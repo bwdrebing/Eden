@@ -176,6 +176,20 @@ function reflectAt(gx, gy, S) {
 
 // ---- geometry helpers ---------------------------------------------
 function cell2ground(ix, iy, S) {
+  if (S.rectOutput && S.perspective) {
+    // map the grid to the trapezoid that projects to a full screen rectangle:
+    // rows evenly spaced in projected-y, each row spanning the near edge's width
+    const cp = Math.cos(S.pitch), sp = Math.sin(S.pitch);
+    const ryOf = (g) => -(g * sp - S.H * cp) / (g * cp + S.H * sp);
+    const rNear = ryOf(S.yMin), rFar = ryOf(S.yMax);
+    const r = rNear + (iy / S.ny) * (rFar - rNear);
+    const gy = S.H * (cp - r * sp) / (r * cp + sp);          // invert ry(gy)
+    const Zc = gy * cp + S.H * sp;
+    const Znear = S.yMin * cp + S.H * sp;
+    const A = ((S.xMax - S.xMin) / 2) / Znear;               // near-edge half width in rx
+    const rx = -A + (ix / S.nx) * (2 * A);
+    return [rx * Zc, gy];                                    // gx = rx * Zc
+  }
   const gx = S.xMin + (ix / S.nx) * (S.xMax - S.xMin);
   const gy = S.yMin + (iy / S.ny) * (S.yMax - S.yMin);
   return [gx, gy];
@@ -207,11 +221,15 @@ function computeFit(S) {
   }
   const m = 14;
   const baseScale = Math.min((VB_W - 2 * m) / (maxX - minX), (VB_H - 2 * m) / (maxY - minY));
-  const scale = baseScale * (S.zoom || 1);
+  let scale = baseScale * (S.zoom || 1), scaleY = scale;
+  if (S.rectOutput && S.perspective) {   // fill the frame as a rectangle
+    scale = ((VB_W - 2 * m) / (maxX - minX)) * (S.zoom || 1);
+    scaleY = ((VB_H - 2 * m) / (maxY - minY)) * (S.zoom || 1);
+  }
   const bcx = (minX + maxX) / 2, bcy = (minY + maxY) / 2;
   const ox = VB_W / 2 - scale * bcx;
-  const oy = VB_H / 2 - scale * bcy + (S.panY || 0) * (VB_H / 2);
-  return { scale, ox, oy };
+  const oy = VB_H / 2 - scaleY * bcy + (S.panY || 0) * (VB_H / 2);
+  return { scale, scaleY, ox, oy };
 }
 
 // Chaikin corner-cutting on a closed ring — rounds the marching-squares
@@ -235,18 +253,58 @@ function chaikin(ring, iters) {
   return p;
 }
 
+// drop near-duplicate screen points (keeps the bezier fit stable and the
+// files small); also un-closes the ring if last == first
+function simplifyRing(pts, eps) {
+  const out = [];
+  for (const p of pts) {
+    const q = out[out.length - 1];
+    if (!q || Math.hypot(p[0] - q[0], p[1] - q[1]) >= eps) out.push(p);
+  }
+  if (out.length > 1) {
+    const a = out[0], b = out[out.length - 1];
+    if (Math.hypot(a[0] - b[0], a[1] - b[1]) < eps) out.pop();
+  }
+  return out;
+}
+
+// closed Catmull-Rom spline through the points, emitted as cubic beziers —
+// the exported edge is a genuinely smooth curve (an elliptical region becomes
+// an actual smooth closed curve, not a polygonal approximation)
+function ringToBezier(p) {
+  const n = p.length;
+  let d = "M" + p[0][0].toFixed(1) + " " + p[0][1].toFixed(1) + " ";
+  for (let i = 0; i < n; i++) {
+    const p0 = p[(i - 1 + n) % n], p1 = p[i], p2 = p[(i + 1) % n], p3 = p[(i + 2) % n];
+    const c1x = p1[0] + (p2[0] - p0[0]) / 6, c1y = p1[1] + (p2[1] - p0[1]) / 6;
+    const c2x = p2[0] - (p3[0] - p1[0]) / 6, c2y = p2[1] - (p3[1] - p1[1]) / 6;
+    d += "C" + c1x.toFixed(1) + " " + c1y.toFixed(1) + " "
+       + c2x.toFixed(1) + " " + c2y.toFixed(1) + " "
+       + p2[0].toFixed(1) + " " + p2[1].toFixed(1) + " ";
+  }
+  return d + "Z ";
+}
+
 function multiToPath(multi, S, fit) {
   const iters = S.smooth || 0;
+  const syScale = fit.scaleY || fit.scale;
   let d = "";
   for (const poly of multi.coordinates) {
     for (const ring0 of poly) {
       const ring = iters ? chaikin(ring0, iters) : ring0;
+      const pts = [];
       for (let idx = 0; idx < ring.length; idx++) {
         const [gx, gy] = cell2ground(ring[idx][0], ring[idx][1], S);
         const [rx, ry] = rawProject(gx, gy, S);
-        const sx = fit.ox + fit.scale * rx;
-        const sy = fit.oy + fit.scale * ry;
-        d += (idx === 0 ? "M" : "L") + sx.toFixed(1) + " " + sy.toFixed(1) + " ";
+        pts.push([fit.ox + fit.scale * rx, fit.oy + syScale * ry]);
+      }
+      if (iters) {
+        const simp = simplifyRing(pts, 1.1);
+        if (simp.length >= 3) { d += ringToBezier(simp); continue; }
+      }
+      // sharp mode (smoothing = 0) or degenerate ring: straight segments
+      for (let idx = 0; idx < pts.length; idx++) {
+        d += (idx === 0 ? "M" : "L") + pts[idx][0].toFixed(1) + " " + pts[idx][1].toFixed(1) + " ";
       }
       d += "Z ";
     }
@@ -270,7 +328,7 @@ function penProject(gx, gy, gz, S, fit) {
     const Yc = gy * sp + (gz - S.H) * cp;
     rx = gx / Zc; ry = -Yc / Zc; depth = Zc;
   }
-  return [fit.ox + fit.scale * rx, fit.oy + fit.scale * ry, depth];
+  return [fit.ox + fit.scale * rx, fit.oy + (fit.scaleY || fit.scale) * ry, depth];
 }
 
 // equally-spaced scan lines across the surface. Each line is split into
@@ -279,19 +337,36 @@ function penProject(gx, gy, gz, S, fit) {
 // With hidden-line removal, a nearer row's silhouette (a per-column "floating
 // horizon") clips any farther row that falls behind it.
 function buildPenLines(S, fit, colorAt, opts) {
-  const { nLines, samples, relief, threeD, hidden } = opts;
+  const { nLines, samples, relief, threeD, hidden, evenScreen } = opts;
   const W = Math.max(2, Math.round(VB_W));
   const horizon = hidden ? new Float64Array(W + 1).fill(Infinity) : null;
   const clampB = (x) => (x < 0 ? 0 : x > W ? W : x);
   const byColor = new Map();
   const add = (color, sub) => { const a = byColor.get(color) || []; a.push(sub); byColor.set(color, a); };
 
+  // pick each line's depth: either equal in the ground plane, or (in
+  // perspective) equal in projected screen-y so they don't bunch at the horizon
+  const cp = Math.cos(S.pitch), sp = Math.sin(S.pitch);
+  const ryOf = (g) => -(g * sp - S.H * cp) / (g * cp + S.H * sp);
+  const useScreen = evenScreen && S.perspective;
+  const rect = S.rectOutput && S.perspective;
+  const rNear = ryOf(S.yMin), rFar = ryOf(S.yMax);
+  const depthForLine = (li) => {
+    const f = (li + 0.5) / nLines;
+    if (!useScreen) return S.yMin + f * (S.yMax - S.yMin);
+    const r = rNear + f * (rFar - rNear);
+    return S.H * (cp - r * sp) / (r * cp + sp);   // invert ry(gy) = r
+  };
+
   for (let li = 0; li < nLines; li++) {          // li = 0 is nearest the camera
-    const gy = S.yMin + ((li + 0.5) / nLines) * (S.yMax - S.yMin);
+    const rowIy = ((li + 0.5) / nLines) * S.ny;
+    const gyLin = depthForLine(li);
     const PX = new Float64Array(samples + 1), PY = new Float64Array(samples + 1);
     const COL = new Array(samples + 1), VIS = new Uint8Array(samples + 1);
     for (let s = 0; s <= samples; s++) {
-      const gx = S.xMin + (s / samples) * (S.xMax - S.xMin);
+      let gx, gy;
+      if (rect) { const g = cell2ground((s / samples) * S.nx, rowIy, S); gx = g[0]; gy = g[1]; }
+      else { gx = S.xMin + (s / samples) * (S.xMax - S.xMin); gy = gyLin; }
       const gz = threeD ? heightAt(gx, gy, S) * relief : 0;
       const [sx, sy] = penProject(gx, gy, gz, S, fit);
       PX[s] = sx; PY[s] = sy; COL[s] = colorAt(gx, gy);
@@ -367,7 +442,7 @@ function buildDepthBuffer(S, fit, relief, threeD, BW, BH) {
   const gN = 100, stride = gN + 1;
   const SX = new Float64Array(stride * stride), SY = new Float64Array(stride * stride), DP = new Float64Array(stride * stride);
   for (let j = 0; j <= gN; j++) for (let i = 0; i <= gN; i++) {
-    const gx = S.xMin + (i / gN) * (S.xMax - S.xMin), gy = S.yMin + (j / gN) * (S.yMax - S.yMin);
+    const [gx, gy] = cell2ground((i / gN) * S.nx, (j / gN) * S.ny, S);
     const gz = threeD ? heightAt(gx, gy, S) * relief : 0;
     const [sx, sy, dp] = penProject(gx, gy, gz, S, fit);
     const q = j * stride + i; SX[q] = sx / VB_W * BW; SY[q] = sy / VB_H * BH; DP[q] = dp;
@@ -570,9 +645,8 @@ function buildGeometry(S) {
   const values = new Float64Array(nx * ny);
   let lo = Infinity, hi = -Infinity;
   for (let j = 0; j < ny; j++) {
-    const gy = S.yMin + ((j + 0.5) / ny) * (S.yMax - S.yMin);
     for (let i = 0; i < nx; i++) {
-      const gx = S.xMin + ((i + 0.5) / nx) * (S.xMax - S.xMin);
+      const [gx, gy] = cell2ground(i + 0.5, j + 0.5, S);
       const v = phiAt(gx, gy, S.t, S);
       values[j * nx + i] = v;
       if (v < lo) lo = v; if (v > hi) hi = v;
@@ -606,9 +680,8 @@ function buildSegmentation(S, env2d, azSpan) {
   const fG = new Float64Array(nx * ny); // azimuth,   0..EW (col units)
   let lo = Infinity, hi = -Infinity;
   for (let j = 0; j < ny; j++) {
-    const gy = S.yMin + ((j + 0.5) / ny) * (S.yMax - S.yMin);
     for (let i = 0; i < nx; i++) {
-      const gx = S.xMin + ((i + 0.5) / nx) * (S.xMax - S.xMin);
+      const [gx, gy] = cell2ground(i + 0.5, j + 0.5, S);
       const R = reflectAt(gx, gy, S);
       const phi = Math.asin(Math.max(-1, Math.min(1, R[2]))) * 180 / Math.PI;
       let psi = Math.atan2(R[0], R[1]) * 180 / Math.PI;
@@ -870,7 +943,7 @@ function useWidth() {
   return w;
 }
 
-export default function WaterReflectionContours() {
+export default function App() {
   const width = useWidth();
   const isNarrow = width < 820;
 
@@ -881,6 +954,7 @@ export default function WaterReflectionContours() {
   const [bands, setBands] = useState(9);
   const [palette, setPalette] = useState("Sunset Lake");
   const [perspective, setPerspective] = useState(true);
+  const [rectOutput, setRectOutput] = useState(false);
   const [edges, setEdges] = useState(false);
   const [animate, setAnimate] = useState(false);
   const [speed, setSpeed] = useState(0.5);
@@ -908,6 +982,7 @@ export default function WaterReflectionContours() {
   const [penHidden, setPenHidden] = useState(true); // hidden-line removal
   const [penStyle, setPenStyle] = useState("lines"); // "lines" | "rings"
   const [penSpacing, setPenSpacing] = useState(7);   // ring spacing (cells)
+  const [penEven, setPenEven] = useState(false);     // even spacing on screen
   const [bgColor, setBgColor] = useState("");       // "" = auto
 
   const [zoom, setZoom] = useState(1);
@@ -951,10 +1026,10 @@ export default function WaterReflectionContours() {
     decay: 0.18 - spread * 0.16,
     omega: 1.0,
     t: animate ? tRef.current : 0,
-    bands, perspective, eLo, eHi, zoom, panY, smooth, coherence,
+    bands, perspective, eLo, eHi, zoom, panY, smooth, coherence, rectOutput,
     emitters,
   }), [quality, steep, wavelength, strength, spread, bands, perspective,
-       halfW, yFar, eLo, eHi, zoom, panY, smooth, coherence, emitters, animate, speed, tRef.current]);
+       halfW, yFar, eLo, eHi, zoom, panY, smooth, coherence, rectOutput, emitters, animate, speed, tRef.current]);
 
   const is2d = mode === "paint2d";
   const geom = useMemo(() => (is2d ? null : buildGeometry(S)), [is2d, S]);
@@ -1007,9 +1082,9 @@ export default function WaterReflectionContours() {
     }
     return buildPenLines(S, fit, colorAt, {
       nLines: penCount, samples: penHidden ? 360 : 260, relief: penRelief,
-      threeD, hidden: penHidden,
+      threeD, hidden: penHidden, evenScreen: penEven,
     });
-  }, [penMode, penStyle, penCount, penSpacing, penRelief, penHidden, S, is2d, mode, segEnv, azSpan, colors1d, presetColors]);
+  }, [penMode, penStyle, penCount, penSpacing, penRelief, penHidden, penEven, S, is2d, mode, segEnv, azSpan, colors1d, presetColors]);
 
   // auto-fit the elevation range to the actual reflected φ, so steep/near water
   // never silently clamps to one band. φ min/max don't depend on eLo/eHi, so
@@ -1332,6 +1407,9 @@ export default function WaterReflectionContours() {
               <Slider label="Vertical pan" value={panY} min={-1} max={1} step={0.02}
                 onChange={setPanY} fmt={(v) => (v === 0 ? "center" : v.toFixed(2))} />
               <Toggle label="Grazing perspective" value={perspective} onChange={setPerspective} />
+              {perspective && (
+                <Toggle label="Rectangular output (fill frame)" value={rectOutput} onChange={setRectOutput} />
+              )}
               <Toggle label="Show region edges" value={edges} onChange={setEdges} />
               <Toggle label="Animate ripples" value={animate} onChange={setAnimate} />
               {animate && (
@@ -1441,6 +1519,8 @@ export default function WaterReflectionContours() {
                     ? <Slider label="ring spacing" value={penSpacing} min={0.5} max={20} step={0.5}
                         onChange={setPenSpacing} fmt={(v) => v.toFixed(1)} />
                     : <Slider label="lines" value={penCount} min={8} max={140} step={2} onChange={setPenCount} />}
+                  {penStyle === "lines" && perspective &&
+                    <Toggle label="Even spacing on screen" value={penEven} onChange={setPenEven} />}
                   <Slider label="line width" value={penWidth} min={0.4} max={4} step={0.1}
                     onChange={setPenWidth} fmt={(v) => v.toFixed(1)} />
                   <Slider label="3D relief" value={penRelief} min={0} max={120} step={2}
