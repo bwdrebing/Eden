@@ -285,7 +285,12 @@ function ringToBezier(p) {
   return d + "Z ";
 }
 
-function multiToPath(multi, S, fit) {
+// `off` shifts contour coordinates from a padded grid back to grid space;
+// `ex` (screen-space expansion about the water's centroid) pushes pad-zone
+// points clear of the clip outline even where perspective squashes a grid
+// cell to a fraction of a pixel (the far edge), so clipped layers always
+// overshoot the frame instead of tracing it.
+function multiToPath(multi, S, fit, off = 0, ex = null) {
   const iters = S.smooth || 0;
   const syScale = fit.scaleY || fit.scale;
   let d = "";
@@ -294,9 +299,15 @@ function multiToPath(multi, S, fit) {
       const ring = iters ? chaikin(ring0, iters) : ring0;
       const pts = [];
       for (let idx = 0; idx < ring.length; idx++) {
-        const [gx, gy] = cell2ground(ring[idx][0], ring[idx][1], S);
+        const gi = ring[idx][0] + off, gj = ring[idx][1] + off;
+        const [gx, gy] = cell2ground(gi, gj, S);
         const [rx, ry] = rawProject(gx, gy, S);
-        pts.push([fit.ox + fit.scale * rx, fit.oy + syScale * ry]);
+        let X = fit.ox + fit.scale * rx, Y = fit.oy + syScale * ry;
+        if (ex && (gi < -0.02 || gi > S.nx + 0.02 || gj < -0.02 || gj > S.ny + 0.02)) {
+          X = ex.cx + (X - ex.cx) * ex.s;
+          Y = ex.cy + (Y - ex.cy) * ex.s;
+        }
+        pts.push([X, Y]);
       }
       if (iters) {
         const simp = simplifyRing(pts, 1.1);
@@ -660,14 +671,25 @@ function buildGeometry(S) {
 }
 
 // ---- geometry build, custom 2D path ------------------------------
-// Instead of hard-quantizing each sample to a panorama cell and contouring
-// categorical labels (which shatters into jagged droplets), we contour the
-// *continuous* azimuth and elevation fields — exactly what makes the 1D path
-// smooth. Elevation gives smooth horizontal bands; azimuth gives smooth
-// vertical swaths. We composite the panorama colors with a painter's
-// algorithm: each elevation row is drawn (clipped to {field >= row}) on top of
-// the one below, and within it the azimuth columns are layered the same way.
-// With no horizontal variation this collapses to the 1D result exactly.
+// The failure mode to avoid: any compositing that follows the panorama's
+// *cell grid* (elevation rows × azimuth columns) turns a painted region's
+// smooth outline into a per-cell staircase — each cell step contributes its
+// own row sliver and column swath, and a flat-colored region ends up with
+// shredded, jagged edges. What makes the 1D path smooth is that every
+// visible boundary is a single contour of one continuous scalar field.
+//
+// So we build exactly that, per color: a signed distance field of the
+// color's painted region in panorama space (positive inside, negative
+// outside), sampled through the continuous reflected-direction fields onto
+// the water grid. The zero level set of that composed field IS the region's
+// reflection boundary — one smooth, ripple-distorted contour, regardless of
+// how blocky the painted pixels are.
+//
+// A hand-smoothed ("melted") panorama can have thousands of distinct colors;
+// past a sanity cap we fall back to row/column compositing, where the
+// per-cell structure is invisible because neighbouring colors are near-equal.
+const SEG_MAX_COLORS = 160;
+
 function buildSegmentation(S, env2d, azSpan) {
   const { nx, ny } = S;
   S._ems = S.emitters.filter((e) => e.on).map((e) => prepEmitter(e, S));
@@ -705,6 +727,85 @@ function buildSegmentation(S, env2d, azSpan) {
   }
 
   const fit = computeFit(S);
+
+  // distinct panorama colors, with cell counts for stacking order
+  const colorId = new Map(), colorOf = [], areas = [];
+  const labels = new Int32Array(EW * EH);
+  for (let p = 0; p < EW * EH; p++) {
+    const c = cells[p];
+    let id = colorId.get(c);
+    if (id === undefined) { id = colorOf.length; colorId.set(c, id); colorOf.push(c); areas.push(0); }
+    labels[p] = id; areas[id]++;
+  }
+
+  if (colorOf.length <= SEG_MAX_COLORS) {
+    const K = colorOf.length;
+    // stack colors bottom-up by the mean elevation of their painted cells —
+    // the 2D generalization of the 1D band order. Layer k is drawn as the
+    // UNION of color k and every color above it, so like the 1D upper sets
+    // each layer solidly contains the next: smoothing can shift a shared
+    // edge but can never open a background seam between neighbours.
+    const rowSum = new Float64Array(K);
+    for (let p = 0; p < EW * EH; p++) rowSum[labels[p]] += (p / EW) | 0;
+    const order = d3.range(K).sort((a, b) => rowSum[a] / areas[a] - rowSum[b] / areas[b]);
+    const union = new Float64Array(EW * EH), inv = new Float64Array(EW * EH);
+    const F = new Float64Array(nx * ny), tmp = new Float64Array(nx * ny);
+    // fields are contoured on a one-cell-padded grid (edge values replicated)
+    // so every region overshoots the water's edge instead of tracing it; the
+    // whole stack is then clipped to the exact trapezoid. Otherwise each
+    // layer would re-trace the frame with its own smoothing wobble, and the
+    // layer below would peek through in dotted slivers along the border.
+    const px = nx + 2, py = ny + 2;
+    const FP = new Float64Array(px * py);
+    // exact projected outline of the water plane, used to clip the stack
+    const corner = (ix, iy) => {
+      const [gx, gy] = cell2ground(ix, iy, S);
+      const [rx, ry] = rawProject(gx, gy, S);
+      return [fit.ox + fit.scale * rx, fit.oy + (fit.scaleY || fit.scale) * ry];
+    };
+    const cs = [corner(0, 0), corner(nx, 0), corner(nx, ny), corner(0, ny)];
+    const clip = "M" + cs.map((c) => c[0].toFixed(1) + " " + c[1].toFixed(1)).join(" L") + " Z";
+    const ex = { cx: (cs[0][0] + cs[1][0] + cs[2][0] + cs[3][0]) / 4,
+                 cy: (cs[0][1] + cs[1][1] + cs[2][1] + cs[3][1]) / 4, s: 1.05 };
+    const layers = new Array(K);
+    for (let k = K - 1; k >= 0; k--) {   // top of the stack down, growing the union
+      for (let p = 0; p < EW * EH; p++) {
+        if (labels[p] === order[k]) union[p] = 1;
+        inv[p] = 1 - union[p];
+      }
+      // signed distance in panorama cells: >0 inside the union, <0 outside,
+      // zero crossing on the painted boundary
+      const D = distTransform(union, EW, EH), Dout = distTransform(inv, EW, EH);
+      let thick = 0;
+      for (let p = 0; p < EW * EH; p++) { D[p] -= Dout[p]; if (D[p] > thick) thick = D[p]; }
+      // compose through the reflection: bilinear sample at each water
+      // sample's continuous (azimuth, elevation) panorama coordinate
+      for (let p = 0; p < nx * ny; p++) {
+        const x = Math.min(EW - 1, Math.max(0, fG[p] - 0.5));
+        const y = Math.min(EH - 1, Math.max(0, fF[p] - 0.5));
+        const i0 = Math.min(EW - 2, Math.floor(x)), j0 = Math.min(EH - 2, Math.floor(y));
+        const fx = x - i0, fy = y - j0, q = j0 * EW + i0;
+        F[p] = (D[q] * (1 - fx) + D[q + 1] * fx) * (1 - fy)
+             + (D[q + EW] * (1 - fx) + D[q + EW + 1] * fx) * fy;
+      }
+      // a light blur rounds the pixel-corner bevels the bilinear sampling
+      // leaves behind. Skip it for thin unions (the topmost gradient rows):
+      // the blur would erase them, and they have no corners to round.
+      if (thick >= 2) blurField(F, nx, ny, tmp, 1);
+      for (let j = 0; j < py; j++) {
+        const jj = Math.min(ny - 1, Math.max(0, j - 1));
+        for (let i = 0; i < px; i++) {
+          const ii = Math.min(nx - 1, Math.max(0, i - 1));
+          FP[j * px + i] = F[jj * nx + ii];
+        }
+      }
+      const cont = d3.contours().size([px, py]).thresholds([0])(FP)[0];
+      layers[k] = { d: multiToPath(cont, S, fit, -1, ex), color: colorOf[order[k]] };
+    }
+    const drawn = layers.filter((l) => l.d);
+    return { bg: cells[0], layers: drawn, clip, lo, hi, count: drawn.length, twoD: true };
+  }
+
   // upper-set contours of each field (smooth, sub-cell boundaries)
   const elevC = d3.contours().size([nx, ny]).thresholds(d3.range(1, EH))(fF);
   const azC = d3.contours().size([nx, ny]).thresholds(d3.range(1, EW))(fG);
@@ -1043,7 +1144,7 @@ export default function App() {
   const bg = is2d ? seg.bg : isobandColors[0];
   const autoBg = penMode ? "#0a0d12" : bg;
   const bgFill = bgColor || autoBg;
-  const layers = is2d ? null
+  const layers = is2d ? (seg.layers || null)
     : geom.ds.map((d, k) => ({ d, color: isobandColors[k + 1] }));
   const regionCount = is2d ? seg.count : layers.length + 1;
   const rng = is2d ? seg : geom;
@@ -1107,7 +1208,7 @@ export default function App() {
     }
     let body = `<rect width="${VB_W}" height="${VB_H}" fill="${bgFill}"/>`;
     const stroke = edges ? ` stroke="#000" stroke-opacity="0.25" stroke-width="0.6"` : "";
-    if (is2d) {
+    if (is2d && !seg.layers) {
       let defs = "";
       seg.rows.forEach((row, ri) => {
         if (row.clip) defs += `<clipPath id="el${ri}"><path d="${row.clip}"/></clipPath>`;
@@ -1122,6 +1223,14 @@ export default function App() {
         body += g;
       });
       return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${VB_W} ${VB_H}"><defs>${defs}</defs>${body}</svg>`;
+    }
+    if (is2d) {
+      body += `<g clip-path="url(#watertrap)" opacity="0.999">`;
+      layers.forEach((l) => {
+        body += `<path d="${l.d}" fill="${l.color}" fill-rule="evenodd"${stroke}/>`;
+      });
+      body += `</g>`;
+      return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${VB_W} ${VB_H}"><defs><clipPath id="watertrap"><path d="${seg.clip}"/></clipPath></defs>${body}</svg>`;
     }
     layers.forEach((l) => {
       body += `<path d="${l.d}" fill="${l.color}" fill-rule="evenodd"${stroke}/>`;
@@ -1210,7 +1319,7 @@ export default function App() {
                   <path key={i} d={l.d} fill="none" stroke={l.color}
                     strokeWidth={penWidth} strokeLinecap="round" strokeLinejoin="round" />
                 ))
-              ) : is2d ? (
+              ) : is2d && !layers ? (
                 <>
                   <defs>
                     {seg.rows.map((row, ri) => row.clip ? (
@@ -1228,6 +1337,22 @@ export default function App() {
                       )}
                     </g>
                   ))}
+                </>
+              ) : is2d ? (
+                <>
+                  <defs>
+                    <clipPath id="watertrap"><path d={seg.clip} /></clipPath>
+                  </defs>
+                  {/* opacity forces the group into an isolated buffer, so the
+                      clip is antialiased once against the composite instead of
+                      per layer (per-layer clip AA leaks the colors beneath) */}
+                  <g clipPath="url(#watertrap)" opacity={0.999}>
+                    {layers.map((l, i) => (
+                      <path key={i} d={l.d} fill={l.color} fillRule="evenodd"
+                        stroke={edges ? "#000" : "none"} strokeOpacity={edges ? 0.28 : 0}
+                        strokeWidth={edges ? 0.6 : 0} />
+                    ))}
+                  </g>
                 </>
               ) : (
                 layers.map((l, i) => (
