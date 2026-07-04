@@ -1,14 +1,7 @@
-import './App.css';
+import WaterReflectionContours from './WaterReflectionContours';
 
 function App() {
-  return (
-    <div className="App">
-      <header className="App-header">
-        <h1>Hello, World!</h1>
-        <p>A React app deployed on GitHub Pages.</p>
-      </header>
-    </div>
-  );
+  return <WaterReflectionContours />;
 }
 
 export default App;
