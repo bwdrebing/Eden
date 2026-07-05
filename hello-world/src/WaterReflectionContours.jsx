@@ -414,19 +414,37 @@ function buildBuoy(S, fit, obj) {
   return { cx, cy, rx, ry, ringD, nearD, clipAbove, clipBelow, reflD, ortho: !S.perspective };
 }
 
-const BUOY_GRAD = `<radialGradient id="buoyGrad" cx="35%" cy="28%" r="80%">`
-  + `<stop offset="0%" stop-color="#ff7a68"/><stop offset="55%" stop-color="#d63a2f"/>`
-  + `<stop offset="100%" stop-color="#7e150e"/></radialGradient>`;
+// cel-shade bands: flat tones only, like the water's isobands. Each band is
+// the same ellipse shrunk and pushed toward the light (upper-left), clipped
+// to the ball silhouette — the overlaps read as thick crescent color bands.
+// f = radius factor, ox/oy = center offset in units of rx/ry.
+const BUOY_BANDS = [
+  { f: 1.00, ox: 0,     oy: 0,     color: "#7e150e" }, // shadow base
+  { f: 0.90, ox: -0.10, oy: -0.14, color: "#c02c1f" },
+  { f: 0.72, ox: -0.20, oy: -0.28, color: "#e8503c" },
+  { f: 0.46, ox: -0.31, oy: -0.44, color: "#ff8a66" }, // lit side
+  { f: 0.18, ox: -0.42, oy: -0.58, color: "#ffd9b8" }, // glint
+];
+
+function buoyBandGeo(b) {
+  return BUOY_BANDS.map((band) => ({
+    cx: b.cx + band.ox * b.rx, cy: b.cy + band.oy * b.ry,
+    rx: b.rx * band.f, ry: b.ry * band.f, color: band.color,
+  }));
+}
 
 function buoySvg(b) {
   let s = `<defs>`;
   if (b.clipAbove) s += `<clipPath id="buoyAbove"><path d="${b.clipAbove}"/></clipPath>`;
   if (b.clipBelow) s += `<clipPath id="buoyBelow"><path d="${b.clipBelow}"/></clipPath>`;
-  s += BUOY_GRAD + `</defs>`;
+  s += `<clipPath id="buoyBall"><ellipse cx="${b.cx.toFixed(1)}" cy="${b.cy.toFixed(1)}" rx="${b.rx.toFixed(1)}" ry="${b.ry.toFixed(1)}"/></clipPath></defs>`;
   if (b.reflD) s += `<g${b.clipBelow ? ' clip-path="url(#buoyBelow)"' : ""}>`
     + `<path d="${b.reflD}" fill="#b03328" opacity="0.45"/></g>`;
-  s += `<g${b.clipAbove ? ' clip-path="url(#buoyAbove)"' : ""}>`
-    + `<ellipse cx="${b.cx.toFixed(1)}" cy="${b.cy.toFixed(1)}" rx="${b.rx.toFixed(1)}" ry="${b.ry.toFixed(1)}" fill="url(#buoyGrad)"/></g>`;
+  s += `<g${b.clipAbove ? ' clip-path="url(#buoyAbove)"' : ""}><g clip-path="url(#buoyBall)">`
+    + buoyBandGeo(b).map((e) =>
+        `<ellipse cx="${e.cx.toFixed(1)}" cy="${e.cy.toFixed(1)}" rx="${e.rx.toFixed(1)}" ry="${e.ry.toFixed(1)}" fill="${e.color}"/>`
+      ).join("")
+    + `</g></g>`;
   if (b.nearD) s += `<path d="${b.nearD}" fill="none" stroke="#000" stroke-opacity="0.4" stroke-width="1.1"/>`;
   if (b.ortho && b.ringD) s += `<path d="${b.ringD}" fill="none" stroke="#000" stroke-opacity="0.3" stroke-width="1"/>`;
   return s;
@@ -1480,11 +1498,9 @@ export default function App() {
                   <defs>
                     {buoy.clipAbove && <clipPath id="buoyAboveP"><path d={buoy.clipAbove} /></clipPath>}
                     {buoy.clipBelow && <clipPath id="buoyBelowP"><path d={buoy.clipBelow} /></clipPath>}
-                    <radialGradient id="buoyGradP" cx="35%" cy="28%" r="80%">
-                      <stop offset="0%" stopColor="#ff7a68" />
-                      <stop offset="55%" stopColor="#d63a2f" />
-                      <stop offset="100%" stopColor="#7e150e" />
-                    </radialGradient>
+                    <clipPath id="buoyBallP">
+                      <ellipse cx={buoy.cx} cy={buoy.cy} rx={buoy.rx} ry={buoy.ry} />
+                    </clipPath>
                   </defs>
                   {buoy.reflD && (
                     <g clipPath={buoy.clipBelow ? "url(#buoyBelowP)" : undefined}>
@@ -1492,7 +1508,11 @@ export default function App() {
                     </g>
                   )}
                   <g clipPath={buoy.clipAbove ? "url(#buoyAboveP)" : undefined}>
-                    <ellipse cx={buoy.cx} cy={buoy.cy} rx={buoy.rx} ry={buoy.ry} fill="url(#buoyGradP)" />
+                    <g clipPath="url(#buoyBallP)">
+                      {buoyBandGeo(buoy).map((e, i) => (
+                        <ellipse key={i} cx={e.cx} cy={e.cy} rx={e.rx} ry={e.ry} fill={e.color} />
+                      ))}
+                    </g>
                   </g>
                   {buoy.nearD && (
                     <path d={buoy.nearD} fill="none" stroke="#000" strokeOpacity={0.4} strokeWidth={1.1} />
