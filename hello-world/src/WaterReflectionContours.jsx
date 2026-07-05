@@ -1308,10 +1308,10 @@ export default function App() {
 
           {/* PREVIEW */}
           <div style={{ background: "#05080b", borderRadius: 14, border: "1px solid #1b2530",
-            overflow: "hidden", position: isNarrow ? "sticky" : "relative",
-            top: isNarrow ? 8 : "auto", zIndex: 5,
+            overflow: "hidden", position: "sticky",
+            top: isNarrow ? 8 : 22, zIndex: 5,
             marginBottom: isNarrow ? 14 : 0,
-            boxShadow: isNarrow ? "0 8px 24px rgba(0,0,0,0.55)" : "none" }}>
+            boxShadow: "0 8px 24px rgba(0,0,0,0.55)" }}>
             <svg viewBox={`0 0 ${VB_W} ${VB_H}`} style={{ width: "100%", display: "block" }}>
               <rect width={VB_W} height={VB_H} fill={bgFill} />
               {penMode ? (
