@@ -4,5 +4,6 @@ import App from './App';
 test('renders the studio tabs', () => {
   render(<App />);
   expect(screen.getByText(/lake reflections/i)).toBeInTheDocument();
-  expect(screen.getByText(/glass closeups/i)).toBeInTheDocument();
+  expect(screen.getByText(/whiskey glass/i)).toBeInTheDocument();
+  expect(screen.getByText(/liquid macro/i)).toBeInTheDocument();
 });

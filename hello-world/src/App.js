@@ -1,10 +1,12 @@
 import { useState } from 'react';
 import WaterReflectionContours from './WaterReflectionContours';
-import RefractionCloseups from './RefractionCloseups';
+import WhiskeyGlass from './WhiskeyGlass';
+import LiquidMacro from './LiquidMacro';
 
 const TABS = [
   ['reflection', 'Lake Reflections'],
-  ['refraction', 'Glass Closeups'],
+  ['whiskey', 'Whiskey Glass'],
+  ['macro', 'Liquid Macro'],
 ];
 
 function App() {
@@ -24,7 +26,9 @@ function App() {
           </button>
         ))}
       </nav>
-      {tab === 'reflection' ? <WaterReflectionContours /> : <RefractionCloseups />}
+      {tab === 'reflection' ? <WaterReflectionContours />
+        : tab === 'whiskey' ? <WhiskeyGlass />
+        : <LiquidMacro />}
     </div>
   );
 }
