@@ -415,25 +415,34 @@ function buildBuoy(S, fit, obj) {
 }
 
 // cel-shade bands: flat tones only, like the water's isobands. Each band is
-// the same ellipse shrunk and pushed toward the light (upper-left), clipped
-// to the ball silhouette — the overlaps read as thick crescent color bands.
-// f = radius factor, ox/oy = center offset in units of rx/ry.
-const BUOY_BANDS = [
-  { f: 1.00, ox: 0,     oy: 0,     color: "#7e150e" }, // shadow base
-  { f: 0.90, ox: -0.10, oy: -0.14, color: "#c02c1f" },
-  { f: 0.72, ox: -0.20, oy: -0.28, color: "#e8503c" },
-  { f: 0.46, ox: -0.31, oy: -0.44, color: "#ff8a66" }, // lit side
-  { f: 0.18, ox: -0.42, oy: -0.58, color: "#ffd9b8" }, // glint
-];
+// the same ellipse shrunk and pushed toward the light, clipped to the ball
+// silhouette — the overlaps read as thick crescent color bands.
+// n = number of tones, lightDeg = where the light sits around the ball
+// (0° = above, 90° = right, 180° = below, 270° = left).
+const BUOY_RAMP = ["#7e150e", "#c02c1f", "#e8503c", "#ff8a66", "#ffd9b8"];
+function makeBuoyBands(n, lightDeg) {
+  const interp = d3.interpolateRgbBasis(BUOY_RAMP);
+  const a = (lightDeg * Math.PI) / 180;
+  const dx = Math.sin(a), dy = -Math.cos(a);
+  return d3.range(n).map((k) => {
+    const t = k / (n - 1);            // 0 = shadow base, 1 = glint
+    return {
+      f: 1 - 0.82 * Math.pow(t, 1.6), // radius factor
+      ox: 0.72 * t * dx,              // center offset, in units of rx/ry
+      oy: 0.72 * t * dy,
+      color: d3.color(interp(t)).formatHex(),
+    };
+  });
+}
 
-function buoyBandGeo(b) {
-  return BUOY_BANDS.map((band) => ({
+function buoyBandGeo(b, bands) {
+  return bands.map((band) => ({
     cx: b.cx + band.ox * b.rx, cy: b.cy + band.oy * b.ry,
     rx: b.rx * band.f, ry: b.ry * band.f, color: band.color,
   }));
 }
 
-function buoySvg(b) {
+function buoySvg(b, bands) {
   let s = `<defs>`;
   if (b.clipAbove) s += `<clipPath id="buoyAbove"><path d="${b.clipAbove}"/></clipPath>`;
   if (b.clipBelow) s += `<clipPath id="buoyBelow"><path d="${b.clipBelow}"/></clipPath>`;
@@ -441,7 +450,7 @@ function buoySvg(b) {
   if (b.reflD) s += `<g${b.clipBelow ? ' clip-path="url(#buoyBelow)"' : ""}>`
     + `<path d="${b.reflD}" fill="#b03328" opacity="0.45"/></g>`;
   s += `<g${b.clipAbove ? ' clip-path="url(#buoyAbove)"' : ""}><g clip-path="url(#buoyBall)">`
-    + buoyBandGeo(b).map((e) =>
+    + buoyBandGeo(b, bands).map((e) =>
         `<ellipse cx="${e.cx.toFixed(1)}" cy="${e.cy.toFixed(1)}" rx="${e.rx.toFixed(1)}" ry="${e.ry.toFixed(1)}" fill="${e.color}"/>`
       ).join("")
     + `</g></g>`;
@@ -1191,6 +1200,8 @@ export default function App() {
   const [objSub, setObjSub] = useState(0.5);        // fraction of hull under water
   const [objRipple, setObjRipple] = useState(0.9);  // scattered-wave strength
   const [objRippleScale, setObjRippleScale] = useState(0.8);
+  const [objBands, setObjBands] = useState(5);      // cel-shade tone count
+  const [objLight, setObjLight] = useState(325);    // light direction, degrees
   const [eLo, setELo] = useState(0), [eHi, setEHi] = useState(20);
   const [autoFit, setAutoFit] = useState(false);
   const [penMode, setPenMode] = useState(false);
@@ -1317,6 +1328,7 @@ export default function App() {
     S._ems = S.emitters.filter((e) => e.on).map((e) => prepEmitter(e, S));
     return buildBuoy(S, fit, { x: objX, y: objY, size: objSize, sub: objSub });
   }, [objOn, objX, objY, objSize, objSub, S]);
+  const buoyShade = useMemo(() => makeBuoyBands(objBands, objLight), [objBands, objLight]);
 
   // auto-fit the elevation range to the actual reflected φ, so steep/near water
   // never silently clamps to one band. φ min/max don't depend on eLo/eHi, so
@@ -1330,7 +1342,7 @@ export default function App() {
   }, [autoFit, rng.lo, rng.hi, eLo, eHi]);
 
   const buildSvg = () => {
-    const buoyStr = buoy ? buoySvg(buoy) : "";
+    const buoyStr = buoy ? buoySvg(buoy, buoyShade) : "";
     if (penMode) {
       let body = `<rect width="${VB_W}" height="${VB_H}" fill="${bgFill}"/>`;
       penLines.forEach((l) => {
@@ -1509,7 +1521,7 @@ export default function App() {
                   )}
                   <g clipPath={buoy.clipAbove ? "url(#buoyAboveP)" : undefined}>
                     <g clipPath="url(#buoyBallP)">
-                      {buoyBandGeo(buoy).map((e, i) => (
+                      {buoyBandGeo(buoy, buoyShade).map((e, i) => (
                         <ellipse key={i} cx={e.cx} cy={e.cy} rx={e.rx} ry={e.ry} fill={e.color} />
                       ))}
                     </g>
@@ -1697,6 +1709,11 @@ export default function App() {
                     onChange={setObjSize} fmt={(v) => v.toFixed(1)} />
                   <Slider label="submersion" value={objSub} min={0.08} max={0.92} step={0.02}
                     onChange={setObjSub} fmt={(v) => Math.round(v * 100) + "%"} />
+                  <Slider label="shading bands" value={objBands} min={2} max={8} step={1}
+                    onChange={setObjBands} />
+                  <Slider label="light direction" value={objLight} min={0} max={360} step={5}
+                    onChange={setObjLight}
+                    fmt={(v) => v + "° " + ["↑","↗","→","↘","↓","↙","←","↖"][Math.round(v / 45) % 8]} />
                   <Slider label="scattered ripples" value={objRipple} min={0} max={2} step={0.05}
                     onChange={setObjRipple} fmt={(v) => (v === 0 ? "off" : v.toFixed(2))} />
                   {objRipple > 0 && (
