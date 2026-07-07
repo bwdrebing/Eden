@@ -295,6 +295,10 @@ function ringToBezier(p) {
 function multiToPath(multi, S, fit, off = 0, ex = null) {
   const iters = S.smooth || 0;
   const syScale = fit.scaleY || fit.scale;
+  // 3D surface: lift every contour vertex to the wave height and re-project
+  // through the same camera the pen-plot relief uses, so the flat color blobs
+  // ride the real crests and troughs instead of sitting on a flat plane.
+  const lift = S.surface3d && S.perspective;
   let d = "";
   for (const poly of multi.coordinates) {
     for (const ring0 of poly) {
@@ -303,8 +307,15 @@ function multiToPath(multi, S, fit, off = 0, ex = null) {
       for (let idx = 0; idx < ring.length; idx++) {
         const gi = ring[idx][0] + off, gj = ring[idx][1] + off;
         const [gx, gy] = cell2ground(gi, gj, S);
-        const [rx, ry] = rawProject(gx, gy, S);
-        let X = fit.ox + fit.scale * rx, Y = fit.oy + syScale * ry;
+        let X, Y;
+        if (lift) {
+          const gz = heightAt(gx, gy, S) * S.waveScale;
+          const p = penProject(gx, gy, gz, S, fit);
+          X = p[0]; Y = p[1];
+        } else {
+          const [rx, ry] = rawProject(gx, gy, S);
+          X = fit.ox + fit.scale * rx; Y = fit.oy + syScale * ry;
+        }
         if (ex && (gi < -0.02 || gi > S.nx + 0.02 || gj < -0.02 || gj > S.ny + 0.02)) {
           X = ex.cx + (X - ex.cx) * ex.s;
           Y = ex.cy + (Y - ex.cy) * ex.s;
@@ -1173,6 +1184,8 @@ export default function App() {
   const [palette, setPalette] = useState("Sunset Lake");
   const [perspective, setPerspective] = useState(true);
   const [rectOutput, setRectOutput] = useState(false);
+  const [surface3d, setSurface3d] = useState(false); // lift color regions onto the waves
+  const [waveScale, setWaveScale] = useState(35);     // 3D wave-height exaggeration
   const [edges, setEdges] = useState(false);
   const [animate, setAnimate] = useState(false);
   const [speed, setSpeed] = useState(0.5);
@@ -1256,6 +1269,7 @@ export default function App() {
     omega: 1.0,
     t: animate ? tRef.current : 0,
     bands, perspective, eLo, eHi, zoom, panY, smooth, coherence, rectOutput,
+    surface3d, waveScale,
     // waves scatter off the buoy's hull: a ring source pinned to the object,
     // with a tight decay so the disturbance stays local
     emitters: objOn && objRipple > 0
@@ -1263,7 +1277,8 @@ export default function App() {
           size: Math.max(0.3, objSize * objRippleScale), amp: objRipple * 1.5, decay: 0.28 }]
       : emitters,
   }), [quality, steep, wavelength, strength, spread, bands, perspective,
-       halfW, yFar, eLo, eHi, zoom, panY, smooth, coherence, rectOutput, emitters, animate, speed, tRef.current,
+       halfW, yFar, eLo, eHi, zoom, panY, smooth, coherence, rectOutput, surface3d, waveScale,
+       emitters, animate, speed, tRef.current,
        objOn, objX, objY, objSize, objRipple, objRippleScale]);
 
   const is2d = mode === "paint2d";
@@ -1369,7 +1384,10 @@ export default function App() {
       return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${VB_W} ${VB_H}"><defs>${defs}</defs>${body}${buoyStr}</svg>`;
     }
     if (is2d) {
-      body += `<g clip-path="url(#watertrap)" opacity="0.999">`;
+      // in 3D the waves rise above the flat water trapezoid, so skip the clip
+      // (the padded regions already overshoot the frame) — otherwise crests
+      // near the edges would be sheared off flat
+      body += surface3d ? `<g opacity="0.999">` : `<g clip-path="url(#watertrap)" opacity="0.999">`;
       layers.forEach((l) => {
         body += `<path d="${l.d}" fill="${l.color}" fill-rule="evenodd"${stroke}/>`;
       });
@@ -1490,7 +1508,7 @@ export default function App() {
                   {/* opacity forces the group into an isolated buffer, so the
                       clip is antialiased once against the composite instead of
                       per layer (per-layer clip AA leaks the colors beneath) */}
-                  <g clipPath="url(#watertrap)" opacity={0.999}>
+                  <g clipPath={surface3d ? undefined : "url(#watertrap)"} opacity={0.999}>
                     {layers.map((l, i) => (
                       <path key={i} d={l.d} fill={l.color} fillRule="evenodd"
                         stroke={edges ? "#000" : "none"} strokeOpacity={edges ? 0.28 : 0}
@@ -1538,7 +1556,7 @@ export default function App() {
             <div style={{ position: "absolute", left: 12, bottom: 10, fontSize: 10.5,
               color: "#6d808f", fontFamily: "ui-monospace, monospace", letterSpacing: 0.5 }}>
               {penMode ? `${penStyle === "rings" ? "rings" : penCount + " lines"} · ${penLines.length} pens${S.perspective && penRelief > 0 ? " · 3D" : ""}${penHidden ? " · hidden-line" : ""}`
-                : `${regionCount} regions · ${S.nx}×${S.ny} sample grid`}
+                : `${regionCount} regions · ${S.nx}×${S.ny} sample grid${surface3d && perspective ? " · 3D" : ""}`}
             </div>
           </div>
 
@@ -1741,6 +1759,24 @@ export default function App() {
               <Toggle label="Grazing perspective" value={perspective} onChange={setPerspective} />
               {perspective && (
                 <Toggle label="Rectangular output (fill frame)" value={rectOutput} onChange={setRectOutput} />
+              )}
+              {!penMode && (
+                <Toggle
+                  label={perspective ? "3D wave surface" : "3D wave surface (needs perspective)"}
+                  value={surface3d && perspective}
+                  onChange={(v) => { if (!perspective) setPerspective(true); setSurface3d(v); }} />
+              )}
+              {!penMode && perspective && surface3d && (
+                <>
+                  <Slider label="Wave height (3D)" value={waveScale} min={0} max={120} step={2}
+                    onChange={setWaveScale} fmt={(v) => (v === 0 ? "flat" : String(v))} />
+                  <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 8, lineHeight: 1.5,
+                    fontFamily: "ui-monospace, monospace" }}>
+                    Lifts the color regions onto the actual wave crests to preview the surface
+                    in relief. Tune the wave <em>scale</em> with Ripple scale (λ) &amp; strength above,
+                    and the vertical exaggeration here.
+                  </div>
+                </>
               )}
               <Toggle label="Show region edges" value={edges} onChange={setEdges} />
               <Toggle label="Animate ripples" value={animate} onChange={setAnimate} />
