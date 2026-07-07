@@ -31,6 +31,13 @@ const SWATCHES = [
   "#cfe1ef", "#9cc3e8", "#6a96c8", "#3f5f93", "#27406b", "#141d33",
 ];
 
+// body-tint quick picks: the color the water column returns when you look
+// into it head-on. Lake greens, silty/tannin browns, deep-water blues.
+const WATER_TINTS = [
+  "#0c2b24", "#15332c", "#20463b", "#2c5a3e", "#3a4a24",
+  "#4a3b22", "#5a3c1e", "#123a44", "#134a55", "#0f2d3a",
+];
+
 // ---- surface slope & elevation field -------------------------------
 // Real water is a superposition of straight-crested waves over many
 // wavelengths. We work with the surface *slope* (which sets the normal,
@@ -777,6 +784,39 @@ function bandColors(NB, palette) {
   return d3.range(NB).map((k) => interp(NB === 1 ? 0 : k / (NB - 1)));
 }
 
+// ---- water body color (Fresnel) -----------------------------------
+// Water is only a mirror at grazing angles. Looking straight down into the
+// surface it reflects almost nothing (~2%), so the light that reaches the eye
+// is what scattered back out of the water column — the body color, a
+// green / brown / blue tint that also reads darker than the sky it replaces.
+// The crossover is the Fresnel reflectance of the air–water interface.
+//
+// For the mean (flat) surface the ray's angle of incidence onto the vertical
+// normal is θ = 90° − φ, where φ is the reflected ray's elevation — the exact
+// scalar field this studio already bands on. So the reflectance is a function
+// of the band's own φ: grazing bands (small φ) stay full sky reflection, steep
+// bands (large φ) let the body color through. Schlick's approximation, with
+// F0 = the head-on reflectance (≈ 0.02 for a clean air–water interface).
+function fresnelReflectance(phiDeg, F0) {
+  const c = Math.sin(Math.max(0, Math.min(90, phiDeg)) * Math.PI / 180); // = cos θ
+  const r = F0 + (1 - F0) * Math.pow(1 - c, 5);
+  return r < 0 ? 0 : r > 1 ? 1 : r;
+}
+
+// blend a reflection color toward the water's body tint by the non-reflected
+// fraction (1 − R), scaled by a user "depth" strength. p = { on, tint, depth, F0 }.
+function waterBodyColor(color, phiDeg, p) {
+  if (!p || !p.on || p.depth <= 0) return color;
+  const t = (1 - fresnelReflectance(phiDeg, p.F0)) * p.depth;
+  if (t <= 0) return color;
+  return d3.interpolateRgb(color, p.tint)(t > 1 ? 1 : t);
+}
+
+// centre elevation of band k (of NB) across the color window [eLo, eHi]
+function bandPhi(k, NB, eLo, eHi) {
+  return eLo + (eHi - eLo) * ((k + 0.5) / NB);
+}
+
 // ---- geometry build, preset path (elevation isobands) -------------
 function buildGeometry(S) {
   const { nx, ny } = S;
@@ -928,7 +968,11 @@ function buildSegmentation(S, env2d, azSpan) {
         }
       }
       const cont = d3.contours().size([px, py]).thresholds([0])(FP)[0];
-      layers[k] = { d: multiToPath(cont, S, fit, -1, ex), color: colorOf[order[k]] };
+      // mean elevation row of this color's painted cells → its φ, for the
+      // Fresnel body-tint (steep colors darken toward the water, grazing don't)
+      const meanRow = rowSum[order[k]] / Math.max(1, areas[order[k]]);
+      layers[k] = { d: multiToPath(cont, S, fit, -1, ex), color: colorOf[order[k]],
+        phi: eLo + span * (meanRow / Math.max(1, EH - 1)) };
     }
     const drawn = layers.filter((l) => l.d);
     return { bg: cells[0], layers: drawn, clip, lo, hi, count: drawn.length, twoD: true };
@@ -955,14 +999,15 @@ function buildSegmentation(S, env2d, azSpan) {
     return true;
   };
 
+  const rowPhi = (r) => eLo + span * (r / Math.max(1, EH - 1));
   const rows = [];
-  rows.push({ clip: null, base: null, az: rowAz(0) }); // row 0 sits on the bg
+  rows.push({ clip: null, base: null, az: rowAz(0), phi: rowPhi(0) }); // row 0 sits on the bg
   let last = 0;
   for (let r = 1; r < EH; r++) {
     const clip = elevPath[r - 1];
     if (!clip) break;                        // {fF >= r} empty -> nothing higher
     if (sameRow(r, last)) continue;          // merge identical bands
-    rows.push({ clip, base: cells[r * EW], az: rowAz(r) });
+    rows.push({ clip, base: cells[r * EW], az: rowAz(r), phi: rowPhi(r) });
     last = r;
   }
   const count = rows.reduce((n, row) => n + 1 + row.az.length, 0);
@@ -1231,6 +1276,11 @@ export default function App() {
   const [panY, setPanY] = useState(0);
   const [smooth, setSmooth] = useState(2);
   const [mode, setMode] = useState("preset"); // "preset" | "paint1d" | "paint2d"
+  // water body / Fresnel: the tint that shows through where you view straight on
+  const [waterBodyOn, setWaterBodyOn] = useState(true);
+  const [waterTint, setWaterTint] = useState("#15332c");
+  const [tintDepth, setTintDepth] = useState(0.55);
+  const [waterF0, setWaterF0] = useState(0.02);
   const [envColors, setEnvColors] = useState(() => seedEnv("Sunset Lake", ENV_N));
   const [env2d, setEnv2d] = useState(() => seedEnv2D("Sunset Lake", ENV2D_W, ENV2D_H));
   const [segEnv, setSegEnv] = useState(env2d);          // committed copy that drives the water
@@ -1290,11 +1340,31 @@ export default function App() {
     [is2d, S, segEnv, azSpan]);
 
   const isobandColors = mode === "paint1d" ? colors1d : presetColors;
-  const bg = is2d ? seg.bg : isobandColors[0];
+  const bodyParams = useMemo(
+    () => ({ on: waterBodyOn, tint: waterTint, depth: tintDepth, F0: waterF0 }),
+    [waterBodyOn, waterTint, tintDepth, waterF0]);
+  // the water fill colors = reflection band colors with the Fresnel body tint
+  // mixed in per band (steep bands take the tint, grazing bands stay reflection)
+  const fillColors = useMemo(() => {
+    const NB = isobandColors.length;
+    return isobandColors.map((c, k) => waterBodyColor(c, bandPhi(k, NB, eLo, eHi), bodyParams));
+  }, [isobandColors, eLo, eHi, bodyParams]);
+  // 2D segmentation carries per-layer / per-row elevation, so tint by that
+  const segRows = useMemo(() => (is2d && seg && seg.rows)
+    ? seg.rows.map((row) => ({
+        ...row,
+        base: row.base ? waterBodyColor(row.base, row.phi, bodyParams) : row.base,
+        az: row.az.map((a) => ({ ...a, color: waterBodyColor(a.color, row.phi, bodyParams) })),
+      }))
+    : null, [is2d, seg, bodyParams]);
+  const bg = is2d ? waterBodyColor(seg.bg, eLo, bodyParams) : fillColors[0];
   const autoBg = penMode ? "#0a0d12" : bg;
   const bgFill = bgColor || autoBg;
-  const layers = is2d ? (seg.layers || null)
-    : geom.ds.map((d, k) => ({ d, color: isobandColors[k + 1] }));
+  const layers = is2d
+    ? (seg.layers
+        ? seg.layers.map((l) => ({ ...l, color: waterBodyColor(l.color, l.phi, bodyParams) }))
+        : null)
+    : geom.ds.map((d, k) => ({ d, color: fillColors[k + 1] }));
   const regionCount = is2d ? seg.count : layers.length + 1;
   const rng = is2d ? seg : geom;
 
@@ -1313,10 +1383,11 @@ export default function App() {
         let psi = Math.atan2(R[0], R[1]) * 180 / Math.PI; psi = psi < -az ? -az : psi > az ? az : psi;
         let v = (phi - S.eLo) / ((S.eHi - S.eLo) || 1); v = v < 0 ? 0 : v > 1 ? 1 : v;
         let u = (psi + az) / (2 * az); u = u < 0 ? 0 : u > 1 ? 1 : u;
-        return cells[Math.min(EH - 1, Math.floor(v * EH)) * EW + Math.min(EW - 1, Math.floor(u * EW))];
+        const cell = cells[Math.min(EH - 1, Math.floor(v * EH)) * EW + Math.min(EW - 1, Math.floor(u * EW))];
+        return waterBodyColor(cell, phi, bodyParams);   // tint by this sample's own φ
       };
     } else {
-      const cols = mode === "paint1d" ? colors1d : presetColors;
+      const cols = fillColors;   // reflection bands with the body tint already mixed in
       const NB = cols.length;
       colorAt = (gx, gy) => {
         const phi = phiAt(gx, gy, 0, S);
@@ -1334,7 +1405,7 @@ export default function App() {
       nLines: penCount, samples: penHidden ? 360 : 260, relief: penRelief,
       threeD, hidden: penHidden, evenScreen: penEven,
     });
-  }, [penMode, penStyle, penCount, penSpacing, penRelief, penHidden, penEven, S, is2d, mode, segEnv, azSpan, colors1d, presetColors]);
+  }, [penMode, penStyle, penCount, penSpacing, penRelief, penHidden, penEven, S, is2d, segEnv, azSpan, fillColors, bodyParams]);
 
   // floating buoy: projected cap + waterline clip + mirrored reflection
   const buoy = useMemo(() => {
@@ -1369,10 +1440,10 @@ export default function App() {
     const stroke = edges ? ` stroke="#000" stroke-opacity="0.25" stroke-width="0.6"` : "";
     if (is2d && !seg.layers) {
       let defs = "";
-      seg.rows.forEach((row, ri) => {
+      segRows.forEach((row, ri) => {
         if (row.clip) defs += `<clipPath id="el${ri}"><path d="${row.clip}"/></clipPath>`;
       });
-      seg.rows.forEach((row, ri) => {
+      segRows.forEach((row, ri) => {
         const open = row.clip ? `<g clip-path="url(#el${ri})">` : `<g>`;
         let g = open;
         if (row.base) g += `<rect width="${VB_W}" height="${VB_H}" fill="${row.base}"${stroke ? "" : ""}/>`;
@@ -1484,11 +1555,11 @@ export default function App() {
               ) : is2d && !layers ? (
                 <>
                   <defs>
-                    {seg.rows.map((row, ri) => row.clip ? (
+                    {segRows.map((row, ri) => row.clip ? (
                       <clipPath key={ri} id={`el${ri}`}><path d={row.clip} /></clipPath>
                     ) : null)}
                   </defs>
-                  {seg.rows.map((row, ri) => (
+                  {segRows.map((row, ri) => (
                     <g key={ri} clipPath={row.clip ? `url(#el${ri})` : undefined}>
                       {row.base && <rect width={VB_W} height={VB_H} fill={row.base} />}
                       {row.az.map((a, ai) => (
@@ -1711,6 +1782,45 @@ export default function App() {
                     <span>{eLo}° horizon</span><span>zenith {eHi}°</span>
                   </div>
                 </>
+              )}
+            </div>
+
+            <div style={panel}>
+              <div style={heading}>Water body</div>
+              <Toggle label="Body tint (Fresnel)" value={waterBodyOn} onChange={setWaterBodyOn} />
+              {waterBodyOn && (
+                <div style={{ marginTop: 6 }}>
+                  <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 10, lineHeight: 1.5,
+                    fontFamily: "ui-monospace, monospace" }}>
+                    Water only mirrors the sky at grazing angles. Viewed straight on it reflects
+                    almost nothing, so its own color — and the darkness of the water column — comes
+                    through. Steep (near) bands take the tint; grazing (far) bands stay reflection.
+                  </div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 12 }}>
+                    {WATER_TINTS.map((c) => (
+                      <button key={c} onClick={() => setWaterTint(c)}
+                        style={{ width: 26, height: 26, borderRadius: 5, background: c, cursor: "pointer",
+                          padding: 0, border: waterTint === c ? "2px solid #fff" : "1px solid #00000055" }} />
+                    ))}
+                    <label style={{ width: 26, height: 26, borderRadius: 5, cursor: "pointer",
+                      border: "1px solid #44525e", position: "relative", overflow: "hidden",
+                      background: waterTint, display: "inline-block" }}>
+                      <input type="color" value={waterTint}
+                        onChange={(e) => setWaterTint(e.target.value)}
+                        style={{ position: "absolute", inset: -4, opacity: 0, cursor: "pointer" }} />
+                    </label>
+                  </div>
+                  <Slider label="Tint depth" value={tintDepth} min={0} max={1} step={0.02}
+                    onChange={setTintDepth} fmt={(v) => (v === 0 ? "off" : Math.round(v * 100) + "%")} />
+                  <Slider label="Surface reflectivity" value={waterF0} min={0.01} max={0.15} step={0.005}
+                    onChange={setWaterF0} fmt={(v) => (v * 100).toFixed(1) + "%"} />
+                  <div style={{ fontSize: 9.5, color: "#6d808f", marginTop: 2, lineHeight: 1.5,
+                    fontFamily: "ui-monospace, monospace" }}>
+                    Tint depth = how strongly the body color replaces the reflection head-on.
+                    Reflectivity = how mirror-like the surface stays straight on — lower is glassier,
+                    darker water; higher keeps the sky reflection alive deeper into the near field.
+                  </div>
+                </div>
               )}
             </div>
 
