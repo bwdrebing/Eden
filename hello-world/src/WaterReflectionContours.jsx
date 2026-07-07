@@ -969,6 +969,239 @@ function buildSegmentation(S, env2d, azSpan) {
   return { bg: cells[0], rows, lo, hi, count, twoD: true };
 }
 
+// ---- layered-paper stack export -----------------------------------
+// Decompose the scene into a stack of physical paper sheets. Each sheet is
+// ONE contiguous piece of paper (so it can be cut from a single sheet) with
+// holes punched in it; stacked in order, each hole reveals the sheet below and
+// the stack reproduces the image. The construction:
+//
+//   * label 4-connected components of equal color on the sample grid — these
+//     are the "regions" (nodes). Two regions are adjacent when their cells
+//     touch (edges).
+//   * seed a growing blob from an outer FRAME region (a unique registration
+//     color). Repeatedly absorb the whole same-color frontier that has the
+//     largest area; each absorption emits one sheet whose color is that color
+//     and whose shape is the cumulative union absorbed so far.
+//
+// Two invariants make this correct *and* physical, for free:
+//   - Contiguity: we only ever absorb regions ADJACENT to the blob, growing
+//     from one connected seed, so every sheet's mask stays one 4-connected
+//     piece — no floating islands, ever.
+//   - Nesting: sheet_{i+1} ⊇ sheet_i, so the first sheet (from the top) that
+//     covers a point is the one that absorbed that point's region, and its
+//     color is that region's own color. The image is reproduced exactly for
+//     ANY choice of which color to peel next — the choice only affects how
+//     many sheets result. Same-color regions merge onto one sheet exactly when
+//     a single region separates them from the blob (the smilie's eyes+mouth,
+//     one region — the face — away from the frontier).
+//
+// A sheet's outline is contoured with the same d3.contours + multiToPath
+// pipeline as the union layers, so edges stay smooth and correctly projected.
+
+// 4-connected components of equal grid value. Returns per-region cell lists.
+function labelRegions(grid, nx, ny) {
+  const label = new Int32Array(nx * ny).fill(-1);
+  const regions = [];
+  const stack = [];
+  for (let s = 0; s < nx * ny; s++) {
+    if (label[s] !== -1) continue;
+    const val = grid[s];
+    const id = regions.length;
+    const cells = [];
+    label[s] = id; stack.push(s);
+    while (stack.length) {
+      const p = stack.pop();
+      cells.push(p);
+      const x = p % nx, y = (p / nx) | 0;
+      if (x > 0        && label[p - 1]  === -1 && grid[p - 1]  === val) { label[p - 1]  = id; stack.push(p - 1); }
+      if (x < nx - 1   && label[p + 1]  === -1 && grid[p + 1]  === val) { label[p + 1]  = id; stack.push(p + 1); }
+      if (y > 0        && label[p - nx] === -1 && grid[p - nx] === val) { label[p - nx] = id; stack.push(p - nx); }
+      if (y < ny - 1   && label[p + nx] === -1 && grid[p + nx] === val) { label[p + nx] = id; stack.push(p + nx); }
+    }
+    regions.push({ value: val, cells, size: cells.length });
+  }
+  return { label, regions };
+}
+
+// shared-edge adjacency between labeled regions (4-connectivity)
+function buildAdjacency(label, nRegions, nx, ny) {
+  const adj = Array.from({ length: nRegions }, () => new Set());
+  for (let y = 0; y < ny; y++) {
+    for (let x = 0; x < nx; x++) {
+      const p = y * nx + x, a = label[p];
+      if (x < nx - 1) { const b = label[p + 1];  if (b !== a) { adj[a].add(b); adj[b].add(a); } }
+      if (y < ny - 1) { const b = label[p + nx]; if (b !== a) { adj[a].add(b); adj[b].add(a); } }
+    }
+  }
+  return adj;
+}
+
+// merge specks: recolor any region smaller than minCells into the neighbor it
+// shares the most boundary with. Keeps the sheet count sane on rippled scenes
+// (thousands of one-cell islands would otherwise each become their own sheet).
+function denoiseGrid(grid, nx, ny, minCells, maxPasses = 3) {
+  for (let pass = 0; pass < maxPasses; pass++) {
+    const { label, regions } = labelRegions(grid, nx, ny);
+    const border = regions.map(() => new Map());
+    const bump = (a, b) => { border[a].set(b, (border[a].get(b) || 0) + 1); };
+    for (let y = 0; y < ny; y++) {
+      for (let x = 0; x < nx; x++) {
+        const p = y * nx + x, a = label[p];
+        if (x < nx - 1) { const b = label[p + 1];  if (b !== a) { bump(a, b); bump(b, a); } }
+        if (y < ny - 1) { const b = label[p + nx]; if (b !== a) { bump(a, b); bump(b, a); } }
+      }
+    }
+    let changed = false;
+    for (let id = 0; id < regions.length; id++) {
+      if (regions[id].size >= minCells) continue;
+      let best = -1, bestN = -1;
+      for (const [nb, cnt] of border[id]) if (cnt > bestN) { bestN = cnt; best = nb; }
+      if (best < 0 || regions[best].value === regions[id].value) continue;
+      const nv = regions[best].value;
+      for (const p of regions[id].cells) grid[p] = nv;
+      changed = true;
+    }
+    if (!changed) break;
+  }
+  return grid;
+}
+
+// grow the stack from the frame, absorbing the largest same-color frontier at
+// each step. Each step -> one sheet (color + the regions merged into it).
+function collapseStack(regions, adj, frameId) {
+  const absorbed = new Uint8Array(regions.length);
+  const frontier = new Set();
+  const sheets = [];
+  absorbed[frameId] = 1;
+  for (const nb of adj[frameId]) if (!absorbed[nb]) frontier.add(nb);
+  sheets.push({ color: regions[frameId].color, members: [frameId], frame: true });
+  while (frontier.size) {
+    // bucket the frontier by color, peel the color with the largest area
+    const byColor = new Map();
+    for (const id of frontier) {
+      let e = byColor.get(regions[id].color);
+      if (!e) { e = { ids: [], area: 0 }; byColor.set(regions[id].color, e); }
+      e.ids.push(id); e.area += regions[id].size;
+    }
+    let bestColor = null, bestArea = -1;
+    for (const [c, e] of byColor) if (e.area > bestArea) { bestArea = e.area; bestColor = c; }
+    const chosen = byColor.get(bestColor).ids;
+    for (const id of chosen) { absorbed[id] = 1; frontier.delete(id); }
+    for (const id of chosen) for (const nb of adj[id]) if (!absorbed[nb]) frontier.add(nb);
+    sheets.push({ color: bestColor, members: chosen });
+  }
+  return sheets;
+}
+
+const PAPER_FRAME_COLOR = "#ff2d78"; // unique registration color for the mount frame
+
+// full pipeline: color grid (+ palette id->hex) -> ordered sheets with paths.
+function buildPaperStack(S, grid, palette, minCells = 5) {
+  const { nx, ny } = S;
+  const fit = computeFit(S);
+
+  denoiseGrid(grid, nx, ny, minCells);
+  const { label, regions } = labelRegions(grid, nx, ny);
+  for (const r of regions) r.color = palette[r.value];
+  const adj = buildAdjacency(label, regions.length, nx, ny);
+
+  // frame: a virtual node adjacent to every region touching the grid border
+  const frameId = regions.length;
+  regions.push({ value: -1, cells: [], size: 0, color: PAPER_FRAME_COLOR, frame: true });
+  adj.push(new Set());
+  const touch = new Set();
+  for (let x = 0; x < nx; x++) { touch.add(label[x]); touch.add(label[(ny - 1) * nx + x]); }
+  for (let y = 0; y < ny; y++) { touch.add(label[y * nx]); touch.add(label[y * nx + nx - 1]); }
+  for (const r of touch) { adj[frameId].add(r); adj[r].add(frameId); }
+
+  const sheets = collapseStack(regions, adj, frameId);
+
+  // exact projected water outline (clip) + overshoot expansion, as in the
+  // union-layer path, so each sheet's cut edge overshoots the frame instead of
+  // tracing it and the whole stack registers to one trapezoid.
+  const cornerPt = (ix, iy) => {
+    const [gx, gy] = cell2ground(ix, iy, S);
+    const [rx, ry] = rawProject(gx, gy, S);
+    return [fit.ox + fit.scale * rx, fit.oy + (fit.scaleY || fit.scale) * ry];
+  };
+  const cs = [cornerPt(0, 0), cornerPt(nx, 0), cornerPt(nx, ny), cornerPt(0, ny)];
+  const clip = "M" + cs.map((c) => c[0].toFixed(1) + " " + c[1].toFixed(1)).join(" L") + " Z";
+  const ex = { cx: (cs[0][0] + cs[1][0] + cs[2][0] + cs[3][0]) / 4,
+               cy: (cs[0][1] + cs[1][1] + cs[2][1] + cs[3][1]) / 4, s: 1.05 };
+
+  // cumulative union mask -> contour, one per sheet
+  const px = nx + 2, py = ny + 2;
+  const cum = new Uint8Array(nx * ny);
+  const FP = new Float64Array(px * py);
+  let cumCount = 0;
+  const out = [];
+  for (let si = 0; si < sheets.length; si++) {
+    const sh = sheets[si];
+    for (const id of sh.members) {
+      const r = regions[id];
+      for (const p of r.cells) if (!cum[p]) { cum[p] = 1; cumCount++; }
+    }
+    let d = "";
+    if (cumCount > 0) {
+      for (let j = 0; j < py; j++) {
+        const jj = Math.min(ny - 1, Math.max(0, j - 1));
+        for (let i = 0; i < px; i++) {
+          const ii = Math.min(nx - 1, Math.max(0, i - 1));
+          FP[j * px + i] = cum[jj * nx + ii];
+        }
+      }
+      const cont = d3.contours().size([px, py]).thresholds([0.5])(FP)[0];
+      if (cont) d = multiToPath(cont, S, fit, -1, ex);
+    }
+    out.push({ color: sh.color, d, frame: !!sh.frame });
+  }
+  return { sheets: out, clip, nSheets: out.length };
+}
+
+// tile the sheets into one printable SVG: each is the full viewport in its
+// paper color with the holes shown as a hatched "cut" fill and a dashed cut
+// line. Listed top -> bottom (assemble the stack bottom -> top).
+function buildPaperStackSvg(stack) {
+  const sheets = stack.sheets, N = sheets.length;
+  const cols = Math.min(4, Math.max(1, N));
+  const rows = Math.ceil(N / cols);
+  const tileW = 240, tileH = Math.round(tileW * VB_H / VB_W);
+  const labelH = 26, gap = 18, pad = 20, top = 46;
+  const W = pad * 2 + cols * tileW + (cols - 1) * gap;
+  const H = top + pad + rows * (tileH + labelH) + (rows - 1) * gap;
+  const sx = tileW / VB_W;
+  let body = `<text x="${pad}" y="26" font-family="ui-monospace,monospace" font-size="15" fill="#e6eef5">`
+    + `Layered paper stack · ${N} sheets · top → bottom (assemble bottom → top)</text>`;
+  sheets.forEach((sh, i) => {
+    const cx = pad + (i % cols) * (tileW + gap);
+    const cy = top + Math.floor(i / cols) * (tileH + labelH + gap);
+    const tf = `translate(${cx} ${cy}) scale(${sx.toFixed(4)})`;
+    const clipId = `pcut${i}`;
+    body += `<clipPath id="${clipId}"><path transform="${tf}" d="${stack.clip}"/></clipPath>`;
+    // paper base (fills the whole sheet, incl. the mount margin around the water)
+    body += `<rect x="${cx}" y="${cy}" width="${tileW}" height="${tileH}" fill="${sh.color}"`
+      + ` stroke="#000" stroke-opacity="0.3" stroke-width="1"/>`;
+    // inside the water outline: hatch = hole, paper color = this sheet's paper
+    body += `<g clip-path="url(#${clipId})">`
+      + `<path transform="${tf}" d="${stack.clip}" fill="url(#cuthatch)"/>`;
+    if (sh.d) body += `<path transform="${tf}" d="${sh.d}" fill="${sh.color}" fill-rule="evenodd"/>`;
+    if (sh.d) body += `<path transform="${tf}" d="${sh.d}" fill="none" stroke="#0b0f14"`
+      + ` stroke-width="1" stroke-dasharray="4 2"/>`;
+    body += `</g>`;
+    // registration outline of the water plane (the frame's inner edge)
+    body += `<path transform="${tf}" d="${stack.clip}" fill="none" stroke="#0b0f14"`
+      + ` stroke-opacity="0.5" stroke-width="1"/>`;
+    const role = sh.frame ? "FRAME · mount" : (i === N - 1 ? "BACKING · solid" : `sheet ${i}`);
+    body += `<text x="${cx}" y="${cy + tileH + 17}" font-family="ui-monospace,monospace"`
+      + ` font-size="11" fill="#c9d4da">${i + 1}. ${role} · ${sh.color}</text>`;
+  });
+  const defs = `<defs><pattern id="cuthatch" width="7" height="7" patternUnits="userSpaceOnUse"`
+    + ` patternTransform="rotate(45)"><rect width="7" height="7" fill="#0d1116"/>`
+    + `<line x1="0" y1="0" x2="0" y2="7" stroke="#39454f" stroke-width="1.6"/></pattern></defs>`;
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}">`
+    + `<rect width="${W}" height="${H}" fill="#0b0f14"/>${defs}${body}</svg>`;
+}
+
 // ---- UI bits -------------------------------------------------------
 function Slider({ label, value, min, max, step, onChange, fmt }) {
   return (
@@ -1241,6 +1474,8 @@ export default function App() {
   const [brushSize, setBrushSize] = useState(1);       // radius in cells
   const [brushShape, setBrushShape] = useState("round"); // round | square | diamond
   const [svgOut, setSvgOut] = useState(null);
+  const [svgName, setSvgName] = useState("reflection-regions.svg");
+  const [stackInfo, setStackInfo] = useState(null); // { nSheets } when a paper stack is exported
   const [copied, setCopied] = useState(false);
   const enter1d = () => { setEnvColors(seedEnv(palette, ENV_N)); setMode("paint1d"); };
   const enter2d = () => {
@@ -1399,16 +1634,67 @@ export default function App() {
     });
     return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${VB_W} ${VB_H}">${body}${buoyStr}</svg>`;
   };
-  const downloadSVG = () => {
-    const svg = buildSvg();
+  const saveSvg = (svg, name) => {
     try {
       const url = URL.createObjectURL(new Blob([svg], { type: "image/svg+xml" }));
       const a = document.createElement("a");
-      a.href = url; a.download = "reflection-regions.svg";
+      a.href = url; a.download = name;
       document.body.appendChild(a); a.click(); a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 4000);
     } catch (e) { /* sandbox may block downloads */ }
+  };
+  const downloadSVG = () => {
+    const svg = buildSvg();
+    saveSvg(svg, "reflection-regions.svg");
+    setSvgName("reflection-regions.svg");
+    setStackInfo(null);
     setSvgOut(svg); // always show a reliable copy fallback
+  };
+
+  // build the sample-grid color used by the layered-paper decomposition — the
+  // same field the renderer bands/segments, one value per cell.
+  const paperColorGrid = () => {
+    S._ems = S.emitters.filter((e) => e.on).map((e) => prepEmitter(e, S));
+    const { nx, ny } = S;
+    const grid = new Int32Array(nx * ny);
+    if (is2d) {
+      const { w: EW, h: EH, cells } = segEnv, az = azSpan;
+      const idOf = new Map(), palette = [];
+      for (let j = 0; j < ny; j++) {
+        for (let i = 0; i < nx; i++) {
+          const [gx, gy] = cell2ground(i + 0.5, j + 0.5, S);
+          const R = reflectAt(gx, gy, S);
+          const phi = Math.asin(Math.max(-1, Math.min(1, R[2]))) * 180 / Math.PI;
+          let psi = Math.atan2(R[0], R[1]) * 180 / Math.PI; psi = psi < -az ? -az : psi > az ? az : psi;
+          let v = (phi - S.eLo) / ((S.eHi - S.eLo) || 1); v = v < 0 ? 0 : v > 1 ? 1 : v;
+          let u = (psi + az) / (2 * az); u = u < 0 ? 0 : u > 1 ? 1 : u;
+          const c = cells[Math.min(EH - 1, Math.floor(v * EH)) * EW + Math.min(EW - 1, Math.floor(u * EW))];
+          let id = idOf.get(c); if (id === undefined) { id = palette.length; idOf.set(c, id); palette.push(c); }
+          grid[j * nx + i] = id;
+        }
+      }
+      return { grid, palette };
+    }
+    const cols = mode === "paint1d" ? colors1d : presetColors, NB = cols.length;
+    for (let j = 0; j < ny; j++) {
+      for (let i = 0; i < nx; i++) {
+        const [gx, gy] = cell2ground(i + 0.5, j + 0.5, S);
+        const phi = phiAt(gx, gy, S.t, S);
+        let v = (phi - S.eLo) / ((S.eHi - S.eLo) || 1); v = v < 0 ? 0 : v >= 1 ? 0.999999 : v;
+        grid[j * nx + i] = Math.floor(v * NB);
+      }
+    }
+    return { grid, palette: cols };
+  };
+
+  const exportPaperStack = () => {
+    const { grid, palette } = paperColorGrid();
+    const stack = buildPaperStack(S, grid, palette);
+    const svg = buildPaperStackSvg(stack);
+    saveSvg(svg, "reflection-paper-stack.svg");
+    setSvgName("reflection-paper-stack.svg");
+    setStackInfo({ nSheets: stack.nSheets });
+    setSvgOut(svg);
   };
   const copySvg = () => {
     if (svgOut && navigator.clipboard) {
@@ -1913,13 +2199,41 @@ export default function App() {
               Export SVG
             </button>
 
+            <button onClick={exportPaperStack} disabled={penMode}
+              title={penMode ? "Turn off pen-plot mode — the paper stack needs filled color regions"
+                : "Decompose the scene into cuttable paper sheets"}
+              style={{ width: "100%", marginTop: 8, background: penMode ? "#1a232c" : "#274b3f",
+                border: "1px solid " + (penMode ? "#26313c" : "#3f7e63"),
+                color: penMode ? "#5f7384" : "#e6fbf1",
+                padding: "12px", borderRadius: 10, cursor: penMode ? "not-allowed" : "pointer",
+                fontSize: 13.5, fontWeight: 600, letterSpacing: 0.3 }}>
+              Export layered paper ↓
+            </button>
+            <div style={{ fontSize: 10, color: "#6d808f", marginTop: 5, lineHeight: 1.5,
+              fontFamily: "ui-monospace, monospace" }}>
+              A stack of same-size sheets, each one contiguous piece with holes cut, that
+              rebuilds the scene when stacked in order.
+            </div>
+
             {svgOut && (
               <div style={{ ...panel, marginTop: 12, marginBottom: 0 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
-                  <span style={{ ...heading, margin: 0, flex: 1 }}>Export</span>
-                  <button onClick={() => setSvgOut(null)}
+                  <span style={{ ...heading, margin: 0, flex: 1 }}>
+                    {stackInfo ? "Layered paper stack" : "Export"}</span>
+                  <button onClick={() => { setSvgOut(null); setStackInfo(null); }}
                     style={{ ...miniBtn, flex: "none", padding: "4px 10px" }}>close</button>
                 </div>
+                {stackInfo && (
+                  <>
+                    <div style={{ background: "#0b0f14", borderRadius: 8, border: "1px solid #26313c",
+                      padding: 6, marginBottom: 10, maxHeight: 320, overflow: "auto" }}
+                      dangerouslySetInnerHTML={{ __html: svgOut }} />
+                    <div style={{ fontSize: 10.5, color: "#8a9bab", marginBottom: 10, lineHeight: 1.5 }}>
+                      {stackInfo.nSheets} sheets · top → bottom. Hatched = holes to cut.
+                      Cut each sheet from paper of its labeled color, then assemble bottom → top.
+                    </div>
+                  </>
+                )}
                 <div style={{ fontSize: 10.5, color: "#8a9bab", marginBottom: 10, lineHeight: 1.5 }}>
                   A download may have started. If not (some sandboxes block it), use a button below.
                 </div>
@@ -1930,7 +2244,7 @@ export default function App() {
                     {copied ? "Copied ✓" : "Copy SVG code"}
                   </button>
                   <a href={`data:image/svg+xml;charset=utf-8,${encodeURIComponent(svgOut)}`}
-                    download="reflection-regions.svg" target="_blank" rel="noopener noreferrer"
+                    download={svgName} target="_blank" rel="noopener noreferrer"
                     style={{ flex: 1, background: "#1a232c", color: "#cfe6ec", textAlign: "center",
                       padding: "11px", borderRadius: 9, fontSize: 13, fontWeight: 600,
                       textDecoration: "none", border: "1px solid #2f6b78" }}>
@@ -1942,7 +2256,8 @@ export default function App() {
                     background: "#0b1118", color: "#9fb0c0", border: "1px solid #26313c",
                     borderRadius: 8, padding: 8, fontSize: 10.5, fontFamily: "ui-monospace, monospace" }} />
                 <div style={{ fontSize: 10, color: "#5f7384", marginTop: 6, fontFamily: "ui-monospace, monospace" }}>
-                  Or select all in the box above and copy. {(svgOut.length / 1024).toFixed(0)} KB · {regionCount} regions.
+                  Or select all in the box above and copy. {(svgOut.length / 1024).toFixed(0)} KB
+                  {stackInfo ? ` · ${stackInfo.nSheets} sheets` : ` · ${regionCount} regions`}.
                 </div>
               </div>
             )}
