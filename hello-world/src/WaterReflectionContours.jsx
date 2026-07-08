@@ -1072,9 +1072,24 @@ function collapseStack(regions, adj, frameId) {
   const absorbed = new Uint8Array(regions.length);
   const frontier = new Set();
   const sheets = [];
+  const frameColor = regions[frameId].color;
   absorbed[frameId] = 1;
   for (const nb of adj[frameId]) if (!absorbed[nb]) frontier.add(nb);
-  sheets.push({ color: regions[frameId].color, members: [frameId], frame: true });
+  // sheet 0 is the frame/background. Swallow any adjacent regions that already
+  // share the background color into it, so the water<->background boundary is
+  // cut once here instead of re-appearing as an edge on every sheet below.
+  const frameMembers = [frameId];
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const id of Array.from(frontier)) {
+      if (regions[id].color !== frameColor) continue;
+      absorbed[id] = 1; frontier.delete(id); frameMembers.push(id);
+      for (const nb of adj[id]) if (!absorbed[nb]) frontier.add(nb);
+      grew = true;
+    }
+  }
+  sheets.push({ color: frameColor, members: frameMembers, frame: true });
   while (frontier.size) {
     // bucket the frontier by color, peel the color with the largest area
     const byColor = new Map();
@@ -1093,10 +1108,12 @@ function collapseStack(regions, adj, frameId) {
   return sheets;
 }
 
-const PAPER_FRAME_COLOR = "#ff2d78"; // unique registration color for the mount frame
+const PAPER_FRAME_COLOR = "#ff2d78"; // fallback registration color if no background
 
 // full pipeline: color grid (+ palette id->hex) -> ordered sheets with paths.
-function buildPaperStack(S, grid, palette, minCells = 5) {
+// bgColor is the scene's background fill: the mount/frame sheet takes this color
+// and absorbs any background-colored regions, so the water edge is cut once.
+function buildPaperStack(S, grid, palette, bgColor, minCells = 5) {
   const { nx, ny } = S;
   const fit = computeFit(S);
 
@@ -1107,7 +1124,7 @@ function buildPaperStack(S, grid, palette, minCells = 5) {
 
   // frame: a virtual node adjacent to every region touching the grid border
   const frameId = regions.length;
-  regions.push({ value: -1, cells: [], size: 0, color: PAPER_FRAME_COLOR, frame: true });
+  regions.push({ value: -1, cells: [], size: 0, color: bgColor || PAPER_FRAME_COLOR, frame: true });
   adj.push(new Set());
   const touch = new Set();
   for (let x = 0; x < nx; x++) { touch.add(label[x]); touch.add(label[(ny - 1) * nx + x]); }
@@ -1129,7 +1146,10 @@ function buildPaperStack(S, grid, palette, minCells = 5) {
   const ex = { cx: (cs[0][0] + cs[1][0] + cs[2][0] + cs[3][0]) / 4,
                cy: (cs[0][1] + cs[1][1] + cs[2][1] + cs[3][1]) / 4, s: 1.05 };
 
-  // cumulative union mask -> contour, one per sheet
+  // per sheet, contour the HOLE = everything not yet absorbed (the inverse of
+  // the cumulative union). The cut line is then the boundary between this
+  // sheet's paper and the sheets below; it only touches the grid rim (the
+  // water<->background edge) on the top sheet, never re-cutting it afterwards.
   const px = nx + 2, py = ny + 2;
   const cum = new Uint8Array(nx * ny);
   const FP = new Float64Array(px * py);
@@ -1142,18 +1162,19 @@ function buildPaperStack(S, grid, palette, minCells = 5) {
       for (const p of r.cells) if (!cum[p]) { cum[p] = 1; cumCount++; }
     }
     let d = "";
-    if (cumCount > 0) {
+    const solid = cumCount >= nx * ny;
+    if (!solid) {                          // an open hole remains to cut
       for (let j = 0; j < py; j++) {
         const jj = Math.min(ny - 1, Math.max(0, j - 1));
         for (let i = 0; i < px; i++) {
           const ii = Math.min(nx - 1, Math.max(0, i - 1));
-          FP[j * px + i] = cum[jj * nx + ii];
+          FP[j * px + i] = 1 - cum[jj * nx + ii];
         }
       }
       const cont = d3.contours().size([px, py]).thresholds([0.5])(FP)[0];
       if (cont) d = multiToPath(cont, S, fit, -1, ex);
     }
-    out.push({ color: sh.color, d, frame: !!sh.frame });
+    out.push({ color: sh.color, d, frame: !!sh.frame, solid });
   }
   return { sheets: out, clip, nSheets: out.length };
 }
@@ -1176,22 +1197,24 @@ function buildPaperStackSvg(stack) {
     const cx = pad + (i % cols) * (tileW + gap);
     const cy = top + Math.floor(i / cols) * (tileH + labelH + gap);
     const tf = `translate(${cx} ${cy}) scale(${sx.toFixed(4)})`;
-    const clipId = `pcut${i}`;
-    body += `<clipPath id="${clipId}"><path transform="${tf}" d="${stack.clip}"/></clipPath>`;
-    // paper base (fills the whole sheet, incl. the mount margin around the water)
-    body += `<rect x="${cx}" y="${cy}" width="${tileW}" height="${tileH}" fill="${sh.color}"`
-      + ` stroke="#000" stroke-opacity="0.3" stroke-width="1"/>`;
-    // inside the water outline: hatch = hole, paper color = this sheet's paper
-    body += `<g clip-path="url(#${clipId})">`
-      + `<path transform="${tf}" d="${stack.clip}" fill="url(#cuthatch)"/>`;
-    if (sh.d) body += `<path transform="${tf}" d="${sh.d}" fill="${sh.color}" fill-rule="evenodd"/>`;
-    if (sh.d) body += `<path transform="${tf}" d="${sh.d}" fill="none" stroke="#0b0f14"`
-      + ` stroke-width="1" stroke-dasharray="4 2"/>`;
+    // clip the tile to its viewport so a zoomed-in scene crops instead of
+    // spilling into neighbours; the hole is further clipped to the water plane
+    // (so its 5% overshoot never bleeds into the mount margin).
+    body += `<clipPath id="ptile${i}"><rect x="${cx}" y="${cy}" width="${tileW}" height="${tileH}"/></clipPath>`;
+    body += `<clipPath id="ptrap${i}"><path transform="${tf}" d="${stack.clip}"/></clipPath>`;
+    body += `<g clip-path="url(#ptile${i})">`;
+    // full-sheet paper — this is the whole physical sheet, mount margin and all,
+    // in one color; the water<->background edge is NOT drawn here
+    body += `<rect x="${cx}" y="${cy}" width="${tileW}" height="${tileH}" fill="${sh.color}"/>`;
+    // holes: paper removed to reveal the sheets below (hatched + dashed cut line)
+    if (sh.d) body += `<g clip-path="url(#ptrap${i})">`
+      + `<path transform="${tf}" d="${sh.d}" fill="url(#cuthatch)" fill-rule="evenodd"/>`
+      + `<path transform="${tf}" d="${sh.d}" fill="none" fill-rule="evenodd" stroke="#0b0f14"`
+      + ` stroke-width="1" stroke-dasharray="4 2"/></g>`;
     body += `</g>`;
-    // registration outline of the water plane (the frame's inner edge)
-    body += `<path transform="${tf}" d="${stack.clip}" fill="none" stroke="#0b0f14"`
-      + ` stroke-opacity="0.5" stroke-width="1"/>`;
-    const role = sh.frame ? "FRAME · mount" : (i === N - 1 ? "BACKING · solid" : `sheet ${i}`);
+    body += `<rect x="${cx}" y="${cy}" width="${tileW}" height="${tileH}" fill="none"`
+      + ` stroke="#000" stroke-opacity="0.35" stroke-width="1"/>`;
+    const role = sh.frame ? "BACKGROUND · mount" : (sh.solid ? "BACKING · solid" : `sheet ${i}`);
     body += `<text x="${cx}" y="${cy + tileH + 17}" font-family="ui-monospace,monospace"`
       + ` font-size="11" fill="#c9d4da">${i + 1}. ${role} · ${sh.color}</text>`;
   });
@@ -1689,7 +1712,7 @@ export default function App() {
 
   const exportPaperStack = () => {
     const { grid, palette } = paperColorGrid();
-    const stack = buildPaperStack(S, grid, palette);
+    const stack = buildPaperStack(S, grid, palette, bgFill);
     const svg = buildPaperStackSvg(stack);
     saveSvg(svg, "reflection-paper-stack.svg");
     setSvgName("reflection-paper-stack.svg");
@@ -2038,7 +2061,7 @@ export default function App() {
               <div style={heading}>Display</div>
               <Slider label="Edge smoothing" value={smooth} min={0} max={4} step={1}
                 onChange={setSmooth} fmt={(v) => (v === 0 ? "off (crisp)" : v + "×")} />
-              <Slider label="Zoom" value={zoom} min={1} max={5} step={0.05}
+              <Slider label="Zoom" value={zoom} min={1} max={14} step={0.05}
                 onChange={setZoom} fmt={(v) => v.toFixed(2) + "×"} />
               <Slider label="Vertical pan" value={panY} min={-1} max={1} step={0.02}
                 onChange={setPanY} fmt={(v) => (v === 0 ? "center" : v.toFixed(2))} />
