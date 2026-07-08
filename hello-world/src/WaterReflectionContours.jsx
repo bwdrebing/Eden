@@ -1,5 +1,6 @@
 import React, { useState, useMemo, useRef, useEffect } from "react";
 import * as d3 from "d3";
+import { labelRegions, buildAdjacency, denoiseGrid, planCollapse } from "./paperStack";
 
 /* ------------------------------------------------------------------ *
  *  Water-reflection contour studio
@@ -997,116 +998,8 @@ function buildSegmentation(S, env2d, azSpan) {
 //
 // A sheet's outline is contoured with the same d3.contours + multiToPath
 // pipeline as the union layers, so edges stay smooth and correctly projected.
-
-// 4-connected components of equal grid value. Returns per-region cell lists.
-function labelRegions(grid, nx, ny) {
-  const label = new Int32Array(nx * ny).fill(-1);
-  const regions = [];
-  const stack = [];
-  for (let s = 0; s < nx * ny; s++) {
-    if (label[s] !== -1) continue;
-    const val = grid[s];
-    const id = regions.length;
-    const cells = [];
-    label[s] = id; stack.push(s);
-    while (stack.length) {
-      const p = stack.pop();
-      cells.push(p);
-      const x = p % nx, y = (p / nx) | 0;
-      if (x > 0        && label[p - 1]  === -1 && grid[p - 1]  === val) { label[p - 1]  = id; stack.push(p - 1); }
-      if (x < nx - 1   && label[p + 1]  === -1 && grid[p + 1]  === val) { label[p + 1]  = id; stack.push(p + 1); }
-      if (y > 0        && label[p - nx] === -1 && grid[p - nx] === val) { label[p - nx] = id; stack.push(p - nx); }
-      if (y < ny - 1   && label[p + nx] === -1 && grid[p + nx] === val) { label[p + nx] = id; stack.push(p + nx); }
-    }
-    regions.push({ value: val, cells, size: cells.length });
-  }
-  return { label, regions };
-}
-
-// shared-edge adjacency between labeled regions (4-connectivity)
-function buildAdjacency(label, nRegions, nx, ny) {
-  const adj = Array.from({ length: nRegions }, () => new Set());
-  for (let y = 0; y < ny; y++) {
-    for (let x = 0; x < nx; x++) {
-      const p = y * nx + x, a = label[p];
-      if (x < nx - 1) { const b = label[p + 1];  if (b !== a) { adj[a].add(b); adj[b].add(a); } }
-      if (y < ny - 1) { const b = label[p + nx]; if (b !== a) { adj[a].add(b); adj[b].add(a); } }
-    }
-  }
-  return adj;
-}
-
-// merge specks: recolor any region smaller than minCells into the neighbor it
-// shares the most boundary with. Keeps the sheet count sane on rippled scenes
-// (thousands of one-cell islands would otherwise each become their own sheet).
-function denoiseGrid(grid, nx, ny, minCells, maxPasses = 3) {
-  for (let pass = 0; pass < maxPasses; pass++) {
-    const { label, regions } = labelRegions(grid, nx, ny);
-    const border = regions.map(() => new Map());
-    const bump = (a, b) => { border[a].set(b, (border[a].get(b) || 0) + 1); };
-    for (let y = 0; y < ny; y++) {
-      for (let x = 0; x < nx; x++) {
-        const p = y * nx + x, a = label[p];
-        if (x < nx - 1) { const b = label[p + 1];  if (b !== a) { bump(a, b); bump(b, a); } }
-        if (y < ny - 1) { const b = label[p + nx]; if (b !== a) { bump(a, b); bump(b, a); } }
-      }
-    }
-    let changed = false;
-    for (let id = 0; id < regions.length; id++) {
-      if (regions[id].size >= minCells) continue;
-      let best = -1, bestN = -1;
-      for (const [nb, cnt] of border[id]) if (cnt > bestN) { bestN = cnt; best = nb; }
-      if (best < 0 || regions[best].value === regions[id].value) continue;
-      const nv = regions[best].value;
-      for (const p of regions[id].cells) grid[p] = nv;
-      changed = true;
-    }
-    if (!changed) break;
-  }
-  return grid;
-}
-
-// grow the stack from the frame, absorbing the largest same-color frontier at
-// each step. Each step -> one sheet (color + the regions merged into it).
-function collapseStack(regions, adj, frameId) {
-  const absorbed = new Uint8Array(regions.length);
-  const frontier = new Set();
-  const sheets = [];
-  const frameColor = regions[frameId].color;
-  absorbed[frameId] = 1;
-  for (const nb of adj[frameId]) if (!absorbed[nb]) frontier.add(nb);
-  // sheet 0 is the frame/background. Swallow any adjacent regions that already
-  // share the background color into it, so the water<->background boundary is
-  // cut once here instead of re-appearing as an edge on every sheet below.
-  const frameMembers = [frameId];
-  let grew = true;
-  while (grew) {
-    grew = false;
-    for (const id of Array.from(frontier)) {
-      if (regions[id].color !== frameColor) continue;
-      absorbed[id] = 1; frontier.delete(id); frameMembers.push(id);
-      for (const nb of adj[id]) if (!absorbed[nb]) frontier.add(nb);
-      grew = true;
-    }
-  }
-  sheets.push({ color: frameColor, members: frameMembers, frame: true });
-  while (frontier.size) {
-    // bucket the frontier by color, peel the color with the largest area
-    const byColor = new Map();
-    for (const id of frontier) {
-      let e = byColor.get(regions[id].color);
-      if (!e) { e = { ids: [], area: 0 }; byColor.set(regions[id].color, e); }
-      e.ids.push(id); e.area += regions[id].size;
-    }
-    let bestColor = null, bestArea = -1;
-    for (const [c, e] of byColor) if (e.area > bestArea) { bestArea = e.area; bestColor = c; }
-    const chosen = byColor.get(bestColor).ids;
-    for (const id of chosen) { absorbed[id] = 1; frontier.delete(id); }
-    for (const id of chosen) for (const nb of adj[id]) if (!absorbed[nb]) frontier.add(nb);
-    sheets.push({ color: bestColor, members: chosen });
-  }
-  return sheets;
-}
+// The graph algorithms (region labeling, denoise, and the peel-order
+// planner — greedy + budgeted exact search) live in paperStack.js.
 
 const PAPER_FRAME_COLOR = "#ff2d78"; // fallback registration color if no background
 
@@ -1117,9 +1010,22 @@ function buildPaperStack(S, grid, palette, bgColor, minCells = 5) {
   const { nx, ny } = S;
   const fit = computeFit(S);
 
+  // collapse duplicate hexes up front: two grid values with the same paper
+  // color must label as ONE color, so its regions can gather onto one sheet
+  // (and so no two adjacent regions ever share a color, which the planner's
+  // one-color-per-step transitions and lower bound rely on)
+  const hexId = new Map();
+  const uniq = [];
+  for (let p = 0; p < nx * ny; p++) {
+    const hx = palette[grid[p]];
+    let id = hexId.get(hx);
+    if (id === undefined) { id = uniq.length; hexId.set(hx, id); uniq.push(hx); }
+    grid[p] = id;
+  }
+
   denoiseGrid(grid, nx, ny, minCells);
   const { label, regions } = labelRegions(grid, nx, ny);
-  for (const r of regions) r.color = palette[r.value];
+  for (const r of regions) r.color = uniq[r.value];
   const adj = buildAdjacency(label, regions.length, nx, ny);
 
   // frame: a virtual node adjacent to every region touching the grid border
@@ -1131,7 +1037,7 @@ function buildPaperStack(S, grid, palette, bgColor, minCells = 5) {
   for (let y = 0; y < ny; y++) { touch.add(label[y * nx]); touch.add(label[y * nx + nx - 1]); }
   for (const r of touch) { adj[frameId].add(r); adj[r].add(frameId); }
 
-  const sheets = collapseStack(regions, adj, frameId);
+  const { sheets, method } = planCollapse(regions, adj, frameId);
 
   // exact projected water outline (clip) + overshoot expansion, as in the
   // union-layer path, so each sheet's cut edge overshoots the frame instead of
@@ -1176,7 +1082,7 @@ function buildPaperStack(S, grid, palette, bgColor, minCells = 5) {
     }
     out.push({ color: sh.color, d, frame: !!sh.frame, solid });
   }
-  return { sheets: out, clip, nSheets: out.length };
+  return { sheets: out, clip, nSheets: out.length, method };
 }
 
 // tile the sheets into one printable SVG: each is the full viewport in its
@@ -1191,8 +1097,9 @@ function buildPaperStackSvg(stack) {
   const W = pad * 2 + cols * tileW + (cols - 1) * gap;
   const H = top + pad + rows * (tileH + labelH) + (rows - 1) * gap;
   const sx = tileW / VB_W;
+  const ord = stack.method === "optimal" ? "provably fewest" : "greedy order";
   let body = `<text x="${pad}" y="26" font-family="ui-monospace,monospace" font-size="15" fill="#e6eef5">`
-    + `Layered paper stack · ${N} sheets · top → bottom (assemble bottom → top)</text>`;
+    + `Layered paper stack · ${N} sheets (${ord}) · top → bottom (assemble bottom → top)</text>`;
   sheets.forEach((sh, i) => {
     const cx = pad + (i % cols) * (tileW + gap);
     const cy = top + Math.floor(i / cols) * (tileH + labelH + gap);
@@ -1716,7 +1623,7 @@ export default function App() {
     const svg = buildPaperStackSvg(stack);
     saveSvg(svg, "reflection-paper-stack.svg");
     setSvgName("reflection-paper-stack.svg");
-    setStackInfo({ nSheets: stack.nSheets });
+    setStackInfo({ nSheets: stack.nSheets, method: stack.method });
     setSvgOut(svg);
   };
   const copySvg = () => {
@@ -2252,7 +2159,11 @@ export default function App() {
                       padding: 6, marginBottom: 10, maxHeight: 320, overflow: "auto" }}
                       dangerouslySetInnerHTML={{ __html: svgOut }} />
                     <div style={{ fontSize: 10.5, color: "#8a9bab", marginBottom: 10, lineHeight: 1.5 }}>
-                      {stackInfo.nSheets} sheets · top → bottom. Hatched = holes to cut.
+                      {stackInfo.nSheets} sheets
+                      {stackInfo.method === "optimal"
+                        ? " — provably the fewest for this scene"
+                        : " — greedy order (scene too complex for exact search)"}
+                      · top → bottom. Hatched = holes to cut.
                       Cut each sheet from paper of its labeled color, then assemble bottom → top.
                     </div>
                   </>
