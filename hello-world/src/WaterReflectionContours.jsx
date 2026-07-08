@@ -1056,9 +1056,40 @@ function buildPaperStack(S, grid, palette, bgColor, minCells = 5) {
   // the cumulative union). The cut line is then the boundary between this
   // sheet's paper and the sheets below; it only touches the grid rim (the
   // water<->background edge) on the top sheet, never re-cutting it afterwards.
+  //
+  // A raw 0/1 mask contour is a per-cell staircase (marching squares puts
+  // every vertex at a cell-edge midpoint), so — same trick as the union
+  // layers — contour the zero level set of a lightly blurred SIGNED DISTANCE
+  // field of the mask instead: the crossing interpolates to sub-cell
+  // positions and the cut edge comes out as smooth as the normal export.
   const px = nx + 2, py = ny + 2;
   const cum = new Uint8Array(nx * ny);
+  const inv = new Uint8Array(nx * ny);
+  const F = new Float64Array(nx * ny);
+  const tmp = new Float64Array(nx * ny);
   const FP = new Float64Array(px * py);
+  // physical guard: the sheet is one piece only because every paper component
+  // reaches the grid border (= the mount margin). True for the planner's mask
+  // by construction; the blur must not pinch a thin bridge and break it.
+  const paperHoldsTogether = () => {
+    const seen = new Uint8Array(nx * ny);
+    const st = [];
+    for (let s = 0; s < nx * ny; s++) {
+      if (F[s] >= 0 || seen[s]) continue;
+      let touchesBorder = false;
+      seen[s] = 1; st.push(s);
+      while (st.length) {
+        const p = st.pop(), x = p % nx, y = (p / nx) | 0;
+        if (x === 0 || x === nx - 1 || y === 0 || y === ny - 1) touchesBorder = true;
+        if (x > 0 && F[p - 1] < 0 && !seen[p - 1]) { seen[p - 1] = 1; st.push(p - 1); }
+        if (x < nx - 1 && F[p + 1] < 0 && !seen[p + 1]) { seen[p + 1] = 1; st.push(p + 1); }
+        if (y > 0 && F[p - nx] < 0 && !seen[p - nx]) { seen[p - nx] = 1; st.push(p - nx); }
+        if (y < ny - 1 && F[p + nx] < 0 && !seen[p + nx]) { seen[p + nx] = 1; st.push(p + nx); }
+      }
+      if (!touchesBorder) return false;
+    }
+    return true;
+  };
   let cumCount = 0;
   const out = [];
   for (let si = 0; si < sheets.length; si++) {
@@ -1070,14 +1101,30 @@ function buildPaperStack(S, grid, palette, bgColor, minCells = 5) {
     let d = "";
     const solid = cumCount >= nx * ny;
     if (!solid) {                          // an open hole remains to cut
+      for (let p = 0; p < nx * ny; p++) inv[p] = 1 - cum[p];
+      const Din = distTransform(inv, nx, ny);   // depth into the hole
+      const Dout = distTransform(cum, nx, ny);  // depth into the paper
+      let thick = 0;
+      for (let p = 0; p < nx * ny; p++) {
+        F[p] = Din[p] - Dout[p];                // >0 hole, <0 paper
+        if (F[p] > thick) thick = F[p];
+      }
+      // skip the blur on hairline holes (it would erase them), and undo it if
+      // it disconnected the paper — sub-cell interpolation still smooths
+      if (thick >= 2) {
+        blurField(F, nx, ny, tmp, 1);
+        if (!paperHoldsTogether()) {
+          for (let p = 0; p < nx * ny; p++) F[p] = Din[p] - Dout[p];
+        }
+      }
       for (let j = 0; j < py; j++) {
         const jj = Math.min(ny - 1, Math.max(0, j - 1));
         for (let i = 0; i < px; i++) {
           const ii = Math.min(nx - 1, Math.max(0, i - 1));
-          FP[j * px + i] = 1 - cum[jj * nx + ii];
+          FP[j * px + i] = F[jj * nx + ii];
         }
       }
-      const cont = d3.contours().size([px, py]).thresholds([0.5])(FP)[0];
+      const cont = d3.contours().size([px, py]).thresholds([0])(FP)[0];
       if (cont) d = multiToPath(cont, S, fit, -1, ex);
     }
     out.push({ color: sh.color, d, frame: !!sh.frame, solid });
