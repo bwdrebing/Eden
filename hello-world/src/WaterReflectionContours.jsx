@@ -194,6 +194,19 @@ function heightAt(gx, gy, S) {
   return z;
 }
 
+// keep the 3D lift well below the camera: an exaggerated crest that rose to
+// (or past) the camera height would cross the projection plane and explode
+// into spikes at the frame edges. Soft clamp — gentle settings pass through
+// almost linearly, extreme ones saturate at 3/4 of the camera height. In
+// rectangular output the frame-fill stretches vertical screen distances by
+// scaleY/scale, so the lift is pre-shrunk by that ratio to subtend the same
+// apparent relief instead of smearing into streaks.
+function clampLift(z, S, fit) {
+  const aniso = fit && fit.scaleY ? Math.min(1, fit.scale / fit.scaleY) : 1;
+  const m = 0.75 * S.H;
+  return m * Math.tanh((z * aniso) / m);
+}
+
 function slopeAt(gx, gy, S) {
   let hx = 0, hy = 0;
   for (const e of S._ems) {
@@ -325,7 +338,7 @@ function computeFit(S) {
     scaleY = ((VB_H - 2 * m) / (maxY - minY)) * (S.zoom || 1);
   }
   const bcx = (minX + maxX) / 2, bcy = (minY + maxY) / 2;
-  const ox = VB_W / 2 - scale * bcx;
+  const ox = VB_W / 2 - scale * bcx + (S.panX || 0) * (VB_W / 2);
   const oy = VB_H / 2 - scaleY * bcy + (S.panY || 0) * (VB_H / 2);
   return { scale, scaleY, ox, oy };
 }
@@ -418,7 +431,7 @@ function multiToPath(multi, S, fit, off = 0, ex = null) {
         const [gx, gy] = cell2ground(gi, gj, S);
         let X, Y;
         if (lift) {
-          const gz = heightAt(gx, gy, S) * S.waveScale;
+          const gz = clampLift(heightAt(gx, gy, S) * S.waveScale, S, fit);
           const p = penProject(gx, gy, gz, S, fit);
           X = p[0]; Y = p[1];
         } else {
@@ -615,7 +628,7 @@ function buildPenLines(S, fit, colorAt, opts) {
       let gx, gy;
       if (rect) { const g = cell2ground((s / samples) * S.nx, rowIy, S); gx = g[0]; gy = g[1]; }
       else { gx = S.xMin + (s / samples) * (S.xMax - S.xMin); gy = gyLin; }
-      const gz = threeD ? heightAt(gx, gy, S) * relief : 0;
+      const gz = threeD ? clampLift(heightAt(gx, gy, S) * relief, S, fit) : 0;
       const [sx, sy] = penProject(gx, gy, gz, S, fit);
       PX[s] = sx; PY[s] = sy; COL[s] = colorAt(gx, gy);
       // visible if it rises to / above the silhouette of everything nearer
@@ -691,7 +704,7 @@ function buildDepthBuffer(S, fit, relief, threeD, BW, BH) {
   const SX = new Float64Array(stride * stride), SY = new Float64Array(stride * stride), DP = new Float64Array(stride * stride);
   for (let j = 0; j <= gN; j++) for (let i = 0; i <= gN; i++) {
     const [gx, gy] = cell2ground((i / gN) * S.nx, (j / gN) * S.ny, S);
-    const gz = threeD ? heightAt(gx, gy, S) * relief : 0;
+    const gz = threeD ? clampLift(heightAt(gx, gy, S) * relief, S, fit) : 0;
     const [sx, sy, dp] = penProject(gx, gy, gz, S, fit);
     const q = j * stride + i; SX[q] = sx / VB_W * BW; SY[q] = sy / VB_H * BH; DP[q] = dp;
   }
@@ -733,7 +746,7 @@ function buildPenConcentric(S, fit, colorAt, opts) {
     for (let k = 0; k <= n; k++) {
       const v = ring[k % n];
       const [gx, gy] = cell2ground(v[0], v[1], S);
-      const gz = threeD ? heightAt(gx, gy, S) * relief : 0;
+      const gz = threeD ? clampLift(heightAt(gx, gy, S) * relief, S, fit) : 0;
       const [sx, sy, depth] = penProject(gx, gy, gz, S, fit);
       if (visAt(sx, sy, depth)) {
         const pt = sx.toFixed(1) + " " + sy.toFixed(1) + " ";
@@ -1685,7 +1698,7 @@ export default function App() {
   const [perspective, setPerspective] = useState(true);
   const [rectOutput, setRectOutput] = useState(false);
   const [surface3d, setSurface3d] = useState(false); // lift color regions onto the waves
-  const [waveScale, setWaveScale] = useState(35);     // 3D wave-height exaggeration
+  const [waveScale, setWaveScale] = useState(1.5);    // 3D wave-height exaggeration
   const [edges, setEdges] = useState(false);
   const [animate, setAnimate] = useState(false);
   const [speed, setSpeed] = useState(0.5);
@@ -1742,6 +1755,7 @@ export default function App() {
   const [bgColor, setBgColor] = useState("");       // "" = auto
 
   const [zoom, setZoom] = useState(1);
+  const [panX, setPanX] = useState(0);
   const [panY, setPanY] = useState(0);
   const [smooth, setSmooth] = useState(2);
   const [mode, setMode] = useState("preset"); // "preset" | "paint1d" | "paint2d"
@@ -1763,6 +1777,58 @@ export default function App() {
     const seeded = seedEnv2D(palette, ENV2D_W, ENV2D_H);
     setEnv2d(seeded); setSegEnv(seeded); setMode("paint2d");
   };
+
+  // camera interaction: drag the preview to pan, scroll to zoom (anchored at
+  // the cursor). Toggleable so touch users can still scroll past the preview.
+  const previewRef = useRef(null);
+  const dragRef = useRef(null);
+  const [camDrag, setCamDrag] = useState(
+    () => typeof window === "undefined" || window.innerWidth >= 820);
+  const camRef = useRef({ panX: 0, panY: 0, zoom: 1 });
+  camRef.current = { panX, panY, zoom };
+  const clampPan = (v) => Math.max(-2.5, Math.min(2.5, v));
+  const resetCamera = () => { setZoom(1); setPanX(0); setPanY(0); };
+
+  useEffect(() => {
+    const el = previewRef.current;
+    if (!el || !camDrag) return;
+    // native listener: React registers wheel as passive, so preventDefault
+    // (needed to stop the page scrolling) only works this way
+    const onWheel = (e) => {
+      e.preventDefault();
+      const r = el.getBoundingClientRect();
+      const { panX: px, panY: py, zoom: z } = camRef.current;
+      const z2 = Math.max(1, Math.min(14, z * Math.exp(-e.deltaY * 0.0016)));
+      const k = z2 / z;
+      if (k === 1) return;
+      const ocx = ((e.clientX - r.left) / r.width - 0.5) * 2;  // -1..1 across
+      const ocy = ((e.clientY - r.top) / r.height - 0.5) * 2;
+      setZoom(z2);
+      setPanX(clampPan(px + (1 - k) * (ocx - px)));
+      setPanY(clampPan(py + (1 - k) * (ocy - py)));
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, [camDrag]);
+
+  const camPointer = camDrag ? {
+    onPointerDown: (e) => {
+      if (e.button !== 0 && e.pointerType === "mouse") return;
+      e.currentTarget.setPointerCapture(e.pointerId);
+      dragRef.current = { x: e.clientX, y: e.clientY,
+        panX: camRef.current.panX, panY: camRef.current.panY };
+    },
+    onPointerMove: (e) => {
+      const d = dragRef.current;
+      if (!d) return;
+      const r = e.currentTarget.getBoundingClientRect();
+      setPanX(clampPan(d.panX + (2 * (e.clientX - d.x)) / r.width));
+      setPanY(clampPan(d.panY + (2 * (e.clientY - d.y)) / r.height));
+    },
+    onPointerUp: () => { dragRef.current = null; },
+    onPointerCancel: () => { dragRef.current = null; },
+    onDoubleClick: resetCamera,
+  } : {};
 
   const tRef = useRef(0);
   const [, force] = useState(0);
@@ -1795,7 +1861,7 @@ export default function App() {
     decay: 0.18 - spread * 0.16,
     omega: 1.0,
     t: animate ? tRef.current : 0,
-    bands, perspective, eLo, eHi, zoom, panY, smooth, coherence, rectOutput,
+    bands, perspective, eLo, eHi, zoom, panX, panY, smooth, coherence, rectOutput,
     surface3d, waveScale, bandFractions, fresOn, fresBands,
     // waves scatter off the buoy's hull: a ring source pinned to the object,
     // with a tight decay so the disturbance stays local
@@ -1804,7 +1870,7 @@ export default function App() {
           size: Math.max(0.3, objSize * objRippleScale), amp: objRipple * 1.5, decay: 0.28 }]
       : emitters,
   }), [quality, steep, pitchDeg, wavelength, strength, sharp, spread, bands, perspective,
-       halfW, yFar, eLo, eHi, zoom, panY, smooth, coherence, rectOutput, surface3d, waveScale,
+       halfW, yFar, eLo, eHi, zoom, panX, panY, smooth, coherence, rectOutput, surface3d, waveScale,
        bandFractions, fresOn, fresBands,
        emitters, animate, speed, tRef.current,
        objOn, objX, objY, objSize, objRipple, objRippleScale]);
@@ -2131,10 +2197,13 @@ export default function App() {
           gridTemplateColumns: "minmax(0,1fr) 320px", gap: 16, alignItems: "start" }}>
 
           {/* PREVIEW */}
-          <div style={{ background: "#05080b", borderRadius: 14, border: "1px solid #1b2530",
+          <div ref={previewRef} {...camPointer}
+            style={{ background: "#05080b", borderRadius: 14, border: "1px solid #1b2530",
             overflow: "hidden", position: "sticky",
             top: isNarrow ? 8 : 22, zIndex: 5,
             marginBottom: isNarrow ? 14 : 0,
+            touchAction: camDrag ? "none" : undefined,
+            cursor: camDrag ? "grab" : undefined,
             boxShadow: "0 8px 24px rgba(0,0,0,0.55)" }}>
             <svg viewBox={`0 0 ${VB_W} ${VB_H}`} style={{ width: "100%", display: "block" }}>
               <rect width={VB_W} height={VB_H} fill={bgFill} />
@@ -2238,21 +2307,53 @@ export default function App() {
               {penMode ? `${penStyle === "rings" ? "rings" : penCount + " lines"} · ${penLines.length} pens${S.perspective && penRelief > 0 ? " · 3D" : ""}${penHidden ? " · hidden-line" : ""}`
                 : `${regionCount} regions · ${S.nx}×${S.ny} sample grid${surface3d && perspective ? " · 3D" : ""}`}
             </div>
+            <button onClick={() => setCamDrag((v) => !v)}
+              onPointerDown={(e) => e.stopPropagation()}
+              title={camDrag ? "camera drag ON: drag to pan, scroll to zoom, double-click to reset"
+                : "camera drag OFF"}
+              style={{ position: "absolute", right: 10, top: 10, width: 34, height: 34,
+                borderRadius: 8, cursor: "pointer", fontSize: 15, lineHeight: 1,
+                background: camDrag ? "#27424b" : "#141b23e0",
+                color: camDrag ? "#dff1f6" : "#7f93a4",
+                border: "1px solid " + (camDrag ? "#3f7e8f" : "#26313c") }}>✥</button>
           </div>
 
           {/* CONTROLS */}
           <div>
             <div style={panel}>
-              <div style={heading}>Surface & view</div>
-              <Slider label="View angle (near edge)" value={steep} min={0} max={1} step={0.01}
+              <div style={heading}>Camera</div>
+              <Slider label="Height (view angle at near edge)" value={steep} min={0} max={1} step={0.01}
                 onChange={setSteep}
                 fmt={(v) => Math.round(Math.atan((0.4 * Math.pow(22.5, v)) / 3) * 180 / Math.PI) + "°"} />
               {perspective && (
-                <Slider label="Camera pitch (framing)" value={pitchDeg} min={4} max={55} step={0.5}
+                <Slider label="Pitch (perspective squash)" value={pitchDeg} min={4} max={55} step={0.5}
                   onChange={setPitchDeg} fmt={(v) => v.toFixed(1) + "°"} />
               )}
-              <Slider label="Camera roll" value={rollDeg} min={-30} max={30} step={0.5}
+              <Slider label="Roll" value={rollDeg} min={-30} max={30} step={0.5}
                 onChange={setRollDeg} fmt={(v) => (v === 0 ? "level" : v.toFixed(1) + "°")} />
+              <Slider label="Zoom (focal length)" value={zoom} min={1} max={14} step={0.05}
+                onChange={setZoom} fmt={(v) => v.toFixed(2) + "×"} />
+              <Slider label="Pan ← →" value={panX} min={-2} max={2} step={0.02}
+                onChange={setPanX} fmt={(v) => (v === 0 ? "center" : v.toFixed(2))} />
+              <Slider label="Pan ↑ ↓" value={panY} min={-2} max={2} step={0.02}
+                onChange={setPanY} fmt={(v) => (v === 0 ? "center" : v.toFixed(2))} />
+              <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+                <button style={miniBtn} onClick={resetCamera}>Full scene</button>
+                <button style={miniBtn}
+                  onClick={() => { setZoom(3.2); setPanX(0); setPanY(0.5); }}>Mid-field</button>
+                <button style={miniBtn}
+                  onClick={() => { setZoom(5.5); setPanX(0); setPanY(0.75); }}>Far band</button>
+              </div>
+              <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5,
+                fontFamily: "ui-monospace, monospace" }}>
+                Or grab the picture: drag to pan, scroll / pinch-zoom at the cursor,
+                double-click to reset. The ✥ button on the preview toggles this
+                (turn it off to scroll the page on touch screens).
+              </div>
+            </div>
+
+            <div style={panel}>
+              <div style={heading}>Water surface</div>
               <Slider label="Ripple scale (λ)" value={wavelength} min={1.2} max={7} step={0.1}
                 onChange={setWavelength} fmt={(v) => v.toFixed(1)} />
               <Slider label="Ripple strength" value={strength} min={0.05} max={1} step={0.01}
@@ -2518,10 +2619,6 @@ export default function App() {
               <div style={heading}>Display</div>
               <Slider label="Edge smoothing" value={smooth} min={0} max={4} step={1}
                 onChange={setSmooth} fmt={(v) => (v === 0 ? "off (crisp)" : v + "×")} />
-              <Slider label="Zoom" value={zoom} min={1} max={14} step={0.05}
-                onChange={setZoom} fmt={(v) => v.toFixed(2) + "×"} />
-              <Slider label="Vertical pan" value={panY} min={-1} max={1} step={0.02}
-                onChange={setPanY} fmt={(v) => (v === 0 ? "center" : v.toFixed(2))} />
               <Toggle label="Grazing perspective" value={perspective} onChange={setPerspective} />
               {perspective && (
                 <Toggle label="Rectangular output (fill frame)" value={rectOutput} onChange={setRectOutput} />
@@ -2534,8 +2631,8 @@ export default function App() {
               )}
               {!penMode && perspective && surface3d && (
                 <>
-                  <Slider label="Wave height (3D)" value={waveScale} min={0} max={120} step={2}
-                    onChange={setWaveScale} fmt={(v) => (v === 0 ? "flat" : String(v))} />
+                  <Slider label="Wave height (3D)" value={waveScale} min={0} max={3} step={0.05}
+                    onChange={setWaveScale} fmt={(v) => (v === 0 ? "flat" : v.toFixed(2))} />
                   <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 8, lineHeight: 1.5,
                     fontFamily: "ui-monospace, monospace" }}>
                     Lifts the color regions onto the actual wave crests to preview the surface
