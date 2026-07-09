@@ -16,6 +16,52 @@ const PALETTES = {
   "Obra Dinn":   ["#0b0b0b", "#262626", "#565656", "#8f8f8f", "#c7c7c7", "#f2f2f2"],
 };
 
+// Banded palettes: piecewise-constant elevation strips [color, weight] from
+// horizon (first) to zenith (last), instead of a smooth ramp. The thin dark
+// strips are the key: the reflected-elevation field is continuous, so every
+// boundary between the bands on either side must pass THROUGH the strip —
+// it draws itself as a closed hairline outline around each color region,
+// the "ink line" look of real harbor-water reflections.
+const BANDED_PALETTES = {
+  // each ink strip gets a visually identical but UNIQUE hex: a repeated color
+  // fuses into one multi-strip region in the 2D segmentation, whose union
+  // layer grows hairline protrusions that the sliver blur then eats. Unique
+  // strips keep every union a clean upper set of elevation.
+  "Harbor Ink": [
+    ["#eef7fb", 0.15], ["#06090d", 0.022], ["#9fd2e2", 0.15], ["#070a0e", 0.022],
+    ["#4b93bd", 0.16], ["#05080c", 0.022], ["#20608a", 0.15], ["#060a0e", 0.022],
+    ["#143b58", 0.14], ["#07090d", 0.026], ["#0d2334", 0.126],
+  ],
+  "Sunset Buoy": [
+    ["#f6edc9", 0.13], ["#e5a94b", 0.05], ["#cd5a28", 0.028], ["#f2d98a", 0.07],
+    ["#8c9cc8", 0.12], ["#c8551f", 0.024], ["#46689e", 0.14], ["#2b1710", 0.024],
+    ["#31518a", 0.13], ["#15101e", 0.05], ["#101c38", 0.12], ["#7e2d12", 0.022],
+    ["#060a14", 0.09],
+  ],
+  "Black Water": [
+    ["#d9f0f4", 0.12], ["#f6fbfb", 0.02], ["#a7c4ef", 0.13], ["#8e959d", 0.024],
+    ["#7e97dd", 0.14], ["#494f58", 0.024], ["#0b0e13", 0.22], ["#b9c8ee", 0.028],
+    ["#05070b", 0.294],
+  ],
+};
+
+// cumulative stops of a banded palette: [{c, f0, f1}] with f = fraction of the
+// elevation range, horizon (0) -> zenith (1). null for smooth palettes.
+function paletteStops(name) {
+  const b = BANDED_PALETTES[name];
+  if (!b) return null;
+  const total = b.reduce((s, [, w]) => s + w, 0);
+  let acc = 0;
+  return b.map(([c, w]) => { const f0 = acc / total; acc += w; return { c, f0, f1: acc / total }; });
+}
+
+function paletteColorAt(name, f) {
+  const stops = paletteStops(name);
+  if (!stops) return d3.interpolateRgbBasis(PALETTES[name])(f);
+  for (const s of stops) if (f < s.f1) return s.c;
+  return stops[stops.length - 1].c;
+}
+
 const VB_W = 760;
 const VB_H = 500;
 
@@ -45,11 +91,21 @@ function rand1(i) {
   return x - Math.floor(x);
 }
 
+// Distance filter: short waves narrower than what the sample grid (and the
+// eye) can resolve at range gy fade out smoothly instead of aliasing into
+// far-field speckle. Returns the coefficient a such that the attenuation at
+// range gy is 1 / (1 + (a·gy)²). Perspective only — in plan view every part
+// of the plane is equally close.
+function aaCoef(k, S) {
+  return S.perspective ? (0.22 * k) / S.ny : 0;
+}
+
 // Pre-bake an emitter into per-frame constants so the per-sample loop is cheap.
 function prepEmitter(em, S) {
   const baseLambda = (2 * Math.PI / S.k) * em.size; // global λ × size
   const A = S.amp * em.amp;
   const wt = S.omega * S.t;
+  const q = S.sharp || 0;   // Stokes-style crest sharpening, 2nd harmonic weight
 
   if (em.type === "point") {
     // em.decay overrides the global reach — used by the buoy's scattered
@@ -59,7 +115,9 @@ function prepEmitter(em, S) {
   }
   if (em.type === "swell") {
     const a = (em.dir * Math.PI) / 180;
-    return { type: "swell", k0: 2 * Math.PI / baseLambda, Dx: Math.cos(a), Dy: Math.sin(a), A, ph0: -wt };
+    const k0 = 2 * Math.PI / baseLambda;
+    return { type: "swell", k0, Dx: Math.cos(a), Dy: Math.sin(a), A, ph0: -wt,
+      q, aa: aaCoef(k0, S) };
   }
   if (em.type === "rings") {
     // a scattered field of radial ripple sources -> concentric color rings
@@ -77,25 +135,30 @@ function prepEmitter(em, S) {
     }
     return { type: "rings", M, CX, CY, K, AMP, PH, dec };
   }
-  // spectrum
+  // spectrum: a ladder of components from baseLambda down through several
+  // octaves — 1.5 octaves when glassy up to ~6 when rough — with jittered
+  // wavelengths so the ladder rungs don't beat against each other, and a
+  // directional spread that widens for the short waves (as in real seas)
   const N = Math.max(2, em.detail | 0);
   const wind = (em.dir * Math.PI) / 180;
   const spread = (em.spread * Math.PI) / 180;
   const rough = em.roughness;
-  const K = [], DX = [], DY = [], AMP = [], PH = [];
+  const K = [], DX = [], DY = [], AMP = [], PH = [], AA = [];
   for (let i = 0; i < N; i++) {
     const f = i / (N - 1);
-    const lam = baseLambda * Math.pow(0.5, f * (1 + 3.2 * rough)); // long → short as roughness rises
+    const lam = baseLambda * Math.pow(0.5, f * (1.5 + 4.5 * rough))
+      * (1 + (rand1(i * 5 + 9) - 0.5) * 0.35);
     const ki = 2 * Math.PI / lam;
-    const th = wind + (rand1(i * 2 + 1) - 0.5) * 2 * spread;
+    const th = wind + (rand1(i * 2 + 1) - 0.5) * 2 * spread * (0.7 + 0.6 * f);
     const om = Math.sqrt(ki) * S.omega;
     K.push(ki);
     DX.push(Math.cos(th));
     DY.push(Math.sin(th));
     AMP.push(A * (lam / baseLambda) / N * 1.5);       // longer waves carry more energy
     PH.push(rand1(i * 2 + 2) * Math.PI * 2 - om * S.t);
+    AA.push(aaCoef(ki, S));
   }
-  return { type: "spectrum", K, DX, DY, AMP, PH, N };
+  return { type: "spectrum", K, DX, DY, AMP, PH, AA, N, q };
 }
 
 // actual surface height (the wave displacement) — mirrors slopeAt but returns
@@ -108,7 +171,11 @@ function heightAt(gx, gy, S) {
       const r = Math.hypot(dx, dy) + 1e-6;
       z += e.A * Math.exp(-e.decay * r) * Math.sin(e.k0 * r - e.wt);
     } else if (e.type === "swell") {
-      z += e.A * Math.sin(e.k0 * (e.Dx * gx + e.Dy * gy) + e.ph0);
+      const s1 = Math.sin(e.k0 * (e.Dx * gx + e.Dy * gy) + e.ph0);
+      // Stokes-ish profile: 2nd harmonic peaks the crests, flattens troughs
+      const prof = e.q ? s1 - e.q * 0.5 + e.q * s1 * s1 : s1;
+      const x = e.aa * gy;
+      z += e.A * prof / (1 + x * x);
     } else if (e.type === "rings") {
       for (let i = 0; i < e.M; i++) {
         const dx = gx - e.CX[i], dy = gy - e.CY[i];
@@ -117,7 +184,10 @@ function heightAt(gx, gy, S) {
       }
     } else {
       for (let i = 0; i < e.N; i++) {
-        z += e.AMP[i] * Math.sin(e.K[i] * (e.DX[i] * gx + e.DY[i] * gy) + e.PH[i]);
+        const s1 = Math.sin(e.K[i] * (e.DX[i] * gx + e.DY[i] * gy) + e.PH[i]);
+        const prof = e.q ? s1 - e.q * 0.5 + e.q * s1 * s1 : s1;
+        const x = e.AA[i] * gy;
+        z += e.AMP[i] * prof / (1 + x * x);
       }
     }
   }
@@ -134,7 +204,12 @@ function slopeAt(gx, gy, S) {
       const f = e.A * env * (e.k0 * Math.cos(e.k0 * r - e.wt) - e.decay * Math.sin(e.k0 * r - e.wt));
       hx += f * dx / r; hy += f * dy / r;
     } else if (e.type === "swell") {
-      const c = e.A * e.k0 * Math.cos(e.k0 * (e.Dx * gx + e.Dy * gy) + e.ph0);
+      const th = e.k0 * (e.Dx * gx + e.Dy * gy) + e.ph0;
+      // d/dθ of the sharpened profile: cosθ·(1 + 2q·sinθ)
+      let c = e.A * e.k0 * Math.cos(th);
+      if (e.q) c *= 1 + 2 * e.q * Math.sin(th);
+      const x = e.aa * gy;
+      c /= 1 + x * x;
       hx += c * e.Dx; hy += c * e.Dy;
     } else if (e.type === "rings") {
       for (let i = 0; i < e.M; i++) {
@@ -147,7 +222,11 @@ function slopeAt(gx, gy, S) {
       }
     } else {
       for (let i = 0; i < e.N; i++) {
-        const c = e.AMP[i] * e.K[i] * Math.cos(e.K[i] * (e.DX[i] * gx + e.DY[i] * gy) + e.PH[i]);
+        const th = e.K[i] * (e.DX[i] * gx + e.DY[i] * gy) + e.PH[i];
+        let c = e.AMP[i] * e.K[i] * Math.cos(th);
+        if (e.q) c *= 1 + 2 * e.q * Math.sin(th);
+        const x = e.AA[i] * gy;
+        c /= 1 + x * x;
         hx += c * e.DX[i]; hy += c * e.DY[i];
       }
     }
@@ -155,18 +234,9 @@ function slopeAt(gx, gy, S) {
   return [hx, hy];
 }
 
-function phiAt(gx, gy, t, S) {
-  const [hx, hy] = slopeAt(gx, gy, S);
-  let nx = -hx, ny = -hy, nz = 1;
-  const nl = Math.hypot(nx, ny, nz); nx /= nl; ny /= nl; nz /= nl;
-  let vx = gx, vy = gy, vz = -S.H;
-  const vl = Math.hypot(vx, vy, vz); vx /= vl; vy /= vl; vz /= vl;
-  const d = vx * nx + vy * ny + vz * nz;
-  const rz = vz - 2 * d * nz;
-  return Math.asin(Math.max(-1, Math.min(1, rz))) * 180 / Math.PI;
-}
-
-// full reflected direction (unit) — gives both elevation and azimuth
+// full reflected direction (unit) — gives both elevation and azimuth.
+// 4th component = cos of the incidence angle (view ray vs surface normal),
+// which sets the Fresnel reflectance at this point.
 function reflectAt(gx, gy, S) {
   const [hx, hy] = slopeAt(gx, gy, S);
   let nx = -hx, ny = -hy, nz = 1;
@@ -174,7 +244,32 @@ function reflectAt(gx, gy, S) {
   let vx = gx, vy = gy, vz = -S.H;
   const vl = Math.hypot(vx, vy, vz); vx /= vl; vy /= vl; vz /= vl;
   const d = vx * nx + vy * ny + vz * nz;
-  return [vx - 2 * d * nx, vy - 2 * d * ny, vz - 2 * d * nz];
+  return [vx - 2 * d * nx, vy - 2 * d * ny, vz - 2 * d * nz, -d];
+}
+
+// Schlick Fresnel for water (R0 ≈ 0.02): the fraction of light NOT reflected
+// at this incidence — i.e. the weight of the transmitted deep-water color.
+// Grazing view -> ~0 (perfect mirror); looking straight down -> ~0.98.
+function fresnelDeepW(cosI) {
+  const c = cosI < 0 ? 0 : cosI > 1 ? 1 : cosI;
+  const m = 1 - c;
+  return 1 - (0.02 + 0.98 * m * m * m * m * m);
+}
+
+// quantized Lab mix toward the deep-water color: band b of K, b = 0 pure
+// reflection, b = K-1 fully "deep". Cached — called per region per band.
+function makeDeepMixer(deep, strength, K) {
+  const cache = new Map();
+  return (color, b) => {
+    if (!b) return color;
+    const key = color + "|" + b;
+    let v = cache.get(key);
+    if (v === undefined) {
+      v = d3.color(d3.interpolateLab(color, deep)(strength * b / (K - 1))).formatHex();
+      cache.set(key, v);
+    }
+    return v;
+  };
 }
 
 // ---- geometry helpers ---------------------------------------------
@@ -233,6 +328,19 @@ function computeFit(S) {
   const ox = VB_W / 2 - scale * bcx;
   const oy = VB_H / 2 - scaleY * bcy + (S.panY || 0) * (VB_H / 2);
   return { scale, scaleY, ox, oy };
+}
+
+// camera roll: rotate the finished picture about the viewport center, scaled
+// up just enough that the rotated frame still covers the viewport (cover-fit,
+// like rotating a photo). Applied as one SVG group transform so every mode —
+// regions, pen lines, buoy, clips — rolls consistently.
+function rollTransform(rollDeg) {
+  if (!rollDeg) return null;
+  const r = (rollDeg * Math.PI) / 180;
+  const ca = Math.abs(Math.cos(r)), sa = Math.abs(Math.sin(r));
+  const s = Math.max((VB_W * ca + VB_H * sa) / VB_W, (VB_W * sa + VB_H * ca) / VB_H);
+  const cx = VB_W / 2, cy = VB_H / 2;
+  return `rotate(${rollDeg} ${cx} ${cy}) translate(${(cx * (1 - s)).toFixed(2)} ${(cy * (1 - s)).toFixed(2)}) scale(${s.toFixed(4)})`;
 }
 
 // Chaikin corner-cutting on a closed ring — rounds the marching-squares
@@ -659,12 +767,29 @@ function buildPenConcentric(S, fit, colorAt, opts) {
 // 2D environment panorama: width = azimuth (looking across the lake),
 // height = elevation (waterline at the bottom, sky at the top).
 const ENV2D_W = 84, ENV2D_H = 52;
+// taller row count for panoramas derived from presets / the 1D strip when
+// reflected objects force the 2D path — keeps hairline bands ≥ 2 rows
+const DERIVED_ENV_H = 96;
 
 // 1D environment strip: color by elevation only (horizon -> zenith)
 const ENV_N = 64;
 function seedEnv(name, n) {
-  const interp = d3.interpolateRgbBasis(PALETTES[name]);
-  return d3.range(n).map((i) => d3.color(interp(i / (n - 1))).formatHex());
+  return d3.range(n).map((i) => d3.color(paletteColorAt(name, i / (n - 1))).formatHex());
+}
+
+// collapse the painted 1D strip into runs of equal color: one band per run,
+// with boundaries exactly at the run edges. Unlike sampling N evenly-spaced
+// bands, this keeps a 1-row painted hairline as its own (thin) band.
+function envRuns(envColors) {
+  const colors = [], fracs = [];
+  const n = envColors.length;
+  for (let i = 0; i < n; i++) {
+    if (i === 0 || envColors[i] !== envColors[i - 1]) {
+      colors.push(envColors[i]);
+      if (i > 0) fracs.push(i / n);
+    }
+  }
+  return { colors, fracs };
 }
 function smoothEnv(arr) {
   return arr.map((c, i) => {
@@ -674,31 +799,6 @@ function smoothEnv(arr) {
     return d3.rgb((a.r + b.r + e.r) / 3, (a.g + b.g + e.g) / 3, (a.b + b.b + e.b) / 3).formatHex();
   });
 }
-function strip1dColors(NB, envColors) {
-  return d3.range(NB).map((k) =>
-    envColors[Math.round((NB === 1 ? 0 : k / (NB - 1)) * (ENV_N - 1))]);
-}
-
-// light separable box blur on a 0/1 mask -> rounder region boundaries
-function blurMask(src, nx, ny, tmp) {
-  for (let j = 0; j < ny; j++) {
-    for (let i = 0; i < nx; i++) {
-      const a = src[j * nx + (i > 0 ? i - 1 : i)];
-      const b = src[j * nx + i];
-      const c = src[j * nx + (i < nx - 1 ? i + 1 : i)];
-      tmp[j * nx + i] = (a + b + c) / 3;
-    }
-  }
-  for (let j = 0; j < ny; j++) {
-    for (let i = 0; i < nx; i++) {
-      const a = tmp[(j > 0 ? j - 1 : j) * nx + i];
-      const b = tmp[j * nx + i];
-      const c = tmp[(j < ny - 1 ? j + 1 : j) * nx + i];
-      src[j * nx + i] = (a + b + c) / 3;
-    }
-  }
-}
-
 // separable box blur on a continuous field (used to de-jitter the reflected
 // direction fields before quantizing them into panorama cells)
 function blurField(src, nx, ny, tmp, passes) {
@@ -714,42 +814,117 @@ function blurField(src, nx, ny, tmp, passes) {
   }
 }
 
-// 3x3 majority (mode) filter on a categorical label field. Unlike blurring a
-// per-label mask, this keeps adjacent regions sharing the same boundary (no
-// background seams) while removing salt-and-pepper speckle from azimuth noise.
-function modeFilter(labels, nx, ny, iters) {
-  let src = labels;
-  for (let it = 0; it < iters; it++) {
-    const dst = new Int16Array(nx * ny);
-    for (let j = 0; j < ny; j++) {
-      for (let i = 0; i < nx; i++) {
-        const self = src[j * nx + i];
-        let best = self, bestc = 0;
-        const tally = {};
-        for (let dy = -1; dy <= 1; dy++) {
-          const jj = j + dy < 0 ? 0 : j + dy >= ny ? ny - 1 : j + dy;
-          for (let dx = -1; dx <= 1; dx++) {
-            const ii = i + dx < 0 ? 0 : i + dx >= nx ? nx - 1 : i + dx;
-            const v = src[jj * nx + ii];
-            const c = (tally[v] = (tally[v] || 0) + 1);
-            if (c > bestc || (c === bestc && v === self)) { bestc = c; best = v; }
-          }
-        }
-        dst[j * nx + i] = best;
-      }
-    }
-    src = dst;
+// horizontal-stripe panorama from any elevation->color function
+function envFromRows(colorAtF, w, h) {
+  const cells = new Array(w * h);
+  for (let r = 0; r < h; r++) {                 // r = 0 is the waterline
+    const c = d3.color(colorAtF(r / (h - 1))).formatHex();
+    for (let col = 0; col < w; col++) cells[r * w + col] = c;
   }
-  return src;
+  return { w, h, cells };
 }
 
 function seedEnv2D(name, w, h) {
-  const interp = d3.interpolateRgbBasis(PALETTES[name]);
-  const cells = new Array(w * h);
-  for (let r = 0; r < h; r++) {                 // r = 0 is the waterline
-    const c = d3.color(interp(r / (h - 1))).formatHex();
-    for (let col = 0; col < w; col++) cells[r * w + col] = c;
-  }
+  return envFromRows((f) => paletteColorAt(name, f), w, h);
+}
+
+// ---- reflected scene objects ---------------------------------------
+// Objects (a sailboat, a dock, a buoy...) are environment features: shapes
+// stamped into the reflected panorama at an azimuth. The water then reflects
+// them exactly like the sky — the reflection stretches toward the viewer,
+// shreds on the ripples, and rims itself with an ink outline, through the
+// same contour machinery as everything else. Like the boats in the reference
+// paintings, the object itself sits across the water, outside the frame;
+// only its reflection appears.
+//
+// Each shape is evaluated in a local box: u ∈ [-1, 1] across its width,
+// v ∈ [0, 1] from the waterline to its top. Returns 0 = empty, 1 = primary
+// color (structure), 2 = accent color (the color that "pops").
+const OBJECT_SHAPES = {
+  sailboat: { aspect: 1.7, label: ["hull", "sails"], fn: (u, v) => {
+    if (v < 0.16 && Math.abs(u) < 0.95 - 1.8 * Math.max(0, 0.09 - v)) return 1; // hull, tapered bow/stern
+    if (v >= 0.14 && v < 0.99) {
+      const fm = (0.99 - v) / 0.85;                       // mainsail: tall triangle aft of the mast
+      if (u >= 0.03 && u < 0.03 + 0.9 * fm) return 2;
+      if (v < 0.8) {                                      // jib: shorter triangle forward
+        const fj = (0.8 - v) / 0.66;
+        if (u <= -0.03 && u > -0.03 - 0.7 * fj) return 2;
+      }
+    }
+    return 0;
+  } },
+  dock: { aspect: 4.0, label: ["pilings", "deck"], fn: (u, v) => {
+    if (v >= 0.5 && v < 0.85) return v >= 0.72 ? 2 : 1;   // deck slab, lit top edge
+    if (v < 0.5) {
+      for (const k of [-0.7, -0.235, 0.235, 0.7]) if (Math.abs(u - k) < 0.06) return 1;
+    }
+    return 0;
+  } },
+  buoy: { aspect: 0.8, label: ["base", "ball"], fn: (u, v) => {
+    const dv = (v - 0.52) / 0.46;
+    if (u * u + dv * dv <= 1) return 2;                   // the ball
+    if (v < 0.1 && Math.abs(u) < 0.3) return 1;           // dark waterline nub
+    return 0;
+  } },
+  post: { aspect: 0.3, label: ["post", "cap"], fn: (u, v) =>
+    (Math.abs(u) < 0.55 ? (v > 0.82 ? 2 : 1) : 0) },
+};
+
+// nudge a color's low blue bits so every object instance gets unique hexes —
+// repeated colors would fuse into one region in the segmentation
+function tweakHex(hex, salt) {
+  const c = d3.rgb(hex);
+  return d3.rgb(c.r, c.g, Math.max(0, Math.min(255, (c.b & ~7) + (salt % 8)))).formatHex();
+}
+
+// stamp the live objects into a copy of the panorama. Sizes are in degrees of
+// reflected elevation (so they read at the same scale as the eLo..eHi range);
+// each silhouette gets a 1-cell ink rim so its reflection carries the
+// paintings' dark contour line.
+function stampObjects(env, objects, azSpan, eLo, eHi) {
+  const live = objects.filter((o) => o.on);
+  if (!env || !live.length) return env;
+  const { w, h } = env;
+  const cells = env.cells.slice();
+  const span = (eHi - eLo) || 1;
+  const colsPerDeg = w / (2 * azSpan);
+  const rowsPerDeg = h / span;
+  live.forEach((o, oi) => {
+    const shape = OBJECT_SHAPES[o.type];
+    const hRows = Math.max(2, o.size * rowsPerDeg);
+    const halfCols = Math.max(1, (o.size * shape.aspect / 2) * colsPerDeg);
+    const rowBase = (0 - eLo) * rowsPerDeg;               // objects sit on the waterline
+    const colC = ((o.az + azSpan) / (2 * azSpan)) * w;
+    const primary = tweakHex(o.color, oi * 2 + 1);
+    const accent = tweakHex(o.color2, oi * 2 + 1);
+    const ink = tweakHex("#070a0e", oi * 2 + 1);
+    const mask = new Uint8Array(w * h);
+    const r0 = Math.max(0, Math.floor(rowBase)), r1 = Math.min(h - 1, Math.ceil(rowBase + hRows));
+    const c0 = Math.max(0, Math.floor(colC - halfCols)), c1 = Math.min(w - 1, Math.ceil(colC + halfCols));
+    for (let r = r0; r <= r1; r++) {
+      const v = (r + 0.5 - rowBase) / hRows;
+      if (v < 0 || v > 1) continue;
+      for (let c = c0; c <= c1; c++) {
+        const u = (c + 0.5 - colC) / halfCols;
+        if (u < -1 || u > 1) continue;
+        const t = shape.fn(u, v);
+        if (t) { cells[r * w + c] = t === 2 ? accent : primary; mask[r * w + c] = 1; }
+      }
+    }
+    for (let r = Math.max(0, r0 - 1); r <= Math.min(h - 1, r1 + 1); r++) {
+      for (let c = Math.max(0, c0 - 1); c <= Math.min(w - 1, c1 + 1); c++) {
+        if (mask[r * w + c]) continue;
+        let near = false;
+        for (let dr = -1; dr <= 1 && !near; dr++) {
+          for (let dc = -1; dc <= 1; dc++) {
+            const rr = r + dr, cc = c + dc;
+            if (rr >= 0 && rr < h && cc >= 0 && cc < w && mask[rr * w + cc]) { near = true; break; }
+          }
+        }
+        if (near) cells[r * w + c] = ink;
+      }
+    }
+  });
   return { w, h, cells };
 }
 
@@ -783,20 +958,34 @@ function buildGeometry(S) {
   const { nx, ny } = S;
   S._ems = S.emitters.filter((e) => e.on).map((e) => prepEmitter(e, S));
   const values = new Float64Array(nx * ny);
+  const wVals = S.fresOn ? new Float64Array(nx * ny) : null;
   let lo = Infinity, hi = -Infinity;
   for (let j = 0; j < ny; j++) {
     for (let i = 0; i < nx; i++) {
       const [gx, gy] = cell2ground(i + 0.5, j + 0.5, S);
-      const v = phiAt(gx, gy, S.t, S);
+      const R = reflectAt(gx, gy, S);
+      const v = Math.asin(Math.max(-1, Math.min(1, R[2]))) * 180 / Math.PI;
       values[j * nx + i] = v;
+      if (wVals) wVals[j * nx + i] = fresnelDeepW(R[3]);
       if (v < lo) lo = v; if (v > hi) hi = v;
     }
   }
+  // banded palettes carry their own (non-uniform) band fractions — this is
+  // what lets a 2%-thick ink strip survive regardless of the band count
   const NB = S.bands;
-  const boundaries = d3.range(1, NB).map((k) => S.eLo + ((S.eHi - S.eLo) * k) / NB);
+  const boundaries = S.bandFractions
+    ? S.bandFractions.map((f) => S.eLo + (S.eHi - S.eLo) * f)
+    : d3.range(1, NB).map((k) => S.eLo + ((S.eHi - S.eLo) * k) / NB);
   const fit = computeFit(S);
   const contours = d3.contours().size([nx, ny]).thresholds(boundaries)(values);
-  return { ds: contours.map((c) => multiToPath(c, S, fit)), lo, hi };
+  let fres = null;
+  if (wVals) {
+    const K = S.fresBands;
+    const fc = d3.contours().size([nx, ny])
+      .thresholds(d3.range(1, K).map((k) => k / K))(wVals);
+    fres = fc.map((c) => multiToPath(c, S, fit));
+  }
+  return { ds: contours.map((c) => multiToPath(c, S, fit)), fres, lo, hi };
 }
 
 // ---- geometry build, custom 2D path ------------------------------
@@ -829,6 +1018,7 @@ function buildSegmentation(S, env2d, azSpan) {
   // continuous reflected-direction fields, in panorama-cell units
   const fF = new Float64Array(nx * ny); // elevation, 0..EH (row units)
   const fG = new Float64Array(nx * ny); // azimuth,   0..EW (col units)
+  const fW = S.fresOn ? new Float64Array(nx * ny) : null; // deep-water weight 0..1
   let lo = Infinity, hi = -Infinity;
   for (let j = 0; j < ny; j++) {
     for (let i = 0; i < nx; i++) {
@@ -839,6 +1029,7 @@ function buildSegmentation(S, env2d, azSpan) {
       psi = psi < -az ? -az : psi > az ? az : psi;
       fF[j * nx + i] = phi;
       fG[j * nx + i] = psi;
+      if (fW) fW[j * nx + i] = fresnelDeepW(R[3]);
       if (phi < lo) lo = phi; if (phi > hi) hi = phi;
     }
   }
@@ -848,6 +1039,7 @@ function buildSegmentation(S, env2d, azSpan) {
     const tmp = new Float64Array(nx * ny);
     blurField(fF, nx, ny, tmp, passes);
     blurField(fG, nx, ny, tmp, passes);
+    if (fW) blurField(fW, nx, ny, tmp, passes);
   }
   // convert to cell units
   for (let p = 0; p < nx * ny; p++) {
@@ -856,6 +1048,16 @@ function buildSegmentation(S, env2d, azSpan) {
   }
 
   const fit = computeFit(S);
+
+  // Fresnel depth bands: upper-set contours of the deep-water weight, used as
+  // nested clips — inside band k every color is re-mixed toward the deep color
+  let fres = null;
+  if (fW) {
+    const K = S.fresBands;
+    fres = d3.contours().size([nx, ny])
+      .thresholds(d3.range(1, K).map((k) => k / K))(fW)
+      .map((c) => multiToPath(c, S, fit));
+  }
 
   // distinct panorama colors, with cell counts for stacking order
   const colorId = new Map(), colorOf = [], areas = [];
@@ -932,7 +1134,7 @@ function buildSegmentation(S, env2d, azSpan) {
       layers[k] = { d: multiToPath(cont, S, fit, -1, ex), color: colorOf[order[k]] };
     }
     const drawn = layers.filter((l) => l.d);
-    return { bg: cells[0], layers: drawn, clip, lo, hi, count: drawn.length, twoD: true };
+    return { bg: cells[0], layers: drawn, clip, fres, lo, hi, count: drawn.length, twoD: true };
   }
 
   // upper-set contours of each field (smooth, sub-cell boundaries)
@@ -967,7 +1169,7 @@ function buildSegmentation(S, env2d, azSpan) {
     last = r;
   }
   const count = rows.reduce((n, row) => n + 1 + row.az.length, 0);
-  return { bg: cells[0], rows, lo, hi, count, twoD: true };
+  return { bg: cells[0], rows, fres, lo, hi, count, twoD: true };
 }
 
 // ---- layered-paper stack export -----------------------------------
@@ -1135,7 +1337,7 @@ function buildPaperStack(S, grid, palette, bgColor, minCells = 5) {
 // tile the sheets into one printable SVG: each is the full viewport in its
 // paper color with the holes shown as a hatched "cut" fill and a dashed cut
 // line. Listed top -> bottom (assemble the stack bottom -> top).
-function buildPaperStackSvg(stack) {
+function buildPaperStackSvg(stack, rollTf) {
   const sheets = stack.sheets, N = sheets.length;
   const cols = Math.min(4, Math.max(1, N));
   const rows = Math.ceil(N / cols);
@@ -1150,7 +1352,7 @@ function buildPaperStackSvg(stack) {
   sheets.forEach((sh, i) => {
     const cx = pad + (i % cols) * (tileW + gap);
     const cy = top + Math.floor(i / cols) * (tileH + labelH + gap);
-    const tf = `translate(${cx} ${cy}) scale(${sx.toFixed(4)})`;
+    const tf = `translate(${cx} ${cy}) scale(${sx.toFixed(4)})` + (rollTf ? " " + rollTf : "");
     // clip the tile to its viewport so a zoomed-in scene crops instead of
     // spilling into neighbours; the hole is further clipped to the water plane
     // (so its 5% overshoot never bleeds into the mount margin).
@@ -1352,7 +1554,7 @@ function EmitterCard({ em, idx, halfW, yFar, onChange, onRemove }) {
         <Slider label="roughness (chop)" value={em.roughness} min={0} max={1} step={0.02}
           onChange={(v) => onChange({ roughness: v })}
           fmt={(v) => (v < 0.25 ? "glassy" : v < 0.55 ? "rippled" : v < 0.8 ? "choppy" : "rough")} />
-        <Slider label="detail (waves)" value={em.detail} min={4} max={24} step={1}
+        <Slider label="detail (waves)" value={em.detail} min={4} max={40} step={1}
           onChange={(v) => onChange({ detail: v })} />
       </>}
 
@@ -1372,6 +1574,87 @@ function EmitterCard({ em, idx, halfW, yFar, onChange, onRemove }) {
   );
 }
 
+// read-only mini render of a panorama (used to show what the water reflects)
+function EnvPreview({ env }) {
+  const cvRef = useRef(null);
+  useEffect(() => {
+    const cv = cvRef.current; if (!cv || !env) return;
+    const { w, h, cells } = env;
+    if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+    const ctx = cv.getContext("2d");
+    if (!ctx) return;                         // jsdom (tests) has no 2D canvas
+    const img = ctx.createImageData(w, h);
+    for (let r = 0; r < h; r++) {
+      const drow = h - 1 - r;                 // canvas top = sky
+      for (let c = 0; c < w; c++) {
+        const col = d3.rgb(cells[r * w + c]);
+        const p = (drow * w + c) * 4;
+        img.data[p] = col.r; img.data[p + 1] = col.g; img.data[p + 2] = col.b; img.data[p + 3] = 255;
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+  }, [env]);
+  if (!env) return null;
+  return (
+    <canvas ref={cvRef} style={{ width: "100%", aspectRatio: `${env.w} / ${env.h * 0.6}`,
+      borderRadius: 8, border: "1px solid #26313c", display: "block" }} />
+  );
+}
+
+function ObjectCard({ obj, idx, azSpan, eLo, eHi, onChange, onRemove }) {
+  const types = [["sailboat", "Sailboat"], ["dock", "Dock"], ["buoy", "Buoy"], ["post", "Post"]];
+  const labels = OBJECT_SHAPES[obj.type].label;
+  return (
+    <div style={{ border: "1px solid #26313c", borderRadius: 9, padding: 11,
+      marginBottom: 10, background: "#121922" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 9 }}>
+        <span style={{ fontSize: 10.5, letterSpacing: 1, color: "#6f8294", flex: 1,
+          fontFamily: "ui-monospace, monospace" }}>OBJECT {idx + 1}</span>
+        <button onClick={() => onChange({ on: !obj.on })}
+          style={{ fontSize: 10.5, padding: "4px 9px", borderRadius: 6, cursor: "pointer",
+            fontFamily: "ui-monospace, monospace",
+            background: obj.on ? "#27424b" : "#1a232c", color: obj.on ? "#dff1f6" : "#7f93a4",
+            border: "1px solid " + (obj.on ? "#3f7e8f" : "#26313c") }}>
+          {obj.on ? "on" : "off"}
+        </button>
+        <button onClick={onRemove}
+          style={{ fontSize: 12, width: 26, height: 26, borderRadius: 6, cursor: "pointer",
+            background: "#1a232c", color: "#9a6a6a", border: "1px solid #3a2a2a" }}>✕</button>
+      </div>
+      <div style={{ display: "flex", gap: 5, marginBottom: 10 }}>
+        {types.map(([tp, label]) => (
+          <button key={tp} onClick={() => onChange({ type: tp })}
+            style={{ flex: 1, padding: "6px 4px", fontSize: 11, borderRadius: 6, cursor: "pointer",
+              fontFamily: "ui-monospace, monospace",
+              background: obj.type === tp ? "#27424b" : "#1a232c",
+              color: obj.type === tp ? "#dff1f6" : "#9fb0c0",
+              border: "1px solid " + (obj.type === tp ? "#3f7e8f" : "#26313c") }}>{label}</button>
+        ))}
+      </div>
+      <Slider label="position ← → (azimuth)" value={obj.az} min={-azSpan + 2} max={azSpan - 2}
+        step={1} onChange={(v) => onChange({ az: v })}
+        fmt={(v) => (v === 0 ? "center" : v + "°")} />
+      <Slider label="apparent height" value={obj.size} min={1.5}
+        max={Math.max(4, (eHi - eLo) * 0.8)} step={0.5}
+        onChange={(v) => onChange({ size: v })} fmt={(v) => v.toFixed(1) + "°"} />
+      <div style={{ display: "flex", gap: 14, alignItems: "center", marginTop: 2 }}>
+        {[["color", labels[0]], ["color2", labels[1]]].map(([k, lbl]) => (
+          <label key={k} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 10.5,
+            color: "#9fb0c0", fontFamily: "ui-monospace, monospace", cursor: "pointer" }}>
+            <span style={{ width: 24, height: 24, borderRadius: 5, background: obj[k],
+              border: "1px solid #44525e", position: "relative", overflow: "hidden",
+              display: "inline-block" }}>
+              <input type="color" value={obj[k]} onChange={(e) => onChange({ [k]: e.target.value })}
+                style={{ position: "absolute", inset: -4, opacity: 0, cursor: "pointer" }} />
+            </span>
+            {lbl}
+          </label>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function useWidth() {
   const [w, setW] = useState(typeof window !== "undefined" ? window.innerWidth : 1024);
   useEffect(() => {
@@ -1387,8 +1670,15 @@ export default function App() {
   const isNarrow = width < 820;
 
   const [steep, setSteep] = useState(0.35);
+  const [pitchDeg, setPitchDeg] = useState(12.6); // 0.22 rad, the old fixed value
+  const [rollDeg, setRollDeg] = useState(0);
+  const [fresOn, setFresOn] = useState(false);
+  const [fresBands, setFresBands] = useState(3);
+  const [fresStrength, setFresStrength] = useState(0.75);
+  const [deepColor, setDeepColor] = useState("#08131d");
   const [wavelength, setWavelength] = useState(3.0);
   const [strength, setStrength] = useState(0.52);
+  const [sharp, setSharp] = useState(0.3);   // crest sharpening (2nd harmonic)
   const [spread, setSpread] = useState(0.5);
   const [bands, setBands] = useState(9);
   const [palette, setPalette] = useState("Sunset Lake");
@@ -1414,6 +1704,20 @@ export default function App() {
   const removeEmitter = (id) => setEmitters((es) => es.filter((e) => e.id !== id));
   const [halfW, setHalfW] = useState(12);
   const [yFar, setYFar] = useState(46);
+
+  // reflected objects: stamped into the environment panorama across the
+  // water, so only their reflection appears in the frame
+  const [objects, setObjects] = useState([
+    { id: 1, on: true, type: "sailboat", az: 14, size: 8, color: "#c2521f", color2: "#efe9d9" },
+  ]);
+  const nextObjId = useRef(2);
+  const updateObject = (id, patch) =>
+    setObjects((os) => os.map((o) => (o.id === id ? { ...o, ...patch } : o)));
+  const addObject = () =>
+    setObjects((os) => os.length >= 4 ? os :
+      [...os, { id: nextObjId.current++, on: true, type: "buoy", az: -12, size: 4,
+        color: "#241a12", color2: "#d64127" }]);
+  const removeObject = (id) => setObjects((os) => os.filter((o) => o.id !== id));
 
   // floating object (red buoy)
   const [objOn, setObjOn] = useState(true);
@@ -1470,54 +1774,104 @@ export default function App() {
     return () => cancelAnimationFrame(raf);
   }, [animate, speed]);
 
+  // banded palette stops / painted-strip runs -> non-uniform band boundaries
+  const stops = useMemo(() => paletteStops(palette), [palette]);
+  const runs1d = useMemo(() => (mode === "paint1d" ? envRuns(envColors) : null),
+    [mode, envColors]);
+  const bandFractions = useMemo(() => {
+    if (mode === "preset" && stops) return stops.slice(1).map((s) => s.f0);
+    if (runs1d) return runs1d.fracs;
+    return null;
+  }, [mode, stops, runs1d]);
+
   const S = useMemo(() => ({
     nx: quality, ny: quality,
     xMin: -halfW, xMax: halfW, yMin: 3, yMax: yFar,
     H: 0.4 * Math.pow(22.5, steep),
-    pitch: 0.22,
+    pitch: (pitchDeg * Math.PI) / 180,
     k: (2 * Math.PI) / wavelength,
     amp: strength * 0.06,
+    sharp,
     decay: 0.18 - spread * 0.16,
     omega: 1.0,
     t: animate ? tRef.current : 0,
     bands, perspective, eLo, eHi, zoom, panY, smooth, coherence, rectOutput,
-    surface3d, waveScale,
+    surface3d, waveScale, bandFractions, fresOn, fresBands,
     // waves scatter off the buoy's hull: a ring source pinned to the object,
     // with a tight decay so the disturbance stays local
     emitters: objOn && objRipple > 0
       ? [...emitters, { id: "buoy", on: true, type: "point", x: objX, y: objY,
           size: Math.max(0.3, objSize * objRippleScale), amp: objRipple * 1.5, decay: 0.28 }]
       : emitters,
-  }), [quality, steep, wavelength, strength, spread, bands, perspective,
+  }), [quality, steep, pitchDeg, wavelength, strength, sharp, spread, bands, perspective,
        halfW, yFar, eLo, eHi, zoom, panY, smooth, coherence, rectOutput, surface3d, waveScale,
+       bandFractions, fresOn, fresBands,
        emitters, animate, speed, tRef.current,
        objOn, objX, objY, objSize, objRipple, objRippleScale]);
 
   const is2d = mode === "paint2d";
-  const geom = useMemo(() => (is2d ? null : buildGeometry(S)), [is2d, S]);
-  const presetColors = useMemo(() => bandColors(bands, palette), [bands, palette]);
-  const colors1d = useMemo(() => (mode === "paint1d" ? strip1dColors(bands, envColors) : null),
-    [mode, bands, envColors]);
-  const seg = useMemo(() => (is2d ? buildSegmentation(S, segEnv, azSpan) : null),
-    [is2d, S, segEnv, azSpan]);
+  const presetColors = useMemo(
+    () => (stops ? stops.map((s) => s.c) : bandColors(bands, palette)),
+    [stops, bands, palette]);
+  const colors1d = runs1d ? runs1d.colors : null;
+
+  // any live reflected object forces the 2D (panorama) path in every mode:
+  // the segmentation sees the painted panorama, or stripe rows derived from
+  // the preset / 1D strip, with the objects stamped on top
+  const objectsOn = objects.some((o) => o.on);
+  const use2d = is2d || objectsOn;
+  const baseEnv2d = useMemo(() => {
+    if (is2d) return segEnv;
+    if (!objectsOn) return null;
+    if (mode === "paint1d")
+      return envFromRows((f) => envColors[Math.min(ENV_N - 1, Math.floor(f * ENV_N))],
+        ENV2D_W, DERIVED_ENV_H);
+    if (stops) return envFromRows((f) => paletteColorAt(palette, f), ENV2D_W, DERIVED_ENV_H);
+    const NB = presetColors.length;
+    return envFromRows((f) => presetColors[Math.min(NB - 1, Math.floor(f * NB))],
+      ENV2D_W, DERIVED_ENV_H);
+  }, [is2d, segEnv, objectsOn, mode, envColors, stops, palette, presetColors]);
+  const envEffective = useMemo(
+    () => (use2d ? stampObjects(baseEnv2d, objects, azSpan, eLo, eHi) : null),
+    [use2d, baseEnv2d, objects, azSpan, eLo, eHi]);
+
+  const geom = useMemo(() => (use2d ? null : buildGeometry(S)), [use2d, S]);
+  const seg = useMemo(() => (use2d ? buildSegmentation(S, envEffective, azSpan) : null),
+    [use2d, S, envEffective, azSpan]);
 
   const isobandColors = mode === "paint1d" ? colors1d : presetColors;
-  const bg = is2d ? seg.bg : isobandColors[0];
+  const bg = use2d ? seg.bg : isobandColors[0];
   const autoBg = penMode ? "#0a0d12" : bg;
   const bgFill = bgColor || autoBg;
-  const layers = is2d ? (seg.layers || null)
+  const layers = use2d ? (seg.layers || null)
     : geom.ds.map((d, k) => ({ d, color: isobandColors[k + 1] }));
-  const regionCount = is2d ? seg.count : layers.length + 1;
-  const rng = is2d ? seg : geom;
+  const rng = use2d ? seg : geom;
+
+  // Fresnel depth bands: clip paths + the color mixer for each band
+  const mixDeep = useMemo(
+    () => (fresOn ? makeDeepMixer(deepColor, fresStrength, fresBands) : (c) => c),
+    [fresOn, deepColor, fresStrength, fresBands]);
+  const fresPaths = fresOn ? (use2d ? seg.fres : geom.fres) : null;
+  const fresIdx = useMemo(
+    () => (fresOn && fresPaths ? d3.range(fresBands) : [0]),
+    [fresOn, fresPaths, fresBands]);
+  const rollTf = rollTransform(rollDeg);
+
+  const regionCount = (use2d ? seg.count : layers.length + 1) * fresIdx.length;
 
   // pen-plot lines: equally spaced scan lines colored by the reflection beneath
   const penLines = useMemo(() => {
     if (!penMode) return null;
     const fit = computeFit(S);
     S._ems = S.emitters.filter((e) => e.on).map((e) => prepEmitter(e, S));
+    const deepMix = (c, cosI) => {
+      if (!fresOn) return c;
+      const b = Math.min(fresBands - 1, Math.floor(fresnelDeepW(cosI) * fresBands));
+      return mixDeep(c, b);
+    };
     let colorAt;
-    if (is2d) {
-      const { w: EW, h: EH, cells } = segEnv;
+    if (use2d) {
+      const { w: EW, h: EH, cells } = envEffective;
       const az = azSpan;
       colorAt = (gx, gy) => {
         const R = reflectAt(gx, gy, S);
@@ -1525,15 +1879,24 @@ export default function App() {
         let psi = Math.atan2(R[0], R[1]) * 180 / Math.PI; psi = psi < -az ? -az : psi > az ? az : psi;
         let v = (phi - S.eLo) / ((S.eHi - S.eLo) || 1); v = v < 0 ? 0 : v > 1 ? 1 : v;
         let u = (psi + az) / (2 * az); u = u < 0 ? 0 : u > 1 ? 1 : u;
-        return cells[Math.min(EH - 1, Math.floor(v * EH)) * EW + Math.min(EW - 1, Math.floor(u * EW))];
+        const c = cells[Math.min(EH - 1, Math.floor(v * EH)) * EW + Math.min(EW - 1, Math.floor(u * EW))];
+        return deepMix(c, R[3]);
       };
     } else {
       const cols = mode === "paint1d" ? colors1d : presetColors;
       const NB = cols.length;
+      const fr = S.bandFractions;
       colorAt = (gx, gy) => {
-        const phi = phiAt(gx, gy, 0, S);
+        const R = reflectAt(gx, gy, S);
+        const phi = Math.asin(Math.max(-1, Math.min(1, R[2]))) * 180 / Math.PI;
         let v = (phi - S.eLo) / ((S.eHi - S.eLo) || 1); v = v < 0 ? 0 : v >= 1 ? 0.999999 : v;
-        return cols[Math.floor(v * NB)] || cols[0];
+        let c;
+        if (fr) {
+          let idx = 0;
+          for (const f of fr) { if (v >= f) idx++; else break; }
+          c = cols[idx] || cols[0];
+        } else c = cols[Math.floor(v * NB)] || cols[0];
+        return deepMix(c, R[3]);
       };
     }
     const threeD = S.perspective && penRelief > 0;
@@ -1546,7 +1909,8 @@ export default function App() {
       nLines: penCount, samples: penHidden ? 360 : 260, relief: penRelief,
       threeD, hidden: penHidden, evenScreen: penEven,
     });
-  }, [penMode, penStyle, penCount, penSpacing, penRelief, penHidden, penEven, S, is2d, mode, segEnv, azSpan, colors1d, presetColors]);
+  }, [penMode, penStyle, penCount, penSpacing, penRelief, penHidden, penEven, S, use2d, mode,
+      envEffective, azSpan, colors1d, presetColors, fresOn, fresBands, mixDeep]);
 
   // floating buoy: projected cap + waterline clip + mirrored reflection
   const buoy = useMemo(() => {
@@ -1570,46 +1934,64 @@ export default function App() {
 
   const buildSvg = () => {
     const buoyStr = buoy ? buoySvg(buoy, buoyShade) : "";
+    const rollOpen = rollTf ? `<g transform="${rollTf}">` : `<g>`;
     if (penMode) {
-      let body = `<rect width="${VB_W}" height="${VB_H}" fill="${bgFill}"/>`;
+      let body = `<rect width="${VB_W}" height="${VB_H}" fill="${bgFill}"/>` + rollOpen;
       penLines.forEach((l) => {
         body += `<path d="${l.d}" fill="none" stroke="${l.color}" stroke-width="${penWidth}" stroke-linecap="round" stroke-linejoin="round"/>`;
       });
-      return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${VB_W} ${VB_H}">${body}${buoyStr}</svg>`;
+      body += buoyStr + `</g>`;
+      return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${VB_W} ${VB_H}">${body}</svg>`;
     }
-    let body = `<rect width="${VB_W}" height="${VB_H}" fill="${bgFill}"/>`;
+    let body = `<rect width="${VB_W}" height="${VB_H}" fill="${bgFill}"/>` + rollOpen;
     const stroke = edges ? ` stroke="#000" stroke-opacity="0.25" stroke-width="0.6"` : "";
-    if (is2d && !seg.layers) {
-      let defs = "";
+    let defs = "";
+    if (fresOn && fresPaths) fresPaths.forEach((d, i) => {
+      if (d) defs += `<clipPath id="fres${i + 1}"><path d="${d}"/></clipPath>`;
+    });
+    const bandOpen = (b) => (b > 0 ? `<g clip-path="url(#fres${b})">` : `<g>`);
+    if (use2d && !seg.layers) {
       seg.rows.forEach((row, ri) => {
         if (row.clip) defs += `<clipPath id="el${ri}"><path d="${row.clip}"/></clipPath>`;
       });
-      seg.rows.forEach((row, ri) => {
-        const open = row.clip ? `<g clip-path="url(#el${ri})">` : `<g>`;
-        let g = open;
-        if (row.base) g += `<rect width="${VB_W}" height="${VB_H}" fill="${row.base}"${stroke ? "" : ""}/>`;
-        row.az.forEach((a) => { g += `<path d="${a.d}" fill="${a.color}" fill-rule="evenodd"${stroke}/>`; });
-        if (edges && row.clip) g += `<path d="${row.clip}" fill="none"${stroke}/>`;
-        g += `</g>`;
-        body += g;
+      fresIdx.forEach((b) => {
+        if (b > 0 && !fresPaths[b - 1]) return;
+        body += bandOpen(b);
+        seg.rows.forEach((row, ri) => {
+          let g = row.clip ? `<g clip-path="url(#el${ri})">` : `<g>`;
+          if (row.base) g += `<rect width="${VB_W}" height="${VB_H}" fill="${mixDeep(row.base, b)}"/>`;
+          row.az.forEach((a) => { g += `<path d="${a.d}" fill="${mixDeep(a.color, b)}" fill-rule="evenodd"${stroke}/>`; });
+          if (edges && row.clip) g += `<path d="${row.clip}" fill="none"${stroke}/>`;
+          g += `</g>`;
+          body += g;
+        });
+        body += `</g>`;
       });
-      return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${VB_W} ${VB_H}"><defs>${defs}</defs>${body}${buoyStr}</svg>`;
+      body += buoyStr + `</g>`;
+      return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${VB_W} ${VB_H}"><defs>${defs}</defs>${body}</svg>`;
     }
-    if (is2d) {
-      // in 3D the waves rise above the flat water trapezoid, so skip the clip
-      // (the padded regions already overshoot the frame) — otherwise crests
-      // near the edges would be sheared off flat
-      body += surface3d ? `<g opacity="0.999">` : `<g clip-path="url(#watertrap)" opacity="0.999">`;
-      layers.forEach((l) => {
-        body += `<path d="${l.d}" fill="${l.color}" fill-rule="evenodd"${stroke}/>`;
+    // layered paths, preset & 2D alike. With Fresnel on, the geometry is
+    // shared via <use> so each depth band re-colors the same paths.
+    if (use2d) defs += `<clipPath id="watertrap"><path d="${seg.clip}"/></clipPath>`;
+    if (fresOn) layers.forEach((l, i) => { defs += `<path id="lyr${i}" d="${l.d}"/>`; });
+    // in 3D the waves rise above the flat water trapezoid, so skip the clip
+    // (the padded regions already overshoot the frame) — otherwise crests
+    // near the edges would be sheared off flat
+    body += use2d && !surface3d
+      ? `<g clip-path="url(#watertrap)" opacity="0.999">` : `<g opacity="0.999">`;
+    fresIdx.forEach((b) => {
+      if (b > 0 && !fresPaths[b - 1]) return;
+      body += bandOpen(b);
+      if (b > 0) body += `<rect width="${VB_W}" height="${VB_H}" fill="${mixDeep(bg, b)}"/>`;
+      layers.forEach((l, i) => {
+        body += fresOn
+          ? `<use href="#lyr${i}" fill="${mixDeep(l.color, b)}" fill-rule="evenodd"${stroke}/>`
+          : `<path d="${l.d}" fill="${l.color}" fill-rule="evenodd"${stroke}/>`;
       });
       body += `</g>`;
-      return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${VB_W} ${VB_H}"><defs><clipPath id="watertrap"><path d="${seg.clip}"/></clipPath></defs>${body}${buoyStr}</svg>`;
-    }
-    layers.forEach((l) => {
-      body += `<path d="${l.d}" fill="${l.color}" fill-rule="evenodd"${stroke}/>`;
     });
-    return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${VB_W} ${VB_H}">${body}${buoyStr}</svg>`;
+    body += `</g>` + buoyStr + `</g>`;
+    return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${VB_W} ${VB_H}">${defs ? `<defs>${defs}</defs>` : ""}${body}</svg>`;
   };
   const saveSvg = (svg, name) => {
     try {
@@ -1634,9 +2016,19 @@ export default function App() {
     S._ems = S.emitters.filter((e) => e.on).map((e) => prepEmitter(e, S));
     const { nx, ny } = S;
     const grid = new Int32Array(nx * ny);
-    if (is2d) {
-      const { w: EW, h: EH, cells } = segEnv, az = azSpan;
-      const idOf = new Map(), palette = [];
+    const deepMix = (c, cosI) => {
+      if (!fresOn) return c;
+      const b = Math.min(fresBands - 1, Math.floor(fresnelDeepW(cosI) * fresBands));
+      return mixDeep(c, b);
+    };
+    const idOf = new Map(), palette = [];
+    const idFor = (c) => {
+      let id = idOf.get(c);
+      if (id === undefined) { id = palette.length; idOf.set(c, id); palette.push(c); }
+      return id;
+    };
+    if (use2d) {
+      const { w: EW, h: EH, cells } = envEffective, az = azSpan;
       for (let j = 0; j < ny; j++) {
         for (let i = 0; i < nx; i++) {
           const [gx, gy] = cell2ground(i + 0.5, j + 0.5, S);
@@ -1646,28 +2038,35 @@ export default function App() {
           let v = (phi - S.eLo) / ((S.eHi - S.eLo) || 1); v = v < 0 ? 0 : v > 1 ? 1 : v;
           let u = (psi + az) / (2 * az); u = u < 0 ? 0 : u > 1 ? 1 : u;
           const c = cells[Math.min(EH - 1, Math.floor(v * EH)) * EW + Math.min(EW - 1, Math.floor(u * EW))];
-          let id = idOf.get(c); if (id === undefined) { id = palette.length; idOf.set(c, id); palette.push(c); }
-          grid[j * nx + i] = id;
+          grid[j * nx + i] = idFor(deepMix(c, R[3]));
         }
       }
       return { grid, palette };
     }
     const cols = mode === "paint1d" ? colors1d : presetColors, NB = cols.length;
+    const fr = S.bandFractions;
     for (let j = 0; j < ny; j++) {
       for (let i = 0; i < nx; i++) {
         const [gx, gy] = cell2ground(i + 0.5, j + 0.5, S);
-        const phi = phiAt(gx, gy, S.t, S);
+        const R = reflectAt(gx, gy, S);
+        const phi = Math.asin(Math.max(-1, Math.min(1, R[2]))) * 180 / Math.PI;
         let v = (phi - S.eLo) / ((S.eHi - S.eLo) || 1); v = v < 0 ? 0 : v >= 1 ? 0.999999 : v;
-        grid[j * nx + i] = Math.floor(v * NB);
+        let c;
+        if (fr) {
+          let idx = 0;
+          for (const f of fr) { if (v >= f) idx++; else break; }
+          c = cols[idx] || cols[0];
+        } else c = cols[Math.floor(v * NB)] || cols[0];
+        grid[j * nx + i] = idFor(deepMix(c, R[3]));
       }
     }
-    return { grid, palette: cols };
+    return { grid, palette };
   };
 
   const exportPaperStack = () => {
     const { grid, palette } = paperColorGrid();
     const stack = buildPaperStack(S, grid, palette, bgFill);
-    const svg = buildPaperStackSvg(stack);
+    const svg = buildPaperStackSvg(stack, rollTf);
     saveSvg(svg, "reflection-paper-stack.svg");
     setSvgName("reflection-paper-stack.svg");
     setStackInfo({ nSheets: stack.nSheets, method: stack.method });
@@ -1739,52 +2138,69 @@ export default function App() {
             boxShadow: "0 8px 24px rgba(0,0,0,0.55)" }}>
             <svg viewBox={`0 0 ${VB_W} ${VB_H}`} style={{ width: "100%", display: "block" }}>
               <rect width={VB_W} height={VB_H} fill={bgFill} />
+              <g transform={rollTf || undefined}>
               {penMode ? (
                 penLines.map((l, i) => (
                   <path key={i} d={l.d} fill="none" stroke={l.color}
                     strokeWidth={penWidth} strokeLinecap="round" strokeLinejoin="round" />
                 ))
-              ) : is2d && !layers ? (
+              ) : use2d && !layers ? (
                 <>
                   <defs>
                     {seg.rows.map((row, ri) => row.clip ? (
                       <clipPath key={ri} id={`el${ri}`}><path d={row.clip} /></clipPath>
                     ) : null)}
+                    {fresOn && fresPaths.map((d, i) => d ? (
+                      <clipPath key={`f${i}`} id={`fres${i + 1}`}><path d={d} /></clipPath>
+                    ) : null)}
                   </defs>
-                  {seg.rows.map((row, ri) => (
-                    <g key={ri} clipPath={row.clip ? `url(#el${ri})` : undefined}>
-                      {row.base && <rect width={VB_W} height={VB_H} fill={row.base} />}
-                      {row.az.map((a, ai) => (
-                        <path key={ai} d={a.d} fill={a.color} fillRule="evenodd" />
+                  {fresIdx.map((b) => (b > 0 && !fresPaths[b - 1]) ? null : (
+                    <g key={`fb${b}`} clipPath={b > 0 ? `url(#fres${b})` : undefined}>
+                      {seg.rows.map((row, ri) => (
+                        <g key={ri} clipPath={row.clip ? `url(#el${ri})` : undefined}>
+                          {row.base && <rect width={VB_W} height={VB_H} fill={mixDeep(row.base, b)} />}
+                          {row.az.map((a, ai) => (
+                            <path key={ai} d={a.d} fill={mixDeep(a.color, b)} fillRule="evenodd" />
+                          ))}
+                          {edges && row.clip && (
+                            <path d={row.clip} fill="none" stroke="#000" strokeOpacity={0.28} strokeWidth={0.6} />
+                          )}
+                        </g>
                       ))}
-                      {edges && row.clip && (
-                        <path d={row.clip} fill="none" stroke="#000" strokeOpacity={0.28} strokeWidth={0.6} />
-                      )}
                     </g>
                   ))}
                 </>
-              ) : is2d ? (
+              ) : (
                 <>
                   <defs>
-                    <clipPath id="watertrap"><path d={seg.clip} /></clipPath>
+                    {use2d && <clipPath id="watertrap"><path d={seg.clip} /></clipPath>}
+                    {fresOn && fresPaths.map((d, i) => d ? (
+                      <clipPath key={`f${i}`} id={`fres${i + 1}`}><path d={d} /></clipPath>
+                    ) : null)}
+                    {fresOn && layers.map((l, i) => (
+                      <path key={i} id={`lyr${i}`} d={l.d} />
+                    ))}
                   </defs>
                   {/* opacity forces the group into an isolated buffer, so the
                       clip is antialiased once against the composite instead of
                       per layer (per-layer clip AA leaks the colors beneath) */}
-                  <g clipPath={surface3d ? undefined : "url(#watertrap)"} opacity={0.999}>
-                    {layers.map((l, i) => (
-                      <path key={i} d={l.d} fill={l.color} fillRule="evenodd"
-                        stroke={edges ? "#000" : "none"} strokeOpacity={edges ? 0.28 : 0}
-                        strokeWidth={edges ? 0.6 : 0} />
+                  <g clipPath={use2d && !surface3d ? "url(#watertrap)" : undefined} opacity={0.999}>
+                    {fresIdx.map((b) => (b > 0 && !fresPaths[b - 1]) ? null : (
+                      <g key={`fb${b}`} clipPath={b > 0 ? `url(#fres${b})` : undefined}>
+                        {b > 0 && <rect width={VB_W} height={VB_H} fill={mixDeep(bg, b)} />}
+                        {layers.map((l, i) => fresOn ? (
+                          <use key={i} href={`#lyr${i}`} fill={mixDeep(l.color, b)} fillRule="evenodd"
+                            stroke={edges ? "#000" : "none"} strokeOpacity={edges ? 0.28 : 0}
+                            strokeWidth={edges ? 0.6 : 0} />
+                        ) : (
+                          <path key={i} d={l.d} fill={l.color} fillRule="evenodd"
+                            stroke={edges ? "#000" : "none"} strokeOpacity={edges ? 0.28 : 0}
+                            strokeWidth={edges ? 0.6 : 0} />
+                        ))}
+                      </g>
                     ))}
                   </g>
                 </>
-              ) : (
-                layers.map((l, i) => (
-                  <path key={i} d={l.d} fill={l.color} fillRule="evenodd"
-                    stroke={edges ? "#000" : "none"} strokeOpacity={edges ? 0.28 : 0}
-                    strokeWidth={edges ? 0.6 : 0} />
-                ))
               )}
               {buoy && (
                 <g>
@@ -1815,6 +2231,7 @@ export default function App() {
                   )}
                 </g>
               )}
+              </g>
             </svg>
             <div style={{ position: "absolute", left: 12, bottom: 10, fontSize: 10.5,
               color: "#6d808f", fontFamily: "ui-monospace, monospace", letterSpacing: 0.5 }}>
@@ -1830,10 +2247,19 @@ export default function App() {
               <Slider label="View angle (near edge)" value={steep} min={0} max={1} step={0.01}
                 onChange={setSteep}
                 fmt={(v) => Math.round(Math.atan((0.4 * Math.pow(22.5, v)) / 3) * 180 / Math.PI) + "°"} />
+              {perspective && (
+                <Slider label="Camera pitch (framing)" value={pitchDeg} min={4} max={55} step={0.5}
+                  onChange={setPitchDeg} fmt={(v) => v.toFixed(1) + "°"} />
+              )}
+              <Slider label="Camera roll" value={rollDeg} min={-30} max={30} step={0.5}
+                onChange={setRollDeg} fmt={(v) => (v === 0 ? "level" : v.toFixed(1) + "°")} />
               <Slider label="Ripple scale (λ)" value={wavelength} min={1.2} max={7} step={0.1}
                 onChange={setWavelength} fmt={(v) => v.toFixed(1)} />
               <Slider label="Ripple strength" value={strength} min={0.05} max={1} step={0.01}
                 onChange={setStrength} fmt={(v) => v.toFixed(2)} />
+              <Slider label="Crest sharpness" value={sharp} min={0} max={0.8} step={0.05}
+                onChange={setSharp}
+                fmt={(v) => (v === 0 ? "sine (soft)" : v < 0.35 ? "gentle" : v < 0.6 ? "peaked" : "steep")} />
               <Slider label="Spread / reach" value={spread} min={0} max={1} step={0.01}
                 onChange={setSpread} fmt={(v) => (v < 0.4 ? "tight" : v < 0.75 ? "medium" : "wide")} />
               <Slider label="Plane width" value={halfW} min={4} max={40} step={1}
@@ -1842,11 +2268,12 @@ export default function App() {
 
             <div style={panel}>
               <div style={heading}>Environment</div>
-              {mode !== "paint2d" &&
+              {mode === "preset" && !stops &&
                 <Slider label="Color regions" value={bands} min={3} max={16} step={1} onChange={setBands} />}
               <div style={{ display: "flex", gap: 6, marginBottom: 10, flexWrap: "wrap" }}>
-                {Object.keys(PALETTES).map((p) => {
+                {[...Object.keys(PALETTES), ...Object.keys(BANDED_PALETTES)].map((p) => {
                   const on = mode === "preset" && palette === p;
+                  const inked = !!BANDED_PALETTES[p];
                   return (
                     <button key={p} onClick={() => { setMode("preset"); setPalette(p); }}
                       style={{ flex: "1 0 30%", padding: "8px 6px", fontSize: 11, borderRadius: 7,
@@ -1854,11 +2281,19 @@ export default function App() {
                         background: on ? "#27424b" : "#1a232c",
                         color: on ? "#dff1f6" : "#9fb0c0",
                         border: "1px solid " + (on ? "#3f7e8f" : "#26313c") }}>
-                      {p}
+                      {p}{inked ? " ✒" : ""}
                     </button>
                   );
                 })}
               </div>
+              {mode === "preset" && stops && (
+                <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 10, lineHeight: 1.5,
+                  fontFamily: "ui-monospace, monospace" }}>
+                  Banded palette: the hairline dark strips draw themselves as ink-line outlines
+                  around every color region — every boundary between the bands on either side
+                  must pass through the strip.
+                </div>
+              )}
               <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
                 <button onClick={enter1d} style={{ flex: 1, padding: "8px 6px", fontSize: 11, borderRadius: 7,
                   cursor: "pointer", fontFamily: "ui-monospace, monospace",
@@ -1967,7 +2402,9 @@ export default function App() {
                 <>
                   <div style={{ display: "flex", height: 14, borderRadius: 4, overflow: "hidden",
                     border: "1px solid #26313c" }}>
-                    {presetColors.map((c, i) => (<div key={i} style={{ flex: 1, background: c }} />))}
+                    {stops
+                      ? stops.map((s, i) => (<div key={i} style={{ flex: s.f1 - s.f0, background: s.c }} />))
+                      : presetColors.map((c, i) => (<div key={i} style={{ flex: 1, background: c }} />))}
                   </div>
                   <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9.5,
                     color: "#6d808f", marginTop: 3, fontFamily: "ui-monospace, monospace" }}>
@@ -1978,7 +2415,73 @@ export default function App() {
             </div>
 
             <div style={panel}>
-              <div style={heading}>Floating object</div>
+              <div style={heading}>Water depth (Fresnel)</div>
+              <Toggle label="Fresnel depth mix" value={fresOn} onChange={setFresOn} />
+              {fresOn && (
+                <div style={{ marginTop: 6 }}>
+                  <Slider label="depth bands" value={fresBands} min={2} max={6} step={1}
+                    onChange={setFresBands} />
+                  <Slider label="depth strength" value={fresStrength} min={0} max={1} step={0.05}
+                    onChange={setFresStrength} fmt={(v) => v.toFixed(2)} />
+                  <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
+                    <label style={{ width: 30, height: 30, borderRadius: 6, cursor: "pointer",
+                      border: "1px solid #44525e", position: "relative", overflow: "hidden",
+                      background: deepColor, display: "inline-block", flex: "none" }}>
+                      <input type="color" value={deepColor}
+                        onChange={(e) => setDeepColor(e.target.value)}
+                        style={{ position: "absolute", inset: -4, opacity: 0, cursor: "pointer" }} />
+                    </label>
+                    <span style={{ fontSize: 12, color: "#9fb0c0",
+                      fontFamily: "ui-monospace, monospace" }}>deep water · {deepColor}</span>
+                  </div>
+                  <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5,
+                    fontFamily: "ui-monospace, monospace" }}>
+                    Steep view angles see through the surface (Fresnel reflectance ~2%), grazing
+                    angles mirror it — so the near water shifts toward the deep-water color, in
+                    flat contoured bands. The far field stays pure reflection.
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div style={panel}>
+              <div style={heading}>Objects across the water</div>
+              <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 10, lineHeight: 1.5,
+                fontFamily: "ui-monospace, monospace" }}>
+                Stamped into the reflected panorama, not drawn in the frame — like the boats
+                in the paintings, only each object's reflection appears in the water, torn up
+                by the ripples and rimmed with an ink line.
+              </div>
+              {objects.map((o, i) => (
+                <ObjectCard key={o.id} obj={o} idx={i} azSpan={azSpan} eLo={eLo} eHi={eHi}
+                  onChange={(patch) => updateObject(o.id, patch)}
+                  onRemove={() => removeObject(o.id)} />
+              ))}
+              {objects.length < 4 && (
+                <button onClick={addObject}
+                  style={{ width: "100%", padding: "9px", borderRadius: 8, cursor: "pointer",
+                    background: "#1a232c", color: "#9fb0c0", border: "1px dashed #3a4a57",
+                    fontFamily: "ui-monospace, monospace", fontSize: 12, marginBottom: 12 }}>
+                  + add object
+                </button>
+              )}
+              {objectsOn && (
+                <>
+                  {!is2d && (
+                    <Slider label="azimuth span (reflection width)" value={azSpan} min={15} max={80}
+                      step={1} onChange={setAzSpan} fmt={(v) => "±" + v + "°"} />
+                  )}
+                  <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 6,
+                    fontFamily: "ui-monospace, monospace" }}>
+                    reflected panorama (what the water sees):
+                  </div>
+                  <EnvPreview env={envEffective} />
+                </>
+              )}
+            </div>
+
+            <div style={panel}>
+              <div style={heading}>Floating buoy (in frame)</div>
               <Toggle label="Red buoy" value={objOn} onChange={setObjOn} />
               {objOn && (
                 <div style={{ marginTop: 6 }}>
@@ -2101,7 +2604,7 @@ export default function App() {
                   </>
                 )}
                 <Slider label="plane depth (far edge)" value={yFar} min={20} max={90} step={2} onChange={setYFar} />
-                <Slider label="sample grid" value={quality} min={60} max={150} step={10} onChange={setQuality} />
+                <Slider label="sample grid" value={quality} min={60} max={220} step={10} onChange={setQuality} />
               </div>
             )}
 
