@@ -1698,7 +1698,7 @@ export default function App() {
   const [perspective, setPerspective] = useState(true);
   const [rectOutput, setRectOutput] = useState(false);
   const [surface3d, setSurface3d] = useState(false); // lift color regions onto the waves
-  const [waveScale, setWaveScale] = useState(35);     // 3D wave-height exaggeration
+  const [waveScale, setWaveScale] = useState(1.5);    // 3D wave-height exaggeration
   const [edges, setEdges] = useState(false);
   const [animate, setAnimate] = useState(false);
   const [speed, setSpeed] = useState(0.5);
@@ -2631,8 +2631,8 @@ export default function App() {
               )}
               {!penMode && perspective && surface3d && (
                 <>
-                  <Slider label="Wave height (3D)" value={waveScale} min={0} max={120} step={2}
-                    onChange={setWaveScale} fmt={(v) => (v === 0 ? "flat" : String(v))} />
+                  <Slider label="Wave height (3D)" value={waveScale} min={0} max={3} step={0.05}
+                    onChange={setWaveScale} fmt={(v) => (v === 0 ? "flat" : v.toFixed(2))} />
                   <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 8, lineHeight: 1.5,
                     fontFamily: "ui-monospace, monospace" }}>
                     Lifts the color regions onto the actual wave crests to preview the surface
