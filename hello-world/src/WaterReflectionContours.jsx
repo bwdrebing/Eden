@@ -16,6 +16,52 @@ const PALETTES = {
   "Obra Dinn":   ["#0b0b0b", "#262626", "#565656", "#8f8f8f", "#c7c7c7", "#f2f2f2"],
 };
 
+// Banded palettes: piecewise-constant elevation strips [color, weight] from
+// horizon (first) to zenith (last), instead of a smooth ramp. The thin dark
+// strips are the key: the reflected-elevation field is continuous, so every
+// boundary between the bands on either side must pass THROUGH the strip —
+// it draws itself as a closed hairline outline around each color region,
+// the "ink line" look of real harbor-water reflections.
+const BANDED_PALETTES = {
+  // each ink strip gets a visually identical but UNIQUE hex: a repeated color
+  // fuses into one multi-strip region in the 2D segmentation, whose union
+  // layer grows hairline protrusions that the sliver blur then eats. Unique
+  // strips keep every union a clean upper set of elevation.
+  "Harbor Ink": [
+    ["#eef7fb", 0.15], ["#06090d", 0.022], ["#9fd2e2", 0.15], ["#070a0e", 0.022],
+    ["#4b93bd", 0.16], ["#05080c", 0.022], ["#20608a", 0.15], ["#060a0e", 0.022],
+    ["#143b58", 0.14], ["#07090d", 0.026], ["#0d2334", 0.126],
+  ],
+  "Sunset Buoy": [
+    ["#f6edc9", 0.13], ["#e5a94b", 0.05], ["#cd5a28", 0.028], ["#f2d98a", 0.07],
+    ["#8c9cc8", 0.12], ["#c8551f", 0.024], ["#46689e", 0.14], ["#2b1710", 0.024],
+    ["#31518a", 0.13], ["#15101e", 0.05], ["#101c38", 0.12], ["#7e2d12", 0.022],
+    ["#060a14", 0.09],
+  ],
+  "Black Water": [
+    ["#d9f0f4", 0.12], ["#f6fbfb", 0.02], ["#a7c4ef", 0.13], ["#8e959d", 0.024],
+    ["#7e97dd", 0.14], ["#494f58", 0.024], ["#0b0e13", 0.22], ["#b9c8ee", 0.028],
+    ["#05070b", 0.294],
+  ],
+};
+
+// cumulative stops of a banded palette: [{c, f0, f1}] with f = fraction of the
+// elevation range, horizon (0) -> zenith (1). null for smooth palettes.
+function paletteStops(name) {
+  const b = BANDED_PALETTES[name];
+  if (!b) return null;
+  const total = b.reduce((s, [, w]) => s + w, 0);
+  let acc = 0;
+  return b.map(([c, w]) => { const f0 = acc / total; acc += w; return { c, f0, f1: acc / total }; });
+}
+
+function paletteColorAt(name, f) {
+  const stops = paletteStops(name);
+  if (!stops) return d3.interpolateRgbBasis(PALETTES[name])(f);
+  for (const s of stops) if (f < s.f1) return s.c;
+  return stops[stops.length - 1].c;
+}
+
 const VB_W = 760;
 const VB_H = 500;
 
@@ -155,18 +201,9 @@ function slopeAt(gx, gy, S) {
   return [hx, hy];
 }
 
-function phiAt(gx, gy, t, S) {
-  const [hx, hy] = slopeAt(gx, gy, S);
-  let nx = -hx, ny = -hy, nz = 1;
-  const nl = Math.hypot(nx, ny, nz); nx /= nl; ny /= nl; nz /= nl;
-  let vx = gx, vy = gy, vz = -S.H;
-  const vl = Math.hypot(vx, vy, vz); vx /= vl; vy /= vl; vz /= vl;
-  const d = vx * nx + vy * ny + vz * nz;
-  const rz = vz - 2 * d * nz;
-  return Math.asin(Math.max(-1, Math.min(1, rz))) * 180 / Math.PI;
-}
-
-// full reflected direction (unit) — gives both elevation and azimuth
+// full reflected direction (unit) — gives both elevation and azimuth.
+// 4th component = cos of the incidence angle (view ray vs surface normal),
+// which sets the Fresnel reflectance at this point.
 function reflectAt(gx, gy, S) {
   const [hx, hy] = slopeAt(gx, gy, S);
   let nx = -hx, ny = -hy, nz = 1;
@@ -174,7 +211,32 @@ function reflectAt(gx, gy, S) {
   let vx = gx, vy = gy, vz = -S.H;
   const vl = Math.hypot(vx, vy, vz); vx /= vl; vy /= vl; vz /= vl;
   const d = vx * nx + vy * ny + vz * nz;
-  return [vx - 2 * d * nx, vy - 2 * d * ny, vz - 2 * d * nz];
+  return [vx - 2 * d * nx, vy - 2 * d * ny, vz - 2 * d * nz, -d];
+}
+
+// Schlick Fresnel for water (R0 ≈ 0.02): the fraction of light NOT reflected
+// at this incidence — i.e. the weight of the transmitted deep-water color.
+// Grazing view -> ~0 (perfect mirror); looking straight down -> ~0.98.
+function fresnelDeepW(cosI) {
+  const c = cosI < 0 ? 0 : cosI > 1 ? 1 : cosI;
+  const m = 1 - c;
+  return 1 - (0.02 + 0.98 * m * m * m * m * m);
+}
+
+// quantized Lab mix toward the deep-water color: band b of K, b = 0 pure
+// reflection, b = K-1 fully "deep". Cached — called per region per band.
+function makeDeepMixer(deep, strength, K) {
+  const cache = new Map();
+  return (color, b) => {
+    if (!b) return color;
+    const key = color + "|" + b;
+    let v = cache.get(key);
+    if (v === undefined) {
+      v = d3.color(d3.interpolateLab(color, deep)(strength * b / (K - 1))).formatHex();
+      cache.set(key, v);
+    }
+    return v;
+  };
 }
 
 // ---- geometry helpers ---------------------------------------------
@@ -233,6 +295,19 @@ function computeFit(S) {
   const ox = VB_W / 2 - scale * bcx;
   const oy = VB_H / 2 - scaleY * bcy + (S.panY || 0) * (VB_H / 2);
   return { scale, scaleY, ox, oy };
+}
+
+// camera roll: rotate the finished picture about the viewport center, scaled
+// up just enough that the rotated frame still covers the viewport (cover-fit,
+// like rotating a photo). Applied as one SVG group transform so every mode —
+// regions, pen lines, buoy, clips — rolls consistently.
+function rollTransform(rollDeg) {
+  if (!rollDeg) return null;
+  const r = (rollDeg * Math.PI) / 180;
+  const ca = Math.abs(Math.cos(r)), sa = Math.abs(Math.sin(r));
+  const s = Math.max((VB_W * ca + VB_H * sa) / VB_W, (VB_W * sa + VB_H * ca) / VB_H);
+  const cx = VB_W / 2, cy = VB_H / 2;
+  return `rotate(${rollDeg} ${cx} ${cy}) translate(${(cx * (1 - s)).toFixed(2)} ${(cy * (1 - s)).toFixed(2)}) scale(${s.toFixed(4)})`;
 }
 
 // Chaikin corner-cutting on a closed ring — rounds the marching-squares
@@ -663,8 +738,22 @@ const ENV2D_W = 84, ENV2D_H = 52;
 // 1D environment strip: color by elevation only (horizon -> zenith)
 const ENV_N = 64;
 function seedEnv(name, n) {
-  const interp = d3.interpolateRgbBasis(PALETTES[name]);
-  return d3.range(n).map((i) => d3.color(interp(i / (n - 1))).formatHex());
+  return d3.range(n).map((i) => d3.color(paletteColorAt(name, i / (n - 1))).formatHex());
+}
+
+// collapse the painted 1D strip into runs of equal color: one band per run,
+// with boundaries exactly at the run edges. Unlike sampling N evenly-spaced
+// bands, this keeps a 1-row painted hairline as its own (thin) band.
+function envRuns(envColors) {
+  const colors = [], fracs = [];
+  const n = envColors.length;
+  for (let i = 0; i < n; i++) {
+    if (i === 0 || envColors[i] !== envColors[i - 1]) {
+      colors.push(envColors[i]);
+      if (i > 0) fracs.push(i / n);
+    }
+  }
+  return { colors, fracs };
 }
 function smoothEnv(arr) {
   return arr.map((c, i) => {
@@ -674,31 +763,6 @@ function smoothEnv(arr) {
     return d3.rgb((a.r + b.r + e.r) / 3, (a.g + b.g + e.g) / 3, (a.b + b.b + e.b) / 3).formatHex();
   });
 }
-function strip1dColors(NB, envColors) {
-  return d3.range(NB).map((k) =>
-    envColors[Math.round((NB === 1 ? 0 : k / (NB - 1)) * (ENV_N - 1))]);
-}
-
-// light separable box blur on a 0/1 mask -> rounder region boundaries
-function blurMask(src, nx, ny, tmp) {
-  for (let j = 0; j < ny; j++) {
-    for (let i = 0; i < nx; i++) {
-      const a = src[j * nx + (i > 0 ? i - 1 : i)];
-      const b = src[j * nx + i];
-      const c = src[j * nx + (i < nx - 1 ? i + 1 : i)];
-      tmp[j * nx + i] = (a + b + c) / 3;
-    }
-  }
-  for (let j = 0; j < ny; j++) {
-    for (let i = 0; i < nx; i++) {
-      const a = tmp[(j > 0 ? j - 1 : j) * nx + i];
-      const b = tmp[j * nx + i];
-      const c = tmp[(j < ny - 1 ? j + 1 : j) * nx + i];
-      src[j * nx + i] = (a + b + c) / 3;
-    }
-  }
-}
-
 // separable box blur on a continuous field (used to de-jitter the reflected
 // direction fields before quantizing them into panorama cells)
 function blurField(src, nx, ny, tmp, passes) {
@@ -714,40 +778,10 @@ function blurField(src, nx, ny, tmp, passes) {
   }
 }
 
-// 3x3 majority (mode) filter on a categorical label field. Unlike blurring a
-// per-label mask, this keeps adjacent regions sharing the same boundary (no
-// background seams) while removing salt-and-pepper speckle from azimuth noise.
-function modeFilter(labels, nx, ny, iters) {
-  let src = labels;
-  for (let it = 0; it < iters; it++) {
-    const dst = new Int16Array(nx * ny);
-    for (let j = 0; j < ny; j++) {
-      for (let i = 0; i < nx; i++) {
-        const self = src[j * nx + i];
-        let best = self, bestc = 0;
-        const tally = {};
-        for (let dy = -1; dy <= 1; dy++) {
-          const jj = j + dy < 0 ? 0 : j + dy >= ny ? ny - 1 : j + dy;
-          for (let dx = -1; dx <= 1; dx++) {
-            const ii = i + dx < 0 ? 0 : i + dx >= nx ? nx - 1 : i + dx;
-            const v = src[jj * nx + ii];
-            const c = (tally[v] = (tally[v] || 0) + 1);
-            if (c > bestc || (c === bestc && v === self)) { bestc = c; best = v; }
-          }
-        }
-        dst[j * nx + i] = best;
-      }
-    }
-    src = dst;
-  }
-  return src;
-}
-
 function seedEnv2D(name, w, h) {
-  const interp = d3.interpolateRgbBasis(PALETTES[name]);
   const cells = new Array(w * h);
   for (let r = 0; r < h; r++) {                 // r = 0 is the waterline
-    const c = d3.color(interp(r / (h - 1))).formatHex();
+    const c = d3.color(paletteColorAt(name, r / (h - 1))).formatHex();
     for (let col = 0; col < w; col++) cells[r * w + col] = c;
   }
   return { w, h, cells };
@@ -783,20 +817,34 @@ function buildGeometry(S) {
   const { nx, ny } = S;
   S._ems = S.emitters.filter((e) => e.on).map((e) => prepEmitter(e, S));
   const values = new Float64Array(nx * ny);
+  const wVals = S.fresOn ? new Float64Array(nx * ny) : null;
   let lo = Infinity, hi = -Infinity;
   for (let j = 0; j < ny; j++) {
     for (let i = 0; i < nx; i++) {
       const [gx, gy] = cell2ground(i + 0.5, j + 0.5, S);
-      const v = phiAt(gx, gy, S.t, S);
+      const R = reflectAt(gx, gy, S);
+      const v = Math.asin(Math.max(-1, Math.min(1, R[2]))) * 180 / Math.PI;
       values[j * nx + i] = v;
+      if (wVals) wVals[j * nx + i] = fresnelDeepW(R[3]);
       if (v < lo) lo = v; if (v > hi) hi = v;
     }
   }
+  // banded palettes carry their own (non-uniform) band fractions — this is
+  // what lets a 2%-thick ink strip survive regardless of the band count
   const NB = S.bands;
-  const boundaries = d3.range(1, NB).map((k) => S.eLo + ((S.eHi - S.eLo) * k) / NB);
+  const boundaries = S.bandFractions
+    ? S.bandFractions.map((f) => S.eLo + (S.eHi - S.eLo) * f)
+    : d3.range(1, NB).map((k) => S.eLo + ((S.eHi - S.eLo) * k) / NB);
   const fit = computeFit(S);
   const contours = d3.contours().size([nx, ny]).thresholds(boundaries)(values);
-  return { ds: contours.map((c) => multiToPath(c, S, fit)), lo, hi };
+  let fres = null;
+  if (wVals) {
+    const K = S.fresBands;
+    const fc = d3.contours().size([nx, ny])
+      .thresholds(d3.range(1, K).map((k) => k / K))(wVals);
+    fres = fc.map((c) => multiToPath(c, S, fit));
+  }
+  return { ds: contours.map((c) => multiToPath(c, S, fit)), fres, lo, hi };
 }
 
 // ---- geometry build, custom 2D path ------------------------------
@@ -829,6 +877,7 @@ function buildSegmentation(S, env2d, azSpan) {
   // continuous reflected-direction fields, in panorama-cell units
   const fF = new Float64Array(nx * ny); // elevation, 0..EH (row units)
   const fG = new Float64Array(nx * ny); // azimuth,   0..EW (col units)
+  const fW = S.fresOn ? new Float64Array(nx * ny) : null; // deep-water weight 0..1
   let lo = Infinity, hi = -Infinity;
   for (let j = 0; j < ny; j++) {
     for (let i = 0; i < nx; i++) {
@@ -839,6 +888,7 @@ function buildSegmentation(S, env2d, azSpan) {
       psi = psi < -az ? -az : psi > az ? az : psi;
       fF[j * nx + i] = phi;
       fG[j * nx + i] = psi;
+      if (fW) fW[j * nx + i] = fresnelDeepW(R[3]);
       if (phi < lo) lo = phi; if (phi > hi) hi = phi;
     }
   }
@@ -848,6 +898,7 @@ function buildSegmentation(S, env2d, azSpan) {
     const tmp = new Float64Array(nx * ny);
     blurField(fF, nx, ny, tmp, passes);
     blurField(fG, nx, ny, tmp, passes);
+    if (fW) blurField(fW, nx, ny, tmp, passes);
   }
   // convert to cell units
   for (let p = 0; p < nx * ny; p++) {
@@ -856,6 +907,16 @@ function buildSegmentation(S, env2d, azSpan) {
   }
 
   const fit = computeFit(S);
+
+  // Fresnel depth bands: upper-set contours of the deep-water weight, used as
+  // nested clips — inside band k every color is re-mixed toward the deep color
+  let fres = null;
+  if (fW) {
+    const K = S.fresBands;
+    fres = d3.contours().size([nx, ny])
+      .thresholds(d3.range(1, K).map((k) => k / K))(fW)
+      .map((c) => multiToPath(c, S, fit));
+  }
 
   // distinct panorama colors, with cell counts for stacking order
   const colorId = new Map(), colorOf = [], areas = [];
@@ -932,7 +993,7 @@ function buildSegmentation(S, env2d, azSpan) {
       layers[k] = { d: multiToPath(cont, S, fit, -1, ex), color: colorOf[order[k]] };
     }
     const drawn = layers.filter((l) => l.d);
-    return { bg: cells[0], layers: drawn, clip, lo, hi, count: drawn.length, twoD: true };
+    return { bg: cells[0], layers: drawn, clip, fres, lo, hi, count: drawn.length, twoD: true };
   }
 
   // upper-set contours of each field (smooth, sub-cell boundaries)
@@ -967,7 +1028,7 @@ function buildSegmentation(S, env2d, azSpan) {
     last = r;
   }
   const count = rows.reduce((n, row) => n + 1 + row.az.length, 0);
-  return { bg: cells[0], rows, lo, hi, count, twoD: true };
+  return { bg: cells[0], rows, fres, lo, hi, count, twoD: true };
 }
 
 // ---- layered-paper stack export -----------------------------------
@@ -1135,7 +1196,7 @@ function buildPaperStack(S, grid, palette, bgColor, minCells = 5) {
 // tile the sheets into one printable SVG: each is the full viewport in its
 // paper color with the holes shown as a hatched "cut" fill and a dashed cut
 // line. Listed top -> bottom (assemble the stack bottom -> top).
-function buildPaperStackSvg(stack) {
+function buildPaperStackSvg(stack, rollTf) {
   const sheets = stack.sheets, N = sheets.length;
   const cols = Math.min(4, Math.max(1, N));
   const rows = Math.ceil(N / cols);
@@ -1150,7 +1211,7 @@ function buildPaperStackSvg(stack) {
   sheets.forEach((sh, i) => {
     const cx = pad + (i % cols) * (tileW + gap);
     const cy = top + Math.floor(i / cols) * (tileH + labelH + gap);
-    const tf = `translate(${cx} ${cy}) scale(${sx.toFixed(4)})`;
+    const tf = `translate(${cx} ${cy}) scale(${sx.toFixed(4)})` + (rollTf ? " " + rollTf : "");
     // clip the tile to its viewport so a zoomed-in scene crops instead of
     // spilling into neighbours; the hole is further clipped to the water plane
     // (so its 5% overshoot never bleeds into the mount margin).
@@ -1387,6 +1448,12 @@ export default function App() {
   const isNarrow = width < 820;
 
   const [steep, setSteep] = useState(0.35);
+  const [pitchDeg, setPitchDeg] = useState(12.6); // 0.22 rad, the old fixed value
+  const [rollDeg, setRollDeg] = useState(0);
+  const [fresOn, setFresOn] = useState(false);
+  const [fresBands, setFresBands] = useState(3);
+  const [fresStrength, setFresStrength] = useState(0.75);
+  const [deepColor, setDeepColor] = useState("#08131d");
   const [wavelength, setWavelength] = useState(3.0);
   const [strength, setStrength] = useState(0.52);
   const [spread, setSpread] = useState(0.5);
@@ -1470,34 +1537,46 @@ export default function App() {
     return () => cancelAnimationFrame(raf);
   }, [animate, speed]);
 
+  // banded palette stops / painted-strip runs -> non-uniform band boundaries
+  const stops = useMemo(() => paletteStops(palette), [palette]);
+  const runs1d = useMemo(() => (mode === "paint1d" ? envRuns(envColors) : null),
+    [mode, envColors]);
+  const bandFractions = useMemo(() => {
+    if (mode === "preset" && stops) return stops.slice(1).map((s) => s.f0);
+    if (runs1d) return runs1d.fracs;
+    return null;
+  }, [mode, stops, runs1d]);
+
   const S = useMemo(() => ({
     nx: quality, ny: quality,
     xMin: -halfW, xMax: halfW, yMin: 3, yMax: yFar,
     H: 0.4 * Math.pow(22.5, steep),
-    pitch: 0.22,
+    pitch: (pitchDeg * Math.PI) / 180,
     k: (2 * Math.PI) / wavelength,
     amp: strength * 0.06,
     decay: 0.18 - spread * 0.16,
     omega: 1.0,
     t: animate ? tRef.current : 0,
     bands, perspective, eLo, eHi, zoom, panY, smooth, coherence, rectOutput,
-    surface3d, waveScale,
+    surface3d, waveScale, bandFractions, fresOn, fresBands,
     // waves scatter off the buoy's hull: a ring source pinned to the object,
     // with a tight decay so the disturbance stays local
     emitters: objOn && objRipple > 0
       ? [...emitters, { id: "buoy", on: true, type: "point", x: objX, y: objY,
           size: Math.max(0.3, objSize * objRippleScale), amp: objRipple * 1.5, decay: 0.28 }]
       : emitters,
-  }), [quality, steep, wavelength, strength, spread, bands, perspective,
+  }), [quality, steep, pitchDeg, wavelength, strength, spread, bands, perspective,
        halfW, yFar, eLo, eHi, zoom, panY, smooth, coherence, rectOutput, surface3d, waveScale,
+       bandFractions, fresOn, fresBands,
        emitters, animate, speed, tRef.current,
        objOn, objX, objY, objSize, objRipple, objRippleScale]);
 
   const is2d = mode === "paint2d";
   const geom = useMemo(() => (is2d ? null : buildGeometry(S)), [is2d, S]);
-  const presetColors = useMemo(() => bandColors(bands, palette), [bands, palette]);
-  const colors1d = useMemo(() => (mode === "paint1d" ? strip1dColors(bands, envColors) : null),
-    [mode, bands, envColors]);
+  const presetColors = useMemo(
+    () => (stops ? stops.map((s) => s.c) : bandColors(bands, palette)),
+    [stops, bands, palette]);
+  const colors1d = runs1d ? runs1d.colors : null;
   const seg = useMemo(() => (is2d ? buildSegmentation(S, segEnv, azSpan) : null),
     [is2d, S, segEnv, azSpan]);
 
@@ -1507,14 +1586,30 @@ export default function App() {
   const bgFill = bgColor || autoBg;
   const layers = is2d ? (seg.layers || null)
     : geom.ds.map((d, k) => ({ d, color: isobandColors[k + 1] }));
-  const regionCount = is2d ? seg.count : layers.length + 1;
   const rng = is2d ? seg : geom;
+
+  // Fresnel depth bands: clip paths + the color mixer for each band
+  const mixDeep = useMemo(
+    () => (fresOn ? makeDeepMixer(deepColor, fresStrength, fresBands) : (c) => c),
+    [fresOn, deepColor, fresStrength, fresBands]);
+  const fresPaths = fresOn ? (is2d ? seg.fres : geom.fres) : null;
+  const fresIdx = useMemo(
+    () => (fresOn && fresPaths ? d3.range(fresBands) : [0]),
+    [fresOn, fresPaths, fresBands]);
+  const rollTf = rollTransform(rollDeg);
+
+  const regionCount = (is2d ? seg.count : layers.length + 1) * fresIdx.length;
 
   // pen-plot lines: equally spaced scan lines colored by the reflection beneath
   const penLines = useMemo(() => {
     if (!penMode) return null;
     const fit = computeFit(S);
     S._ems = S.emitters.filter((e) => e.on).map((e) => prepEmitter(e, S));
+    const deepMix = (c, cosI) => {
+      if (!fresOn) return c;
+      const b = Math.min(fresBands - 1, Math.floor(fresnelDeepW(cosI) * fresBands));
+      return mixDeep(c, b);
+    };
     let colorAt;
     if (is2d) {
       const { w: EW, h: EH, cells } = segEnv;
@@ -1525,15 +1620,24 @@ export default function App() {
         let psi = Math.atan2(R[0], R[1]) * 180 / Math.PI; psi = psi < -az ? -az : psi > az ? az : psi;
         let v = (phi - S.eLo) / ((S.eHi - S.eLo) || 1); v = v < 0 ? 0 : v > 1 ? 1 : v;
         let u = (psi + az) / (2 * az); u = u < 0 ? 0 : u > 1 ? 1 : u;
-        return cells[Math.min(EH - 1, Math.floor(v * EH)) * EW + Math.min(EW - 1, Math.floor(u * EW))];
+        const c = cells[Math.min(EH - 1, Math.floor(v * EH)) * EW + Math.min(EW - 1, Math.floor(u * EW))];
+        return deepMix(c, R[3]);
       };
     } else {
       const cols = mode === "paint1d" ? colors1d : presetColors;
       const NB = cols.length;
+      const fr = S.bandFractions;
       colorAt = (gx, gy) => {
-        const phi = phiAt(gx, gy, 0, S);
+        const R = reflectAt(gx, gy, S);
+        const phi = Math.asin(Math.max(-1, Math.min(1, R[2]))) * 180 / Math.PI;
         let v = (phi - S.eLo) / ((S.eHi - S.eLo) || 1); v = v < 0 ? 0 : v >= 1 ? 0.999999 : v;
-        return cols[Math.floor(v * NB)] || cols[0];
+        let c;
+        if (fr) {
+          let idx = 0;
+          for (const f of fr) { if (v >= f) idx++; else break; }
+          c = cols[idx] || cols[0];
+        } else c = cols[Math.floor(v * NB)] || cols[0];
+        return deepMix(c, R[3]);
       };
     }
     const threeD = S.perspective && penRelief > 0;
@@ -1546,7 +1650,8 @@ export default function App() {
       nLines: penCount, samples: penHidden ? 360 : 260, relief: penRelief,
       threeD, hidden: penHidden, evenScreen: penEven,
     });
-  }, [penMode, penStyle, penCount, penSpacing, penRelief, penHidden, penEven, S, is2d, mode, segEnv, azSpan, colors1d, presetColors]);
+  }, [penMode, penStyle, penCount, penSpacing, penRelief, penHidden, penEven, S, is2d, mode,
+      segEnv, azSpan, colors1d, presetColors, fresOn, fresBands, mixDeep]);
 
   // floating buoy: projected cap + waterline clip + mirrored reflection
   const buoy = useMemo(() => {
@@ -1570,46 +1675,64 @@ export default function App() {
 
   const buildSvg = () => {
     const buoyStr = buoy ? buoySvg(buoy, buoyShade) : "";
+    const rollOpen = rollTf ? `<g transform="${rollTf}">` : `<g>`;
     if (penMode) {
-      let body = `<rect width="${VB_W}" height="${VB_H}" fill="${bgFill}"/>`;
+      let body = `<rect width="${VB_W}" height="${VB_H}" fill="${bgFill}"/>` + rollOpen;
       penLines.forEach((l) => {
         body += `<path d="${l.d}" fill="none" stroke="${l.color}" stroke-width="${penWidth}" stroke-linecap="round" stroke-linejoin="round"/>`;
       });
-      return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${VB_W} ${VB_H}">${body}${buoyStr}</svg>`;
+      body += buoyStr + `</g>`;
+      return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${VB_W} ${VB_H}">${body}</svg>`;
     }
-    let body = `<rect width="${VB_W}" height="${VB_H}" fill="${bgFill}"/>`;
+    let body = `<rect width="${VB_W}" height="${VB_H}" fill="${bgFill}"/>` + rollOpen;
     const stroke = edges ? ` stroke="#000" stroke-opacity="0.25" stroke-width="0.6"` : "";
+    let defs = "";
+    if (fresOn && fresPaths) fresPaths.forEach((d, i) => {
+      if (d) defs += `<clipPath id="fres${i + 1}"><path d="${d}"/></clipPath>`;
+    });
+    const bandOpen = (b) => (b > 0 ? `<g clip-path="url(#fres${b})">` : `<g>`);
     if (is2d && !seg.layers) {
-      let defs = "";
       seg.rows.forEach((row, ri) => {
         if (row.clip) defs += `<clipPath id="el${ri}"><path d="${row.clip}"/></clipPath>`;
       });
-      seg.rows.forEach((row, ri) => {
-        const open = row.clip ? `<g clip-path="url(#el${ri})">` : `<g>`;
-        let g = open;
-        if (row.base) g += `<rect width="${VB_W}" height="${VB_H}" fill="${row.base}"${stroke ? "" : ""}/>`;
-        row.az.forEach((a) => { g += `<path d="${a.d}" fill="${a.color}" fill-rule="evenodd"${stroke}/>`; });
-        if (edges && row.clip) g += `<path d="${row.clip}" fill="none"${stroke}/>`;
-        g += `</g>`;
-        body += g;
+      fresIdx.forEach((b) => {
+        if (b > 0 && !fresPaths[b - 1]) return;
+        body += bandOpen(b);
+        seg.rows.forEach((row, ri) => {
+          let g = row.clip ? `<g clip-path="url(#el${ri})">` : `<g>`;
+          if (row.base) g += `<rect width="${VB_W}" height="${VB_H}" fill="${mixDeep(row.base, b)}"/>`;
+          row.az.forEach((a) => { g += `<path d="${a.d}" fill="${mixDeep(a.color, b)}" fill-rule="evenodd"${stroke}/>`; });
+          if (edges && row.clip) g += `<path d="${row.clip}" fill="none"${stroke}/>`;
+          g += `</g>`;
+          body += g;
+        });
+        body += `</g>`;
       });
-      return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${VB_W} ${VB_H}"><defs>${defs}</defs>${body}${buoyStr}</svg>`;
+      body += buoyStr + `</g>`;
+      return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${VB_W} ${VB_H}"><defs>${defs}</defs>${body}</svg>`;
     }
-    if (is2d) {
-      // in 3D the waves rise above the flat water trapezoid, so skip the clip
-      // (the padded regions already overshoot the frame) — otherwise crests
-      // near the edges would be sheared off flat
-      body += surface3d ? `<g opacity="0.999">` : `<g clip-path="url(#watertrap)" opacity="0.999">`;
-      layers.forEach((l) => {
-        body += `<path d="${l.d}" fill="${l.color}" fill-rule="evenodd"${stroke}/>`;
+    // layered paths, preset & 2D alike. With Fresnel on, the geometry is
+    // shared via <use> so each depth band re-colors the same paths.
+    if (is2d) defs += `<clipPath id="watertrap"><path d="${seg.clip}"/></clipPath>`;
+    if (fresOn) layers.forEach((l, i) => { defs += `<path id="lyr${i}" d="${l.d}"/>`; });
+    // in 3D the waves rise above the flat water trapezoid, so skip the clip
+    // (the padded regions already overshoot the frame) — otherwise crests
+    // near the edges would be sheared off flat
+    body += is2d && !surface3d
+      ? `<g clip-path="url(#watertrap)" opacity="0.999">` : `<g opacity="0.999">`;
+    fresIdx.forEach((b) => {
+      if (b > 0 && !fresPaths[b - 1]) return;
+      body += bandOpen(b);
+      if (b > 0) body += `<rect width="${VB_W}" height="${VB_H}" fill="${mixDeep(bg, b)}"/>`;
+      layers.forEach((l, i) => {
+        body += fresOn
+          ? `<use href="#lyr${i}" fill="${mixDeep(l.color, b)}" fill-rule="evenodd"${stroke}/>`
+          : `<path d="${l.d}" fill="${l.color}" fill-rule="evenodd"${stroke}/>`;
       });
       body += `</g>`;
-      return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${VB_W} ${VB_H}"><defs><clipPath id="watertrap"><path d="${seg.clip}"/></clipPath></defs>${body}${buoyStr}</svg>`;
-    }
-    layers.forEach((l) => {
-      body += `<path d="${l.d}" fill="${l.color}" fill-rule="evenodd"${stroke}/>`;
     });
-    return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${VB_W} ${VB_H}">${body}${buoyStr}</svg>`;
+    body += `</g>` + buoyStr + `</g>`;
+    return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${VB_W} ${VB_H}">${defs ? `<defs>${defs}</defs>` : ""}${body}</svg>`;
   };
   const saveSvg = (svg, name) => {
     try {
@@ -1634,9 +1757,19 @@ export default function App() {
     S._ems = S.emitters.filter((e) => e.on).map((e) => prepEmitter(e, S));
     const { nx, ny } = S;
     const grid = new Int32Array(nx * ny);
+    const deepMix = (c, cosI) => {
+      if (!fresOn) return c;
+      const b = Math.min(fresBands - 1, Math.floor(fresnelDeepW(cosI) * fresBands));
+      return mixDeep(c, b);
+    };
+    const idOf = new Map(), palette = [];
+    const idFor = (c) => {
+      let id = idOf.get(c);
+      if (id === undefined) { id = palette.length; idOf.set(c, id); palette.push(c); }
+      return id;
+    };
     if (is2d) {
       const { w: EW, h: EH, cells } = segEnv, az = azSpan;
-      const idOf = new Map(), palette = [];
       for (let j = 0; j < ny; j++) {
         for (let i = 0; i < nx; i++) {
           const [gx, gy] = cell2ground(i + 0.5, j + 0.5, S);
@@ -1646,28 +1779,35 @@ export default function App() {
           let v = (phi - S.eLo) / ((S.eHi - S.eLo) || 1); v = v < 0 ? 0 : v > 1 ? 1 : v;
           let u = (psi + az) / (2 * az); u = u < 0 ? 0 : u > 1 ? 1 : u;
           const c = cells[Math.min(EH - 1, Math.floor(v * EH)) * EW + Math.min(EW - 1, Math.floor(u * EW))];
-          let id = idOf.get(c); if (id === undefined) { id = palette.length; idOf.set(c, id); palette.push(c); }
-          grid[j * nx + i] = id;
+          grid[j * nx + i] = idFor(deepMix(c, R[3]));
         }
       }
       return { grid, palette };
     }
     const cols = mode === "paint1d" ? colors1d : presetColors, NB = cols.length;
+    const fr = S.bandFractions;
     for (let j = 0; j < ny; j++) {
       for (let i = 0; i < nx; i++) {
         const [gx, gy] = cell2ground(i + 0.5, j + 0.5, S);
-        const phi = phiAt(gx, gy, S.t, S);
+        const R = reflectAt(gx, gy, S);
+        const phi = Math.asin(Math.max(-1, Math.min(1, R[2]))) * 180 / Math.PI;
         let v = (phi - S.eLo) / ((S.eHi - S.eLo) || 1); v = v < 0 ? 0 : v >= 1 ? 0.999999 : v;
-        grid[j * nx + i] = Math.floor(v * NB);
+        let c;
+        if (fr) {
+          let idx = 0;
+          for (const f of fr) { if (v >= f) idx++; else break; }
+          c = cols[idx] || cols[0];
+        } else c = cols[Math.floor(v * NB)] || cols[0];
+        grid[j * nx + i] = idFor(deepMix(c, R[3]));
       }
     }
-    return { grid, palette: cols };
+    return { grid, palette };
   };
 
   const exportPaperStack = () => {
     const { grid, palette } = paperColorGrid();
     const stack = buildPaperStack(S, grid, palette, bgFill);
-    const svg = buildPaperStackSvg(stack);
+    const svg = buildPaperStackSvg(stack, rollTf);
     saveSvg(svg, "reflection-paper-stack.svg");
     setSvgName("reflection-paper-stack.svg");
     setStackInfo({ nSheets: stack.nSheets, method: stack.method });
@@ -1739,6 +1879,7 @@ export default function App() {
             boxShadow: "0 8px 24px rgba(0,0,0,0.55)" }}>
             <svg viewBox={`0 0 ${VB_W} ${VB_H}`} style={{ width: "100%", display: "block" }}>
               <rect width={VB_W} height={VB_H} fill={bgFill} />
+              <g transform={rollTf || undefined}>
               {penMode ? (
                 penLines.map((l, i) => (
                   <path key={i} d={l.d} fill="none" stroke={l.color}
@@ -1750,41 +1891,57 @@ export default function App() {
                     {seg.rows.map((row, ri) => row.clip ? (
                       <clipPath key={ri} id={`el${ri}`}><path d={row.clip} /></clipPath>
                     ) : null)}
+                    {fresOn && fresPaths.map((d, i) => d ? (
+                      <clipPath key={`f${i}`} id={`fres${i + 1}`}><path d={d} /></clipPath>
+                    ) : null)}
                   </defs>
-                  {seg.rows.map((row, ri) => (
-                    <g key={ri} clipPath={row.clip ? `url(#el${ri})` : undefined}>
-                      {row.base && <rect width={VB_W} height={VB_H} fill={row.base} />}
-                      {row.az.map((a, ai) => (
-                        <path key={ai} d={a.d} fill={a.color} fillRule="evenodd" />
+                  {fresIdx.map((b) => (b > 0 && !fresPaths[b - 1]) ? null : (
+                    <g key={`fb${b}`} clipPath={b > 0 ? `url(#fres${b})` : undefined}>
+                      {seg.rows.map((row, ri) => (
+                        <g key={ri} clipPath={row.clip ? `url(#el${ri})` : undefined}>
+                          {row.base && <rect width={VB_W} height={VB_H} fill={mixDeep(row.base, b)} />}
+                          {row.az.map((a, ai) => (
+                            <path key={ai} d={a.d} fill={mixDeep(a.color, b)} fillRule="evenodd" />
+                          ))}
+                          {edges && row.clip && (
+                            <path d={row.clip} fill="none" stroke="#000" strokeOpacity={0.28} strokeWidth={0.6} />
+                          )}
+                        </g>
                       ))}
-                      {edges && row.clip && (
-                        <path d={row.clip} fill="none" stroke="#000" strokeOpacity={0.28} strokeWidth={0.6} />
-                      )}
                     </g>
                   ))}
                 </>
-              ) : is2d ? (
+              ) : (
                 <>
                   <defs>
-                    <clipPath id="watertrap"><path d={seg.clip} /></clipPath>
+                    {is2d && <clipPath id="watertrap"><path d={seg.clip} /></clipPath>}
+                    {fresOn && fresPaths.map((d, i) => d ? (
+                      <clipPath key={`f${i}`} id={`fres${i + 1}`}><path d={d} /></clipPath>
+                    ) : null)}
+                    {fresOn && layers.map((l, i) => (
+                      <path key={i} id={`lyr${i}`} d={l.d} />
+                    ))}
                   </defs>
                   {/* opacity forces the group into an isolated buffer, so the
                       clip is antialiased once against the composite instead of
                       per layer (per-layer clip AA leaks the colors beneath) */}
-                  <g clipPath={surface3d ? undefined : "url(#watertrap)"} opacity={0.999}>
-                    {layers.map((l, i) => (
-                      <path key={i} d={l.d} fill={l.color} fillRule="evenodd"
-                        stroke={edges ? "#000" : "none"} strokeOpacity={edges ? 0.28 : 0}
-                        strokeWidth={edges ? 0.6 : 0} />
+                  <g clipPath={is2d && !surface3d ? "url(#watertrap)" : undefined} opacity={0.999}>
+                    {fresIdx.map((b) => (b > 0 && !fresPaths[b - 1]) ? null : (
+                      <g key={`fb${b}`} clipPath={b > 0 ? `url(#fres${b})` : undefined}>
+                        {b > 0 && <rect width={VB_W} height={VB_H} fill={mixDeep(bg, b)} />}
+                        {layers.map((l, i) => fresOn ? (
+                          <use key={i} href={`#lyr${i}`} fill={mixDeep(l.color, b)} fillRule="evenodd"
+                            stroke={edges ? "#000" : "none"} strokeOpacity={edges ? 0.28 : 0}
+                            strokeWidth={edges ? 0.6 : 0} />
+                        ) : (
+                          <path key={i} d={l.d} fill={l.color} fillRule="evenodd"
+                            stroke={edges ? "#000" : "none"} strokeOpacity={edges ? 0.28 : 0}
+                            strokeWidth={edges ? 0.6 : 0} />
+                        ))}
+                      </g>
                     ))}
                   </g>
                 </>
-              ) : (
-                layers.map((l, i) => (
-                  <path key={i} d={l.d} fill={l.color} fillRule="evenodd"
-                    stroke={edges ? "#000" : "none"} strokeOpacity={edges ? 0.28 : 0}
-                    strokeWidth={edges ? 0.6 : 0} />
-                ))
               )}
               {buoy && (
                 <g>
@@ -1815,6 +1972,7 @@ export default function App() {
                   )}
                 </g>
               )}
+              </g>
             </svg>
             <div style={{ position: "absolute", left: 12, bottom: 10, fontSize: 10.5,
               color: "#6d808f", fontFamily: "ui-monospace, monospace", letterSpacing: 0.5 }}>
@@ -1830,6 +1988,12 @@ export default function App() {
               <Slider label="View angle (near edge)" value={steep} min={0} max={1} step={0.01}
                 onChange={setSteep}
                 fmt={(v) => Math.round(Math.atan((0.4 * Math.pow(22.5, v)) / 3) * 180 / Math.PI) + "°"} />
+              {perspective && (
+                <Slider label="Camera pitch (framing)" value={pitchDeg} min={4} max={55} step={0.5}
+                  onChange={setPitchDeg} fmt={(v) => v.toFixed(1) + "°"} />
+              )}
+              <Slider label="Camera roll" value={rollDeg} min={-30} max={30} step={0.5}
+                onChange={setRollDeg} fmt={(v) => (v === 0 ? "level" : v.toFixed(1) + "°")} />
               <Slider label="Ripple scale (λ)" value={wavelength} min={1.2} max={7} step={0.1}
                 onChange={setWavelength} fmt={(v) => v.toFixed(1)} />
               <Slider label="Ripple strength" value={strength} min={0.05} max={1} step={0.01}
@@ -1842,11 +2006,12 @@ export default function App() {
 
             <div style={panel}>
               <div style={heading}>Environment</div>
-              {mode !== "paint2d" &&
+              {mode === "preset" && !stops &&
                 <Slider label="Color regions" value={bands} min={3} max={16} step={1} onChange={setBands} />}
               <div style={{ display: "flex", gap: 6, marginBottom: 10, flexWrap: "wrap" }}>
-                {Object.keys(PALETTES).map((p) => {
+                {[...Object.keys(PALETTES), ...Object.keys(BANDED_PALETTES)].map((p) => {
                   const on = mode === "preset" && palette === p;
+                  const inked = !!BANDED_PALETTES[p];
                   return (
                     <button key={p} onClick={() => { setMode("preset"); setPalette(p); }}
                       style={{ flex: "1 0 30%", padding: "8px 6px", fontSize: 11, borderRadius: 7,
@@ -1854,11 +2019,19 @@ export default function App() {
                         background: on ? "#27424b" : "#1a232c",
                         color: on ? "#dff1f6" : "#9fb0c0",
                         border: "1px solid " + (on ? "#3f7e8f" : "#26313c") }}>
-                      {p}
+                      {p}{inked ? " ✒" : ""}
                     </button>
                   );
                 })}
               </div>
+              {mode === "preset" && stops && (
+                <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 10, lineHeight: 1.5,
+                  fontFamily: "ui-monospace, monospace" }}>
+                  Banded palette: the hairline dark strips draw themselves as ink-line outlines
+                  around every color region — every boundary between the bands on either side
+                  must pass through the strip.
+                </div>
+              )}
               <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
                 <button onClick={enter1d} style={{ flex: 1, padding: "8px 6px", fontSize: 11, borderRadius: 7,
                   cursor: "pointer", fontFamily: "ui-monospace, monospace",
@@ -1967,13 +2140,45 @@ export default function App() {
                 <>
                   <div style={{ display: "flex", height: 14, borderRadius: 4, overflow: "hidden",
                     border: "1px solid #26313c" }}>
-                    {presetColors.map((c, i) => (<div key={i} style={{ flex: 1, background: c }} />))}
+                    {stops
+                      ? stops.map((s, i) => (<div key={i} style={{ flex: s.f1 - s.f0, background: s.c }} />))
+                      : presetColors.map((c, i) => (<div key={i} style={{ flex: 1, background: c }} />))}
                   </div>
                   <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9.5,
                     color: "#6d808f", marginTop: 3, fontFamily: "ui-monospace, monospace" }}>
                     <span>{eLo}° horizon</span><span>zenith {eHi}°</span>
                   </div>
                 </>
+              )}
+            </div>
+
+            <div style={panel}>
+              <div style={heading}>Water depth (Fresnel)</div>
+              <Toggle label="Fresnel depth mix" value={fresOn} onChange={setFresOn} />
+              {fresOn && (
+                <div style={{ marginTop: 6 }}>
+                  <Slider label="depth bands" value={fresBands} min={2} max={6} step={1}
+                    onChange={setFresBands} />
+                  <Slider label="depth strength" value={fresStrength} min={0} max={1} step={0.05}
+                    onChange={setFresStrength} fmt={(v) => v.toFixed(2)} />
+                  <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
+                    <label style={{ width: 30, height: 30, borderRadius: 6, cursor: "pointer",
+                      border: "1px solid #44525e", position: "relative", overflow: "hidden",
+                      background: deepColor, display: "inline-block", flex: "none" }}>
+                      <input type="color" value={deepColor}
+                        onChange={(e) => setDeepColor(e.target.value)}
+                        style={{ position: "absolute", inset: -4, opacity: 0, cursor: "pointer" }} />
+                    </label>
+                    <span style={{ fontSize: 12, color: "#9fb0c0",
+                      fontFamily: "ui-monospace, monospace" }}>deep water · {deepColor}</span>
+                  </div>
+                  <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5,
+                    fontFamily: "ui-monospace, monospace" }}>
+                    Steep view angles see through the surface (Fresnel reflectance ~2%), grazing
+                    angles mirror it — so the near water shifts toward the deep-water color, in
+                    flat contoured bands. The far field stays pure reflection.
+                  </div>
+                </div>
               )}
             </div>
 
