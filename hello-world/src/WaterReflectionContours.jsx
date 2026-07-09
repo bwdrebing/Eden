@@ -734,6 +734,9 @@ function buildPenConcentric(S, fit, colorAt, opts) {
 // 2D environment panorama: width = azimuth (looking across the lake),
 // height = elevation (waterline at the bottom, sky at the top).
 const ENV2D_W = 84, ENV2D_H = 52;
+// taller row count for panoramas derived from presets / the 1D strip when
+// reflected objects force the 2D path — keeps hairline bands ≥ 2 rows
+const DERIVED_ENV_H = 96;
 
 // 1D environment strip: color by elevation only (horizon -> zenith)
 const ENV_N = 64;
@@ -778,12 +781,117 @@ function blurField(src, nx, ny, tmp, passes) {
   }
 }
 
-function seedEnv2D(name, w, h) {
+// horizontal-stripe panorama from any elevation->color function
+function envFromRows(colorAtF, w, h) {
   const cells = new Array(w * h);
   for (let r = 0; r < h; r++) {                 // r = 0 is the waterline
-    const c = d3.color(paletteColorAt(name, r / (h - 1))).formatHex();
+    const c = d3.color(colorAtF(r / (h - 1))).formatHex();
     for (let col = 0; col < w; col++) cells[r * w + col] = c;
   }
+  return { w, h, cells };
+}
+
+function seedEnv2D(name, w, h) {
+  return envFromRows((f) => paletteColorAt(name, f), w, h);
+}
+
+// ---- reflected scene objects ---------------------------------------
+// Objects (a sailboat, a dock, a buoy...) are environment features: shapes
+// stamped into the reflected panorama at an azimuth. The water then reflects
+// them exactly like the sky — the reflection stretches toward the viewer,
+// shreds on the ripples, and rims itself with an ink outline, through the
+// same contour machinery as everything else. Like the boats in the reference
+// paintings, the object itself sits across the water, outside the frame;
+// only its reflection appears.
+//
+// Each shape is evaluated in a local box: u ∈ [-1, 1] across its width,
+// v ∈ [0, 1] from the waterline to its top. Returns 0 = empty, 1 = primary
+// color (structure), 2 = accent color (the color that "pops").
+const OBJECT_SHAPES = {
+  sailboat: { aspect: 1.7, label: ["hull", "sails"], fn: (u, v) => {
+    if (v < 0.16 && Math.abs(u) < 0.95 - 1.8 * Math.max(0, 0.09 - v)) return 1; // hull, tapered bow/stern
+    if (v >= 0.14 && v < 0.99) {
+      const fm = (0.99 - v) / 0.85;                       // mainsail: tall triangle aft of the mast
+      if (u >= 0.03 && u < 0.03 + 0.9 * fm) return 2;
+      if (v < 0.8) {                                      // jib: shorter triangle forward
+        const fj = (0.8 - v) / 0.66;
+        if (u <= -0.03 && u > -0.03 - 0.7 * fj) return 2;
+      }
+    }
+    return 0;
+  } },
+  dock: { aspect: 4.0, label: ["pilings", "deck"], fn: (u, v) => {
+    if (v >= 0.5 && v < 0.85) return v >= 0.72 ? 2 : 1;   // deck slab, lit top edge
+    if (v < 0.5) {
+      for (const k of [-0.7, -0.235, 0.235, 0.7]) if (Math.abs(u - k) < 0.06) return 1;
+    }
+    return 0;
+  } },
+  buoy: { aspect: 0.8, label: ["base", "ball"], fn: (u, v) => {
+    const dv = (v - 0.52) / 0.46;
+    if (u * u + dv * dv <= 1) return 2;                   // the ball
+    if (v < 0.1 && Math.abs(u) < 0.3) return 1;           // dark waterline nub
+    return 0;
+  } },
+  post: { aspect: 0.3, label: ["post", "cap"], fn: (u, v) =>
+    (Math.abs(u) < 0.55 ? (v > 0.82 ? 2 : 1) : 0) },
+};
+
+// nudge a color's low blue bits so every object instance gets unique hexes —
+// repeated colors would fuse into one region in the segmentation
+function tweakHex(hex, salt) {
+  const c = d3.rgb(hex);
+  return d3.rgb(c.r, c.g, Math.max(0, Math.min(255, (c.b & ~7) + (salt % 8)))).formatHex();
+}
+
+// stamp the live objects into a copy of the panorama. Sizes are in degrees of
+// reflected elevation (so they read at the same scale as the eLo..eHi range);
+// each silhouette gets a 1-cell ink rim so its reflection carries the
+// paintings' dark contour line.
+function stampObjects(env, objects, azSpan, eLo, eHi) {
+  const live = objects.filter((o) => o.on);
+  if (!env || !live.length) return env;
+  const { w, h } = env;
+  const cells = env.cells.slice();
+  const span = (eHi - eLo) || 1;
+  const colsPerDeg = w / (2 * azSpan);
+  const rowsPerDeg = h / span;
+  live.forEach((o, oi) => {
+    const shape = OBJECT_SHAPES[o.type];
+    const hRows = Math.max(2, o.size * rowsPerDeg);
+    const halfCols = Math.max(1, (o.size * shape.aspect / 2) * colsPerDeg);
+    const rowBase = (0 - eLo) * rowsPerDeg;               // objects sit on the waterline
+    const colC = ((o.az + azSpan) / (2 * azSpan)) * w;
+    const primary = tweakHex(o.color, oi * 2 + 1);
+    const accent = tweakHex(o.color2, oi * 2 + 1);
+    const ink = tweakHex("#070a0e", oi * 2 + 1);
+    const mask = new Uint8Array(w * h);
+    const r0 = Math.max(0, Math.floor(rowBase)), r1 = Math.min(h - 1, Math.ceil(rowBase + hRows));
+    const c0 = Math.max(0, Math.floor(colC - halfCols)), c1 = Math.min(w - 1, Math.ceil(colC + halfCols));
+    for (let r = r0; r <= r1; r++) {
+      const v = (r + 0.5 - rowBase) / hRows;
+      if (v < 0 || v > 1) continue;
+      for (let c = c0; c <= c1; c++) {
+        const u = (c + 0.5 - colC) / halfCols;
+        if (u < -1 || u > 1) continue;
+        const t = shape.fn(u, v);
+        if (t) { cells[r * w + c] = t === 2 ? accent : primary; mask[r * w + c] = 1; }
+      }
+    }
+    for (let r = Math.max(0, r0 - 1); r <= Math.min(h - 1, r1 + 1); r++) {
+      for (let c = Math.max(0, c0 - 1); c <= Math.min(w - 1, c1 + 1); c++) {
+        if (mask[r * w + c]) continue;
+        let near = false;
+        for (let dr = -1; dr <= 1 && !near; dr++) {
+          for (let dc = -1; dc <= 1; dc++) {
+            const rr = r + dr, cc = c + dc;
+            if (rr >= 0 && rr < h && cc >= 0 && cc < w && mask[rr * w + cc]) { near = true; break; }
+          }
+        }
+        if (near) cells[r * w + c] = ink;
+      }
+    }
+  });
   return { w, h, cells };
 }
 
@@ -1433,6 +1541,87 @@ function EmitterCard({ em, idx, halfW, yFar, onChange, onRemove }) {
   );
 }
 
+// read-only mini render of a panorama (used to show what the water reflects)
+function EnvPreview({ env }) {
+  const cvRef = useRef(null);
+  useEffect(() => {
+    const cv = cvRef.current; if (!cv || !env) return;
+    const { w, h, cells } = env;
+    if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+    const ctx = cv.getContext("2d");
+    if (!ctx) return;                         // jsdom (tests) has no 2D canvas
+    const img = ctx.createImageData(w, h);
+    for (let r = 0; r < h; r++) {
+      const drow = h - 1 - r;                 // canvas top = sky
+      for (let c = 0; c < w; c++) {
+        const col = d3.rgb(cells[r * w + c]);
+        const p = (drow * w + c) * 4;
+        img.data[p] = col.r; img.data[p + 1] = col.g; img.data[p + 2] = col.b; img.data[p + 3] = 255;
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+  }, [env]);
+  if (!env) return null;
+  return (
+    <canvas ref={cvRef} style={{ width: "100%", aspectRatio: `${env.w} / ${env.h * 0.6}`,
+      borderRadius: 8, border: "1px solid #26313c", display: "block" }} />
+  );
+}
+
+function ObjectCard({ obj, idx, azSpan, eLo, eHi, onChange, onRemove }) {
+  const types = [["sailboat", "Sailboat"], ["dock", "Dock"], ["buoy", "Buoy"], ["post", "Post"]];
+  const labels = OBJECT_SHAPES[obj.type].label;
+  return (
+    <div style={{ border: "1px solid #26313c", borderRadius: 9, padding: 11,
+      marginBottom: 10, background: "#121922" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 9 }}>
+        <span style={{ fontSize: 10.5, letterSpacing: 1, color: "#6f8294", flex: 1,
+          fontFamily: "ui-monospace, monospace" }}>OBJECT {idx + 1}</span>
+        <button onClick={() => onChange({ on: !obj.on })}
+          style={{ fontSize: 10.5, padding: "4px 9px", borderRadius: 6, cursor: "pointer",
+            fontFamily: "ui-monospace, monospace",
+            background: obj.on ? "#27424b" : "#1a232c", color: obj.on ? "#dff1f6" : "#7f93a4",
+            border: "1px solid " + (obj.on ? "#3f7e8f" : "#26313c") }}>
+          {obj.on ? "on" : "off"}
+        </button>
+        <button onClick={onRemove}
+          style={{ fontSize: 12, width: 26, height: 26, borderRadius: 6, cursor: "pointer",
+            background: "#1a232c", color: "#9a6a6a", border: "1px solid #3a2a2a" }}>✕</button>
+      </div>
+      <div style={{ display: "flex", gap: 5, marginBottom: 10 }}>
+        {types.map(([tp, label]) => (
+          <button key={tp} onClick={() => onChange({ type: tp })}
+            style={{ flex: 1, padding: "6px 4px", fontSize: 11, borderRadius: 6, cursor: "pointer",
+              fontFamily: "ui-monospace, monospace",
+              background: obj.type === tp ? "#27424b" : "#1a232c",
+              color: obj.type === tp ? "#dff1f6" : "#9fb0c0",
+              border: "1px solid " + (obj.type === tp ? "#3f7e8f" : "#26313c") }}>{label}</button>
+        ))}
+      </div>
+      <Slider label="position ← → (azimuth)" value={obj.az} min={-azSpan + 2} max={azSpan - 2}
+        step={1} onChange={(v) => onChange({ az: v })}
+        fmt={(v) => (v === 0 ? "center" : v + "°")} />
+      <Slider label="apparent height" value={obj.size} min={1.5}
+        max={Math.max(4, (eHi - eLo) * 0.8)} step={0.5}
+        onChange={(v) => onChange({ size: v })} fmt={(v) => v.toFixed(1) + "°"} />
+      <div style={{ display: "flex", gap: 14, alignItems: "center", marginTop: 2 }}>
+        {[["color", labels[0]], ["color2", labels[1]]].map(([k, lbl]) => (
+          <label key={k} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 10.5,
+            color: "#9fb0c0", fontFamily: "ui-monospace, monospace", cursor: "pointer" }}>
+            <span style={{ width: 24, height: 24, borderRadius: 5, background: obj[k],
+              border: "1px solid #44525e", position: "relative", overflow: "hidden",
+              display: "inline-block" }}>
+              <input type="color" value={obj[k]} onChange={(e) => onChange({ [k]: e.target.value })}
+                style={{ position: "absolute", inset: -4, opacity: 0, cursor: "pointer" }} />
+            </span>
+            {lbl}
+          </label>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function useWidth() {
   const [w, setW] = useState(typeof window !== "undefined" ? window.innerWidth : 1024);
   useEffect(() => {
@@ -1481,6 +1670,20 @@ export default function App() {
   const removeEmitter = (id) => setEmitters((es) => es.filter((e) => e.id !== id));
   const [halfW, setHalfW] = useState(12);
   const [yFar, setYFar] = useState(46);
+
+  // reflected objects: stamped into the environment panorama across the
+  // water, so only their reflection appears in the frame
+  const [objects, setObjects] = useState([
+    { id: 1, on: true, type: "sailboat", az: 14, size: 8, color: "#c2521f", color2: "#efe9d9" },
+  ]);
+  const nextObjId = useRef(2);
+  const updateObject = (id, patch) =>
+    setObjects((os) => os.map((o) => (o.id === id ? { ...o, ...patch } : o)));
+  const addObject = () =>
+    setObjects((os) => os.length >= 4 ? os :
+      [...os, { id: nextObjId.current++, on: true, type: "buoy", az: -12, size: 4,
+        color: "#241a12", color2: "#d64127" }]);
+  const removeObject = (id) => setObjects((os) => os.filter((o) => o.id !== id));
 
   // floating object (red buoy)
   const [objOn, setObjOn] = useState(true);
@@ -1572,33 +1775,54 @@ export default function App() {
        objOn, objX, objY, objSize, objRipple, objRippleScale]);
 
   const is2d = mode === "paint2d";
-  const geom = useMemo(() => (is2d ? null : buildGeometry(S)), [is2d, S]);
   const presetColors = useMemo(
     () => (stops ? stops.map((s) => s.c) : bandColors(bands, palette)),
     [stops, bands, palette]);
   const colors1d = runs1d ? runs1d.colors : null;
-  const seg = useMemo(() => (is2d ? buildSegmentation(S, segEnv, azSpan) : null),
-    [is2d, S, segEnv, azSpan]);
+
+  // any live reflected object forces the 2D (panorama) path in every mode:
+  // the segmentation sees the painted panorama, or stripe rows derived from
+  // the preset / 1D strip, with the objects stamped on top
+  const objectsOn = objects.some((o) => o.on);
+  const use2d = is2d || objectsOn;
+  const baseEnv2d = useMemo(() => {
+    if (is2d) return segEnv;
+    if (!objectsOn) return null;
+    if (mode === "paint1d")
+      return envFromRows((f) => envColors[Math.min(ENV_N - 1, Math.floor(f * ENV_N))],
+        ENV2D_W, DERIVED_ENV_H);
+    if (stops) return envFromRows((f) => paletteColorAt(palette, f), ENV2D_W, DERIVED_ENV_H);
+    const NB = presetColors.length;
+    return envFromRows((f) => presetColors[Math.min(NB - 1, Math.floor(f * NB))],
+      ENV2D_W, DERIVED_ENV_H);
+  }, [is2d, segEnv, objectsOn, mode, envColors, stops, palette, presetColors]);
+  const envEffective = useMemo(
+    () => (use2d ? stampObjects(baseEnv2d, objects, azSpan, eLo, eHi) : null),
+    [use2d, baseEnv2d, objects, azSpan, eLo, eHi]);
+
+  const geom = useMemo(() => (use2d ? null : buildGeometry(S)), [use2d, S]);
+  const seg = useMemo(() => (use2d ? buildSegmentation(S, envEffective, azSpan) : null),
+    [use2d, S, envEffective, azSpan]);
 
   const isobandColors = mode === "paint1d" ? colors1d : presetColors;
-  const bg = is2d ? seg.bg : isobandColors[0];
+  const bg = use2d ? seg.bg : isobandColors[0];
   const autoBg = penMode ? "#0a0d12" : bg;
   const bgFill = bgColor || autoBg;
-  const layers = is2d ? (seg.layers || null)
+  const layers = use2d ? (seg.layers || null)
     : geom.ds.map((d, k) => ({ d, color: isobandColors[k + 1] }));
-  const rng = is2d ? seg : geom;
+  const rng = use2d ? seg : geom;
 
   // Fresnel depth bands: clip paths + the color mixer for each band
   const mixDeep = useMemo(
     () => (fresOn ? makeDeepMixer(deepColor, fresStrength, fresBands) : (c) => c),
     [fresOn, deepColor, fresStrength, fresBands]);
-  const fresPaths = fresOn ? (is2d ? seg.fres : geom.fres) : null;
+  const fresPaths = fresOn ? (use2d ? seg.fres : geom.fres) : null;
   const fresIdx = useMemo(
     () => (fresOn && fresPaths ? d3.range(fresBands) : [0]),
     [fresOn, fresPaths, fresBands]);
   const rollTf = rollTransform(rollDeg);
 
-  const regionCount = (is2d ? seg.count : layers.length + 1) * fresIdx.length;
+  const regionCount = (use2d ? seg.count : layers.length + 1) * fresIdx.length;
 
   // pen-plot lines: equally spaced scan lines colored by the reflection beneath
   const penLines = useMemo(() => {
@@ -1611,8 +1835,8 @@ export default function App() {
       return mixDeep(c, b);
     };
     let colorAt;
-    if (is2d) {
-      const { w: EW, h: EH, cells } = segEnv;
+    if (use2d) {
+      const { w: EW, h: EH, cells } = envEffective;
       const az = azSpan;
       colorAt = (gx, gy) => {
         const R = reflectAt(gx, gy, S);
@@ -1650,8 +1874,8 @@ export default function App() {
       nLines: penCount, samples: penHidden ? 360 : 260, relief: penRelief,
       threeD, hidden: penHidden, evenScreen: penEven,
     });
-  }, [penMode, penStyle, penCount, penSpacing, penRelief, penHidden, penEven, S, is2d, mode,
-      segEnv, azSpan, colors1d, presetColors, fresOn, fresBands, mixDeep]);
+  }, [penMode, penStyle, penCount, penSpacing, penRelief, penHidden, penEven, S, use2d, mode,
+      envEffective, azSpan, colors1d, presetColors, fresOn, fresBands, mixDeep]);
 
   // floating buoy: projected cap + waterline clip + mirrored reflection
   const buoy = useMemo(() => {
@@ -1691,7 +1915,7 @@ export default function App() {
       if (d) defs += `<clipPath id="fres${i + 1}"><path d="${d}"/></clipPath>`;
     });
     const bandOpen = (b) => (b > 0 ? `<g clip-path="url(#fres${b})">` : `<g>`);
-    if (is2d && !seg.layers) {
+    if (use2d && !seg.layers) {
       seg.rows.forEach((row, ri) => {
         if (row.clip) defs += `<clipPath id="el${ri}"><path d="${row.clip}"/></clipPath>`;
       });
@@ -1713,12 +1937,12 @@ export default function App() {
     }
     // layered paths, preset & 2D alike. With Fresnel on, the geometry is
     // shared via <use> so each depth band re-colors the same paths.
-    if (is2d) defs += `<clipPath id="watertrap"><path d="${seg.clip}"/></clipPath>`;
+    if (use2d) defs += `<clipPath id="watertrap"><path d="${seg.clip}"/></clipPath>`;
     if (fresOn) layers.forEach((l, i) => { defs += `<path id="lyr${i}" d="${l.d}"/>`; });
     // in 3D the waves rise above the flat water trapezoid, so skip the clip
     // (the padded regions already overshoot the frame) — otherwise crests
     // near the edges would be sheared off flat
-    body += is2d && !surface3d
+    body += use2d && !surface3d
       ? `<g clip-path="url(#watertrap)" opacity="0.999">` : `<g opacity="0.999">`;
     fresIdx.forEach((b) => {
       if (b > 0 && !fresPaths[b - 1]) return;
@@ -1768,8 +1992,8 @@ export default function App() {
       if (id === undefined) { id = palette.length; idOf.set(c, id); palette.push(c); }
       return id;
     };
-    if (is2d) {
-      const { w: EW, h: EH, cells } = segEnv, az = azSpan;
+    if (use2d) {
+      const { w: EW, h: EH, cells } = envEffective, az = azSpan;
       for (let j = 0; j < ny; j++) {
         for (let i = 0; i < nx; i++) {
           const [gx, gy] = cell2ground(i + 0.5, j + 0.5, S);
@@ -1885,7 +2109,7 @@ export default function App() {
                   <path key={i} d={l.d} fill="none" stroke={l.color}
                     strokeWidth={penWidth} strokeLinecap="round" strokeLinejoin="round" />
                 ))
-              ) : is2d && !layers ? (
+              ) : use2d && !layers ? (
                 <>
                   <defs>
                     {seg.rows.map((row, ri) => row.clip ? (
@@ -1914,7 +2138,7 @@ export default function App() {
               ) : (
                 <>
                   <defs>
-                    {is2d && <clipPath id="watertrap"><path d={seg.clip} /></clipPath>}
+                    {use2d && <clipPath id="watertrap"><path d={seg.clip} /></clipPath>}
                     {fresOn && fresPaths.map((d, i) => d ? (
                       <clipPath key={`f${i}`} id={`fres${i + 1}`}><path d={d} /></clipPath>
                     ) : null)}
@@ -1925,7 +2149,7 @@ export default function App() {
                   {/* opacity forces the group into an isolated buffer, so the
                       clip is antialiased once against the composite instead of
                       per layer (per-layer clip AA leaks the colors beneath) */}
-                  <g clipPath={is2d && !surface3d ? "url(#watertrap)" : undefined} opacity={0.999}>
+                  <g clipPath={use2d && !surface3d ? "url(#watertrap)" : undefined} opacity={0.999}>
                     {fresIdx.map((b) => (b > 0 && !fresPaths[b - 1]) ? null : (
                       <g key={`fb${b}`} clipPath={b > 0 ? `url(#fres${b})` : undefined}>
                         {b > 0 && <rect width={VB_W} height={VB_H} fill={mixDeep(bg, b)} />}
@@ -2183,7 +2407,43 @@ export default function App() {
             </div>
 
             <div style={panel}>
-              <div style={heading}>Floating object</div>
+              <div style={heading}>Objects across the water</div>
+              <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 10, lineHeight: 1.5,
+                fontFamily: "ui-monospace, monospace" }}>
+                Stamped into the reflected panorama, not drawn in the frame — like the boats
+                in the paintings, only each object's reflection appears in the water, torn up
+                by the ripples and rimmed with an ink line.
+              </div>
+              {objects.map((o, i) => (
+                <ObjectCard key={o.id} obj={o} idx={i} azSpan={azSpan} eLo={eLo} eHi={eHi}
+                  onChange={(patch) => updateObject(o.id, patch)}
+                  onRemove={() => removeObject(o.id)} />
+              ))}
+              {objects.length < 4 && (
+                <button onClick={addObject}
+                  style={{ width: "100%", padding: "9px", borderRadius: 8, cursor: "pointer",
+                    background: "#1a232c", color: "#9fb0c0", border: "1px dashed #3a4a57",
+                    fontFamily: "ui-monospace, monospace", fontSize: 12, marginBottom: 12 }}>
+                  + add object
+                </button>
+              )}
+              {objectsOn && (
+                <>
+                  {!is2d && (
+                    <Slider label="azimuth span (reflection width)" value={azSpan} min={15} max={80}
+                      step={1} onChange={setAzSpan} fmt={(v) => "±" + v + "°"} />
+                  )}
+                  <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 6,
+                    fontFamily: "ui-monospace, monospace" }}>
+                    reflected panorama (what the water sees):
+                  </div>
+                  <EnvPreview env={envEffective} />
+                </>
+              )}
+            </div>
+
+            <div style={panel}>
+              <div style={heading}>Floating buoy (in frame)</div>
               <Toggle label="Red buoy" value={objOn} onChange={setObjOn} />
               {objOn && (
                 <div style={{ marginTop: 6 }}>
