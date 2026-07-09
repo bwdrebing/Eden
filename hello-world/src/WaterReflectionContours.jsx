@@ -91,11 +91,21 @@ function rand1(i) {
   return x - Math.floor(x);
 }
 
+// Distance filter: short waves narrower than what the sample grid (and the
+// eye) can resolve at range gy fade out smoothly instead of aliasing into
+// far-field speckle. Returns the coefficient a such that the attenuation at
+// range gy is 1 / (1 + (a·gy)²). Perspective only — in plan view every part
+// of the plane is equally close.
+function aaCoef(k, S) {
+  return S.perspective ? (0.22 * k) / S.ny : 0;
+}
+
 // Pre-bake an emitter into per-frame constants so the per-sample loop is cheap.
 function prepEmitter(em, S) {
   const baseLambda = (2 * Math.PI / S.k) * em.size; // global λ × size
   const A = S.amp * em.amp;
   const wt = S.omega * S.t;
+  const q = S.sharp || 0;   // Stokes-style crest sharpening, 2nd harmonic weight
 
   if (em.type === "point") {
     // em.decay overrides the global reach — used by the buoy's scattered
@@ -105,7 +115,9 @@ function prepEmitter(em, S) {
   }
   if (em.type === "swell") {
     const a = (em.dir * Math.PI) / 180;
-    return { type: "swell", k0: 2 * Math.PI / baseLambda, Dx: Math.cos(a), Dy: Math.sin(a), A, ph0: -wt };
+    const k0 = 2 * Math.PI / baseLambda;
+    return { type: "swell", k0, Dx: Math.cos(a), Dy: Math.sin(a), A, ph0: -wt,
+      q, aa: aaCoef(k0, S) };
   }
   if (em.type === "rings") {
     // a scattered field of radial ripple sources -> concentric color rings
@@ -123,25 +135,30 @@ function prepEmitter(em, S) {
     }
     return { type: "rings", M, CX, CY, K, AMP, PH, dec };
   }
-  // spectrum
+  // spectrum: a ladder of components from baseLambda down through several
+  // octaves — 1.5 octaves when glassy up to ~6 when rough — with jittered
+  // wavelengths so the ladder rungs don't beat against each other, and a
+  // directional spread that widens for the short waves (as in real seas)
   const N = Math.max(2, em.detail | 0);
   const wind = (em.dir * Math.PI) / 180;
   const spread = (em.spread * Math.PI) / 180;
   const rough = em.roughness;
-  const K = [], DX = [], DY = [], AMP = [], PH = [];
+  const K = [], DX = [], DY = [], AMP = [], PH = [], AA = [];
   for (let i = 0; i < N; i++) {
     const f = i / (N - 1);
-    const lam = baseLambda * Math.pow(0.5, f * (1 + 3.2 * rough)); // long → short as roughness rises
+    const lam = baseLambda * Math.pow(0.5, f * (1.5 + 4.5 * rough))
+      * (1 + (rand1(i * 5 + 9) - 0.5) * 0.35);
     const ki = 2 * Math.PI / lam;
-    const th = wind + (rand1(i * 2 + 1) - 0.5) * 2 * spread;
+    const th = wind + (rand1(i * 2 + 1) - 0.5) * 2 * spread * (0.7 + 0.6 * f);
     const om = Math.sqrt(ki) * S.omega;
     K.push(ki);
     DX.push(Math.cos(th));
     DY.push(Math.sin(th));
     AMP.push(A * (lam / baseLambda) / N * 1.5);       // longer waves carry more energy
     PH.push(rand1(i * 2 + 2) * Math.PI * 2 - om * S.t);
+    AA.push(aaCoef(ki, S));
   }
-  return { type: "spectrum", K, DX, DY, AMP, PH, N };
+  return { type: "spectrum", K, DX, DY, AMP, PH, AA, N, q };
 }
 
 // actual surface height (the wave displacement) — mirrors slopeAt but returns
@@ -154,7 +171,11 @@ function heightAt(gx, gy, S) {
       const r = Math.hypot(dx, dy) + 1e-6;
       z += e.A * Math.exp(-e.decay * r) * Math.sin(e.k0 * r - e.wt);
     } else if (e.type === "swell") {
-      z += e.A * Math.sin(e.k0 * (e.Dx * gx + e.Dy * gy) + e.ph0);
+      const s1 = Math.sin(e.k0 * (e.Dx * gx + e.Dy * gy) + e.ph0);
+      // Stokes-ish profile: 2nd harmonic peaks the crests, flattens troughs
+      const prof = e.q ? s1 - e.q * 0.5 + e.q * s1 * s1 : s1;
+      const x = e.aa * gy;
+      z += e.A * prof / (1 + x * x);
     } else if (e.type === "rings") {
       for (let i = 0; i < e.M; i++) {
         const dx = gx - e.CX[i], dy = gy - e.CY[i];
@@ -163,7 +184,10 @@ function heightAt(gx, gy, S) {
       }
     } else {
       for (let i = 0; i < e.N; i++) {
-        z += e.AMP[i] * Math.sin(e.K[i] * (e.DX[i] * gx + e.DY[i] * gy) + e.PH[i]);
+        const s1 = Math.sin(e.K[i] * (e.DX[i] * gx + e.DY[i] * gy) + e.PH[i]);
+        const prof = e.q ? s1 - e.q * 0.5 + e.q * s1 * s1 : s1;
+        const x = e.AA[i] * gy;
+        z += e.AMP[i] * prof / (1 + x * x);
       }
     }
   }
@@ -180,7 +204,12 @@ function slopeAt(gx, gy, S) {
       const f = e.A * env * (e.k0 * Math.cos(e.k0 * r - e.wt) - e.decay * Math.sin(e.k0 * r - e.wt));
       hx += f * dx / r; hy += f * dy / r;
     } else if (e.type === "swell") {
-      const c = e.A * e.k0 * Math.cos(e.k0 * (e.Dx * gx + e.Dy * gy) + e.ph0);
+      const th = e.k0 * (e.Dx * gx + e.Dy * gy) + e.ph0;
+      // d/dθ of the sharpened profile: cosθ·(1 + 2q·sinθ)
+      let c = e.A * e.k0 * Math.cos(th);
+      if (e.q) c *= 1 + 2 * e.q * Math.sin(th);
+      const x = e.aa * gy;
+      c /= 1 + x * x;
       hx += c * e.Dx; hy += c * e.Dy;
     } else if (e.type === "rings") {
       for (let i = 0; i < e.M; i++) {
@@ -193,7 +222,11 @@ function slopeAt(gx, gy, S) {
       }
     } else {
       for (let i = 0; i < e.N; i++) {
-        const c = e.AMP[i] * e.K[i] * Math.cos(e.K[i] * (e.DX[i] * gx + e.DY[i] * gy) + e.PH[i]);
+        const th = e.K[i] * (e.DX[i] * gx + e.DY[i] * gy) + e.PH[i];
+        let c = e.AMP[i] * e.K[i] * Math.cos(th);
+        if (e.q) c *= 1 + 2 * e.q * Math.sin(th);
+        const x = e.AA[i] * gy;
+        c /= 1 + x * x;
         hx += c * e.DX[i]; hy += c * e.DY[i];
       }
     }
@@ -1521,7 +1554,7 @@ function EmitterCard({ em, idx, halfW, yFar, onChange, onRemove }) {
         <Slider label="roughness (chop)" value={em.roughness} min={0} max={1} step={0.02}
           onChange={(v) => onChange({ roughness: v })}
           fmt={(v) => (v < 0.25 ? "glassy" : v < 0.55 ? "rippled" : v < 0.8 ? "choppy" : "rough")} />
-        <Slider label="detail (waves)" value={em.detail} min={4} max={24} step={1}
+        <Slider label="detail (waves)" value={em.detail} min={4} max={40} step={1}
           onChange={(v) => onChange({ detail: v })} />
       </>}
 
@@ -1645,6 +1678,7 @@ export default function App() {
   const [deepColor, setDeepColor] = useState("#08131d");
   const [wavelength, setWavelength] = useState(3.0);
   const [strength, setStrength] = useState(0.52);
+  const [sharp, setSharp] = useState(0.3);   // crest sharpening (2nd harmonic)
   const [spread, setSpread] = useState(0.5);
   const [bands, setBands] = useState(9);
   const [palette, setPalette] = useState("Sunset Lake");
@@ -1757,6 +1791,7 @@ export default function App() {
     pitch: (pitchDeg * Math.PI) / 180,
     k: (2 * Math.PI) / wavelength,
     amp: strength * 0.06,
+    sharp,
     decay: 0.18 - spread * 0.16,
     omega: 1.0,
     t: animate ? tRef.current : 0,
@@ -1768,7 +1803,7 @@ export default function App() {
       ? [...emitters, { id: "buoy", on: true, type: "point", x: objX, y: objY,
           size: Math.max(0.3, objSize * objRippleScale), amp: objRipple * 1.5, decay: 0.28 }]
       : emitters,
-  }), [quality, steep, pitchDeg, wavelength, strength, spread, bands, perspective,
+  }), [quality, steep, pitchDeg, wavelength, strength, sharp, spread, bands, perspective,
        halfW, yFar, eLo, eHi, zoom, panY, smooth, coherence, rectOutput, surface3d, waveScale,
        bandFractions, fresOn, fresBands,
        emitters, animate, speed, tRef.current,
@@ -2222,6 +2257,9 @@ export default function App() {
                 onChange={setWavelength} fmt={(v) => v.toFixed(1)} />
               <Slider label="Ripple strength" value={strength} min={0.05} max={1} step={0.01}
                 onChange={setStrength} fmt={(v) => v.toFixed(2)} />
+              <Slider label="Crest sharpness" value={sharp} min={0} max={0.8} step={0.05}
+                onChange={setSharp}
+                fmt={(v) => (v === 0 ? "sine (soft)" : v < 0.35 ? "gentle" : v < 0.6 ? "peaked" : "steep")} />
               <Slider label="Spread / reach" value={spread} min={0} max={1} step={0.01}
                 onChange={setSpread} fmt={(v) => (v < 0.4 ? "tight" : v < 0.75 ? "medium" : "wide")} />
               <Slider label="Plane width" value={halfW} min={4} max={40} step={1}
@@ -2566,7 +2604,7 @@ export default function App() {
                   </>
                 )}
                 <Slider label="plane depth (far edge)" value={yFar} min={20} max={90} step={2} onChange={setYFar} />
-                <Slider label="sample grid" value={quality} min={60} max={150} step={10} onChange={setQuality} />
+                <Slider label="sample grid" value={quality} min={60} max={220} step={10} onChange={setQuality} />
               </div>
             )}
 
