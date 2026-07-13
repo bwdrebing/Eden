@@ -1221,9 +1221,10 @@ const PAPER_FRAME_COLOR = "#ff2d78"; // fallback registration color if no backgr
 // full pipeline: color grid (+ palette id->hex) -> ordered sheets with paths.
 // bgColor is the scene's background fill: the mount/frame sheet takes this color
 // and absorbs any background-colored regions, so the water edge is cut once.
-function buildPaperStack(S, grid, palette, bgColor, minCells = 5) {
+function buildPaperStack(S, grid, palette, bgColor, minCells = 5, rollDeg = 0) {
   const { nx, ny } = S;
   const fit = computeFit(S);
+  S._ems = S.emitters.filter((e) => e.on).map((e) => prepEmitter(e, S));
 
   // collapse duplicate hexes up front: two grid values with the same paper
   // color must label as ONE color, so its regions can gather onto one sheet
@@ -1254,18 +1255,49 @@ function buildPaperStack(S, grid, palette, bgColor, minCells = 5) {
 
   const { sheets, method } = planCollapse(regions, adj, frameId);
 
-  // exact projected water outline (clip) + overshoot expansion, as in the
-  // union-layer path, so each sheet's cut edge overshoots the frame instead of
-  // tracing it and the whole stack registers to one trapezoid.
-  const cornerPt = (ix, iy) => {
-    const [gx, gy] = cell2ground(ix, iy, S);
-    const [rx, ry] = rawProject(gx, gy, S);
-    return [fit.ox + fit.scale * rx, fit.oy + (fit.scaleY || fit.scale) * ry];
-  };
-  const cs = [cornerPt(0, 0), cornerPt(nx, 0), cornerPt(nx, ny), cornerPt(0, ny)];
-  const clip = "M" + cs.map((c) => c[0].toFixed(1) + " " + c[1].toFixed(1)).join(" L") + " Z";
-  const ex = { cx: (cs[0][0] + cs[1][0] + cs[2][0] + cs[3][0]) / 4,
-               cy: (cs[0][1] + cs[1][1] + cs[2][1] + cs[3][1]) / 4, s: 1.05 };
+  // visibility field: signed inset (in ~cells) of each padded lattice node
+  // inside the visible window — the water trapezoid ∩ the viewport, with the
+  // camera roll (a rotate + cover-scale similarity) applied so the crop lands
+  // where the roll will put it. min-ing each sheet's hole field with this
+  // bakes the crop into the geometry itself: the export carries only visible
+  // path data and needs no <clipPath> at all, so editors and cutting tools
+  // import the cut outlines as-is, and zoomed exports shrink to the on-screen
+  // geometry instead of hauling the whole hidden water plane along.
+  const px = nx + 2, py = ny + 2;
+  const V = new Float64Array(px * py);
+  {
+    const lift = S.surface3d && S.perspective;
+    const syScale = fit.scaleY || fit.scale;
+    const Kpx = (VB_W / nx + VB_H / ny) / 2;  // rough px per cell, for units
+    const r = (rollDeg * Math.PI) / 180;
+    const ca = Math.abs(Math.cos(r)), sa = Math.abs(Math.sin(r));
+    const rs = rollDeg
+      ? Math.max((VB_W * ca + VB_H * sa) / VB_W, (VB_W * sa + VB_H * ca) / VB_H) : 1;
+    const cosr = Math.cos(r), sinr = Math.sin(r), cx0 = VB_W / 2, cy0 = VB_H / 2;
+    for (let j = 0; j < py; j++) {
+      for (let i = 0; i < px; i++) {
+        const gi = i - 1, gj = j - 1;
+        const [gx, gy] = cell2ground(gi, gj, S);
+        let X, Y;
+        if (lift) {
+          const gz = clampLift(heightAt(gx, gy, S) * S.waveScale, S, fit);
+          const p = penProject(gx, gy, gz, S, fit);
+          X = p[0]; Y = p[1];
+        } else {
+          const [rx, ry] = rawProject(gx, gy, S);
+          X = fit.ox + fit.scale * rx; Y = fit.oy + syScale * ry;
+        }
+        if (rollDeg) {
+          const dx = X - cx0, dy = Y - cy0;
+          X = cx0 + rs * (cosr * dx - sinr * dy);
+          Y = cy0 + rs * (sinr * dx + cosr * dy);
+        }
+        const vView = Math.min(X, VB_W - X, Y, VB_H - Y) / Kpx;
+        const vTrap = Math.min(gi, nx - gi, gj, ny - gj);
+        V[j * px + i] = Math.max(-4, Math.min(4, Math.min(vView, vTrap)));
+      }
+    }
+  }
 
   // per sheet, contour the HOLE = everything not yet absorbed (the inverse of
   // the cumulative union). The cut line is then the boundary between this
@@ -1277,7 +1309,6 @@ function buildPaperStack(S, grid, palette, bgColor, minCells = 5) {
   // layers — contour the zero level set of a lightly blurred SIGNED DISTANCE
   // field of the mask instead: the crossing interpolates to sub-cell
   // positions and the cut edge comes out as smooth as the normal export.
-  const px = nx + 2, py = ny + 2;
   const cum = new Uint8Array(nx * ny);
   const inv = new Uint8Array(nx * ny);
   const F = new Float64Array(nx * ny);
@@ -1332,19 +1363,20 @@ function buildPaperStack(S, grid, palette, bgColor, minCells = 5) {
           for (let p = 0; p < nx * ny; p++) F[p] = Din[p] - Dout[p];
         }
       }
+      // hole ∧ visible window, in one field — the crop is part of the cut
       for (let j = 0; j < py; j++) {
         const jj = Math.min(ny - 1, Math.max(0, j - 1));
         for (let i = 0; i < px; i++) {
           const ii = Math.min(nx - 1, Math.max(0, i - 1));
-          FP[j * px + i] = F[jj * nx + ii];
+          FP[j * px + i] = Math.min(F[jj * nx + ii], V[j * px + i]);
         }
       }
       const cont = d3.contours().size([px, py]).thresholds([0])(FP)[0];
-      if (cont) d = multiToPath(cont, S, fit, -1, ex);
+      if (cont) d = multiToPath(cont, S, fit, -1);
     }
     out.push({ color: sh.color, d, frame: !!sh.frame, solid });
   }
-  return { sheets: out, clip, nSheets: out.length, method };
+  return { sheets: out, nSheets: out.length, method };
 }
 
 // tile the sheets into one printable SVG: each is the full viewport in its
@@ -1366,21 +1398,14 @@ function buildPaperStackSvg(stack, rollTf) {
     const cx = pad + (i % cols) * (tileW + gap);
     const cy = top + Math.floor(i / cols) * (tileH + labelH + gap);
     const tf = `translate(${cx} ${cy}) scale(${sx.toFixed(4)})` + (rollTf ? " " + rollTf : "");
-    // clip the tile to its viewport so a zoomed-in scene crops instead of
-    // spilling into neighbours; the hole is further clipped to the water plane
-    // (so its 5% overshoot never bleeds into the mount margin).
-    body += `<clipPath id="ptile${i}"><rect x="${cx}" y="${cy}" width="${tileW}" height="${tileH}"/></clipPath>`;
-    body += `<clipPath id="ptrap${i}"><path transform="${tf}" d="${stack.clip}"/></clipPath>`;
-    body += `<g clip-path="url(#ptile${i})">`;
     // full-sheet paper — this is the whole physical sheet, mount margin and all,
     // in one color; the water<->background edge is NOT drawn here
     body += `<rect x="${cx}" y="${cy}" width="${tileW}" height="${tileH}" fill="${sh.color}"/>`;
-    // holes: paper removed to reveal the sheets below (hatched + dashed cut line)
-    if (sh.d) body += `<g clip-path="url(#ptrap${i})">`
-      + `<path transform="${tf}" d="${sh.d}" fill="url(#cuthatch)" fill-rule="evenodd"/>`
-      + `<path transform="${tf}" d="${sh.d}" fill="none" fill-rule="evenodd" stroke="#0b0f14"`
-      + ` stroke-width="1" stroke-dasharray="4 2"/></g>`;
-    body += `</g>`;
+    // holes: paper removed to reveal the sheets below. The geometry is already
+    // cropped to the visible window, so ONE path carries the whole cut spec —
+    // hatch fill and dashed cut line together, no clipping anywhere.
+    if (sh.d) body += `<path transform="${tf}" d="${sh.d}" fill="url(#cuthatch)"`
+      + ` fill-rule="evenodd" stroke="#0b0f14" stroke-width="1" stroke-dasharray="4 2"/>`;
     body += `<rect x="${cx}" y="${cy}" width="${tileW}" height="${tileH}" fill="none"`
       + ` stroke="#000" stroke-opacity="0.35" stroke-width="1"/>`;
     const role = sh.frame ? "BACKGROUND · mount" : (sh.solid ? "BACKING · solid" : `sheet ${i}`);
@@ -2131,7 +2156,7 @@ export default function App() {
 
   const exportPaperStack = () => {
     const { grid, palette } = paperColorGrid();
-    const stack = buildPaperStack(S, grid, palette, bgFill);
+    const stack = buildPaperStack(S, grid, palette, bgFill, 5, rollDeg);
     const svg = buildPaperStackSvg(stack, rollTf);
     saveSvg(svg, "reflection-paper-stack.svg");
     setSvgName("reflection-paper-stack.svg");
