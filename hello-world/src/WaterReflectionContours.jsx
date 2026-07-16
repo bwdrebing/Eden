@@ -437,7 +437,19 @@ function multiToPath(multi, S, fit, off = 0, ex = null) {
       const ring = iters ? chaikin(ring0, iters) : ring0;
       const pts = [];
       for (let idx = 0; idx < ring.length; idx++) {
-        const gi = ring[idx][0] + off, gj = ring[idx][1] + off;
+        let gi = ring[idx][0] + off, gj = ring[idx][1] + off;
+        // Pad-zone vertices exist to overshoot the flat watertrap clip — but
+        // 3D mode skips that clip so crests can rise above the trapezoid,
+        // which would leave the overshoot visible: every layer's rim would
+        // drape one cell (plus the `ex` expansion) outside the plane, stacked
+        // colored walls that read as the sides of a container. Pin them onto
+        // the water boundary instead, so each layer's rim lands exactly on
+        // the lifted edge silhouette. (The `ex` branch below then never fires
+        // in 3D: clamped points are no longer in the pad zone.)
+        if (lift) {
+          gi = gi < 0 ? 0 : gi > S.nx ? S.nx : gi;
+          gj = gj < 0 ? 0 : gj > S.ny ? S.ny : gj;
+        }
         const [gx, gy] = cell2ground(gi, gj, S);
         let X, Y;
         if (lift) {
@@ -1223,6 +1235,7 @@ function buildSegmentation(S, env2d, azSpan) {
 export {
   buildGeometry, buildSegmentation, envFromRows, stampObjects,
   paletteStops, paletteColorAt, DERIVED_ENV_H, ENV2D_W, DEFAULT_EMITTERS,
+  computeFit, cell2ground, heightAt, clampLift, penProject,
 };
 
 // ---- layered-paper stack export -----------------------------------

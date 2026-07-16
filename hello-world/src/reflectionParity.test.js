@@ -1,6 +1,7 @@
 import {
   buildGeometry, buildSegmentation, envFromRows, stampObjects,
   paletteStops, paletteColorAt, DERIVED_ENV_H, ENV2D_W, DEFAULT_EMITTERS,
+  computeFit, cell2ground, heightAt, clampLift, penProject,
 } from "./WaterReflectionContours";
 
 /* ------------------------------------------------------------------ *
@@ -74,6 +75,33 @@ test("adding a reflected object does not collapse scene detail", () => {
   expect(seg.layers).toBeTruthy();
   const n2 = subpaths(seg.layers.map((l) => l.d));
   expect(n2).toBeGreaterThanOrEqual(0.8 * n1);
+});
+
+test("3D waves: 2D layers hug the lifted water edge (no container walls)", () => {
+  // The 2D path contours on a one-cell-padded grid whose overshoot is meant
+  // to be trimmed by the flat watertrap clip — which 3D mode skips so crests
+  // can rise above the trapezoid. Pad-zone vertices must therefore land ON
+  // the lifted water edge; if they hang outside it, every layer grows a
+  // colored apron below the near edge ("sides like a container").
+  const S = { ...baseS(), surface3d: true, waveScale: 8 };
+  const seg = buildSegmentation(S, stripedEnv(), AZ); // also preps S._ems
+
+  let maxY = -Infinity; // bottom-most vertex across all layers
+  for (const l of seg.layers) {
+    const nums = (l.d.match(/-?\d+(?:\.\d+)?/g) || []).map(Number);
+    for (let i = 1; i < nums.length; i += 2) if (nums[i] > maxY) maxY = nums[i];
+  }
+
+  // the true lifted near-edge silhouette, projected point by point
+  const fit = computeFit(S);
+  let edgeMaxY = -Infinity;
+  for (let i = 0; i <= S.nx; i++) {
+    const [gx, gy] = cell2ground(i, 0, S);
+    const gz = clampLift(heightAt(gx, gy, S) * S.waveScale, S, fit);
+    const y = penProject(gx, gy, gz, S, fit)[1];
+    if (y > edgeMaxY) edgeMaxY = y;
+  }
+  expect(maxY).toBeLessThanOrEqual(edgeMaxY + 3); // 3px: bezier control slack
 });
 
 test("the de-jitter blur is opt-in: coherence 0 must not smooth", () => {
