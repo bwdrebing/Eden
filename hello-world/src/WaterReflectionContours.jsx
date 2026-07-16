@@ -66,9 +66,9 @@ const VB_W = 760;
 const VB_H = 500;
 
 const DEFAULT_EMITTERS = [
-  { id: 1, on: true, type: "swell",    x: 0, y: 20, dir: 75,  size: 2.8, amp: 0.55, spread: 25, roughness: 0.4, detail: 14 },
-  { id: 2, on: true, type: "spectrum", x: 0, y: 20, dir: 105, size: 1.4, amp: 0.6,  spread: 24, roughness: 0.4, detail: 14 },
-  { id: 3, on: true, type: "rings",    x: 0, y: 20, dir: 90,  size: 1.0, amp: 0.9,  spread: 25, roughness: 0.45, detail: 11 },
+  { id: 1, on: true, type: "swell",    x: 0, y: 20, dir: 65,  size: 3.2, amp: 1.85, spread: 25, roughness: 0.4,  detail: 14 },
+  { id: 2, on: true, type: "spectrum", x: 0, y: 20, dir: 125, size: 1.5, amp: 1.1,  spread: 59, roughness: 0.1,  detail: 15 },
+  { id: 3, on: true, type: "spectrum", x: 0, y: 20, dir: 90,  size: 1.7, amp: 1.9,  spread: 17, roughness: 0.15, detail: 19 },
 ];
 
 // quick-pick colors for the environment painter: treeline/earth → sunset → sky
@@ -1722,28 +1722,28 @@ export default function App() {
   const width = useWidth();
   const isNarrow = width < 820;
 
-  const [steep, setSteep] = useState(0.35);
+  const [steep, setSteep] = useState(1); // shows as a 72° view angle at the near edge
   const [pitchDeg, setPitchDeg] = useState(12.6); // 0.22 rad, the old fixed value
   const [rollDeg, setRollDeg] = useState(0);
   const [fresOn, setFresOn] = useState(false);
   const [fresBands, setFresBands] = useState(3);
   const [fresStrength, setFresStrength] = useState(0.75);
   const [deepColor, setDeepColor] = useState("#08131d");
-  const [wavelength, setWavelength] = useState(3.0);
-  const [strength, setStrength] = useState(0.52);
+  const [wavelength, setWavelength] = useState(2.8);
+  const [strength, setStrength] = useState(0.78);
   const [sharp, setSharp] = useState(0.3);   // crest sharpening (2nd harmonic)
   const [spread, setSpread] = useState(0.5);
   const [bands, setBands] = useState(9);
   const [palette, setPalette] = useState("Sunset Lake");
   const [perspective, setPerspective] = useState(true);
   const [rectOutput, setRectOutput] = useState(false);
-  const [surface3d, setSurface3d] = useState(false); // lift color regions onto the waves
-  const [waveScale, setWaveScale] = useState(1.5);    // 3D wave-height exaggeration
+  const [surface3d, setSurface3d] = useState(true); // lift color regions onto the waves
+  const [waveScale, setWaveScale] = useState(8);     // 3D wave-height exaggeration
   const [edges, setEdges] = useState(false);
   const [animate, setAnimate] = useState(false);
   const [speed, setSpeed] = useState(0.5);
   const [quality, setQuality] = useState(() =>
-    (typeof window !== "undefined" && window.innerWidth < 820) ? 72 : 100);
+    (typeof window !== "undefined" && window.innerWidth < 820) ? 100 : 140);
   const [advanced, setAdvanced] = useState(false);
 
   const [emitters, setEmitters] = useState(DEFAULT_EMITTERS);
@@ -1755,9 +1755,9 @@ export default function App() {
       [...es, { id: nextId.current++, on: true, type: "rings", x: 0, y: 20, dir: 90,
         size: 1.0, amp: 0.8, spread: 25, roughness: 0.45, detail: 10 }]);
   const removeEmitter = (id) => setEmitters((es) => es.filter((e) => e.id !== id));
-  const [halfW, setHalfW] = useState(12);
+  const [halfW, setHalfW] = useState(22); // 44 units across
   const [yNear, setYNear] = useState(3);
-  const [yFar, setYFar] = useState(46);
+  const [yFar, setYFar] = useState(78);
   const [reflMag, setReflMag] = useState(1); // reflection detail (angular zoom)
 
   // reflected objects: stamped into the environment panorama across the
@@ -1784,7 +1784,7 @@ export default function App() {
   const [objRippleScale, setObjRippleScale] = useState(0.8);
   const [objBands, setObjBands] = useState(5);      // cel-shade tone count
   const [objLight, setObjLight] = useState(325);    // light direction, degrees
-  const [eLo, setELo] = useState(0), [eHi, setEHi] = useState(20);
+  const [eLo, setELo] = useState(-5), [eHi, setEHi] = useState(33);
   const [autoFit, setAutoFit] = useState(false);
   const [penMode, setPenMode] = useState(false);
   const [penCount, setPenCount] = useState(48);   // number of scan lines
@@ -1796,10 +1796,10 @@ export default function App() {
   const [penEven, setPenEven] = useState(false);     // even spacing on screen
   const [bgColor, setBgColor] = useState("");       // "" = auto
 
-  const [zoom, setZoom] = useState(1);
+  const [zoom, setZoom] = useState(5);
   const [panX, setPanX] = useState(0);
   const [panY, setPanY] = useState(0);
-  const [smooth, setSmooth] = useState(2);
+  const [smooth, setSmooth] = useState(3);
   const [mode, setMode] = useState("preset"); // "preset" | "paint1d" | "paint2d"
   const [envColors, setEnvColors] = useState(() => seedEnv("Sunset Lake", ENV_N));
   const [env2d, setEnv2d] = useState(() => seedEnv2D("Sunset Lake", ENV2D_W, ENV2D_H));
@@ -2704,7 +2704,7 @@ export default function App() {
               )}
               {!penMode && perspective && surface3d && (
                 <>
-                  <Slider label="Wave height (3D)" value={waveScale} min={0} max={3} step={0.05}
+                  <Slider label="Wave height (3D)" value={waveScale} min={0} max={10} step={0.05}
                     onChange={setWaveScale} fmt={(v) => (v === 0 ? "flat" : v.toFixed(2))} />
                   <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 8, lineHeight: 1.5,
                     fontFamily: "ui-monospace, monospace" }}>
