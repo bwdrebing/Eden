@@ -1,6 +1,7 @@
 import React, { useState, useMemo, useRef, useEffect } from "react";
 import * as d3 from "d3";
 import { labelRegions, buildAdjacency, denoiseGrid, planCollapse } from "./paperStack";
+import { useUrlSync } from "./urlSettings";
 
 /* ------------------------------------------------------------------ *
  *  Water-reflection contour studio
@@ -1760,13 +1761,12 @@ export default function App() {
   const [advanced, setAdvanced] = useState(false);
 
   const [emitters, setEmitters] = useState(DEFAULT_EMITTERS);
-  const nextId = useRef(4);
   const updateEmitter = (id, patch) =>
     setEmitters((es) => es.map((e) => (e.id === id ? { ...e, ...patch } : e)));
   const addEmitter = () =>
     setEmitters((es) => es.length >= 5 ? es :
-      [...es, { id: nextId.current++, on: true, type: "rings", x: 0, y: 20, dir: 90,
-        size: 1.0, amp: 0.8, spread: 25, roughness: 0.45, detail: 10 }]);
+      [...es, { id: es.reduce((m, e) => Math.max(m, e.id), 0) + 1, on: true, type: "rings",
+        x: 0, y: 20, dir: 90, size: 1.0, amp: 0.8, spread: 25, roughness: 0.45, detail: 10 }]);
   const removeEmitter = (id) => setEmitters((es) => es.filter((e) => e.id !== id));
   const [halfW, setHalfW] = useState(22); // 44 units across
   const [yNear, setYNear] = useState(3);
@@ -1778,13 +1778,12 @@ export default function App() {
   const [objects, setObjects] = useState([
     { id: 1, on: true, type: "sailboat", az: 14, size: 8, color: "#c2521f", color2: "#efe9d9" },
   ]);
-  const nextObjId = useRef(2);
   const updateObject = (id, patch) =>
     setObjects((os) => os.map((o) => (o.id === id ? { ...o, ...patch } : o)));
   const addObject = () =>
     setObjects((os) => os.length >= 4 ? os :
-      [...os, { id: nextObjId.current++, on: true, type: "buoy", az: -12, size: 4,
-        color: "#241a12", color2: "#d64127" }]);
+      [...os, { id: os.reduce((m, o) => Math.max(m, o.id), 0) + 1, on: true, type: "buoy",
+        az: -12, size: 4, color: "#241a12", color2: "#d64127" }]);
   const removeObject = (id) => setObjects((os) => os.filter((o) => o.id !== id));
 
   // floating object (red buoy)
@@ -1829,6 +1828,40 @@ export default function App() {
   const [svgName, setSvgName] = useState("reflection-regions.svg");
   const [stackInfo, setStackInfo] = useState(null); // { nSheets } when a paper stack is exported
   const [copied, setCopied] = useState(false);
+
+  // Serialize every studio setting into the URL hash (the painted 1D/2D
+  // environment buffers are excluded — they are freehand pixel data, not
+  // controls, and would blow the URL length budget). Structured config
+  // like the emitter and object lists round-trips as-is.
+  useUrlSync("reflection", {
+    steep: [steep, setSteep], pitchDeg: [pitchDeg, setPitchDeg], rollDeg: [rollDeg, setRollDeg],
+    fresOn: [fresOn, setFresOn], fresBands: [fresBands, setFresBands],
+    fresStrength: [fresStrength, setFresStrength], deepColor: [deepColor, setDeepColor],
+    wavelength: [wavelength, setWavelength], strength: [strength, setStrength],
+    sharp: [sharp, setSharp], spread: [spread, setSpread], bands: [bands, setBands],
+    palette: [palette, setPalette], perspective: [perspective, setPerspective],
+    rectOutput: [rectOutput, setRectOutput], surface3d: [surface3d, setSurface3d],
+    waveScale: [waveScale, setWaveScale], edges: [edges, setEdges],
+    animate: [animate, setAnimate], speed: [speed, setSpeed], quality: [quality, setQuality],
+    advanced: [advanced, setAdvanced], emitters: [emitters, setEmitters],
+    halfW: [halfW, setHalfW], yNear: [yNear, setYNear], yFar: [yFar, setYFar],
+    reflMag: [reflMag, setReflMag], objects: [objects, setObjects],
+    objOn: [objOn, setObjOn], objX: [objX, setObjX], objY: [objY, setObjY],
+    objSize: [objSize, setObjSize], objSub: [objSub, setObjSub],
+    objRipple: [objRipple, setObjRipple], objRippleScale: [objRippleScale, setObjRippleScale],
+    objBands: [objBands, setObjBands], objLight: [objLight, setObjLight],
+    eLo: [eLo, setELo], eHi: [eHi, setEHi], autoFit: [autoFit, setAutoFit],
+    penMode: [penMode, setPenMode], penCount: [penCount, setPenCount],
+    penRelief: [penRelief, setPenRelief], penWidth: [penWidth, setPenWidth],
+    penHidden: [penHidden, setPenHidden], penStyle: [penStyle, setPenStyle],
+    penSpacing: [penSpacing, setPenSpacing], penEven: [penEven, setPenEven],
+    bgColor: [bgColor, setBgColor], zoom: [zoom, setZoom], panX: [panX, setPanX],
+    panY: [panY, setPanY], smooth: [smooth, setSmooth], mode: [mode, setMode],
+    azSpan: [azSpan, setAzSpan], coherence: [coherence, setCoherence],
+    activeColor: [activeColor, setActiveColor], brushSize: [brushSize, setBrushSize],
+    brushShape: [brushShape, setBrushShape],
+  });
+
   const enter1d = () => { setEnvColors(seedEnv(palette, ENV_N)); setMode("paint1d"); };
   const enter2d = () => {
     const seeded = seedEnv2D(palette, ENV2D_W, ENV2D_H);
