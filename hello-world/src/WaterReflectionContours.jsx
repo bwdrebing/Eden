@@ -1756,6 +1756,8 @@ export default function App() {
   const [edges, setEdges] = useState(false);
   const [animate, setAnimate] = useState(false);
   const [speed, setSpeed] = useState(0.5);
+  const [manualTime, setManualTime] = useState(0); // scrub the wave phase when not animating
+  const [lowPower, setLowPower] = useState(false);  // cap resolution + throttle animation
   const [quality, setQuality] = useState(() =>
     (typeof window !== "undefined" && window.innerWidth < 820) ? 100 : 140);
   const [advanced, setAdvanced] = useState(false);
@@ -1843,6 +1845,7 @@ export default function App() {
     rectOutput: [rectOutput, setRectOutput], surface3d: [surface3d, setSurface3d],
     waveScale: [waveScale, setWaveScale], edges: [edges, setEdges],
     animate: [animate, setAnimate], speed: [speed, setSpeed], quality: [quality, setQuality],
+    manualTime: [manualTime, setManualTime], lowPower: [lowPower, setLowPower],
     advanced: [advanced, setAdvanced], emitters: [emitters, setEmitters],
     halfW: [halfW, setHalfW], yNear: [yNear, setYNear], yFar: [yFar, setYFar],
     reflMag: [reflMag, setReflMag], objects: [objects, setObjects],
@@ -1930,11 +1933,20 @@ export default function App() {
   const [, force] = useState(0);
   useEffect(() => {
     if (!animate) return;
-    let raf;
-    const loop = () => { tRef.current += 0.12 * speed; force((n) => n + 1); raf = requestAnimationFrame(loop); };
+    let raf, last = 0;
+    // Low power caps the loop to ~15fps: fewer full recomputes of the water
+    // field per second is the single biggest battery saving while animating.
+    const minDelta = lowPower ? 66 : 0;
+    const loop = (ts) => {
+      raf = requestAnimationFrame(loop);
+      if (ts - last < minDelta) return;
+      last = ts;
+      tRef.current += 0.12 * speed;
+      force((n) => n + 1);
+    };
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
-  }, [animate, speed]);
+  }, [animate, speed, lowPower]);
 
   // banded palette stops / painted-strip runs -> non-uniform band boundaries
   const stops = useMemo(() => paletteStops(palette), [palette]);
@@ -1946,8 +1958,12 @@ export default function App() {
     return null;
   }, [mode, stops, runs1d]);
 
+  // Low power renders on a coarser grid, so every redraw (each pan, zoom, or
+  // animation frame) does far less contour work.
+  const effQuality = lowPower ? Math.min(quality, 70) : quality;
+
   const S = useMemo(() => ({
-    nx: quality, ny: quality,
+    nx: effQuality, ny: effQuality,
     xMin: -halfW, xMax: halfW, yMin: Math.min(yNear, yFar - 2), yMax: yFar,
     H: 0.4 * Math.pow(22.5, steep),
     pitch: (pitchDeg * Math.PI) / 180,
@@ -1956,7 +1972,7 @@ export default function App() {
     sharp,
     decay: 0.18 - spread * 0.16,
     omega: 1.0,
-    t: animate ? tRef.current : 0,
+    t: animate ? tRef.current : manualTime,
     bands, perspective, eLo, eHi, zoom, panX, panY, smooth, coherence, rectOutput,
     surface3d, waveScale, bandFractions, fresOn, fresBands, reflMag,
     // waves scatter off the buoy's hull: a ring source pinned to the object,
@@ -1965,10 +1981,10 @@ export default function App() {
       ? [...emitters, { id: "buoy", on: true, type: "point", x: objX, y: objY,
           size: Math.max(0.3, objSize * objRippleScale), amp: objRipple * 1.5, decay: 0.28 }]
       : emitters,
-  }), [quality, steep, pitchDeg, wavelength, strength, sharp, spread, bands, perspective,
+  }), [effQuality, steep, pitchDeg, wavelength, strength, sharp, spread, bands, perspective,
        halfW, yNear, yFar, eLo, eHi, zoom, panX, panY, smooth, coherence, rectOutput, surface3d, waveScale,
        bandFractions, fresOn, fresBands, reflMag,
-       emitters, animate, speed, tRef.current,
+       emitters, animate, speed, tRef.current, manualTime,
        objOn, objX, objY, objSize, objRipple, objRippleScale]);
 
   const is2d = mode === "paint2d";
@@ -2762,10 +2778,19 @@ export default function App() {
               )}
               <Toggle label="Show region edges" value={edges} onChange={setEdges} />
               <Toggle label="Animate ripples" value={animate} onChange={setAnimate} />
-              {animate && (
+              {animate ? (
                 <div style={{ marginTop: 8 }}>
                   <Slider label="Speed" value={speed} min={0.1} max={1.5} step={0.05}
                     onChange={setSpeed} fmt={(v) => v.toFixed(2)} />
+                </div>
+              ) : (
+                <div style={{ marginTop: 8 }}>
+                  <Slider label="Time (wave phase)" value={manualTime} min={0} max={20} step={0.05}
+                    onChange={setManualTime} fmt={(v) => v.toFixed(2)} />
+                  <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5, marginTop: -4,
+                    fontFamily: "ui-monospace, monospace" }}>
+                    Scrub to a specific frozen moment to view or export.
+                  </div>
                 </div>
               )}
             </div>
@@ -2969,6 +2994,25 @@ export default function App() {
               Exports as {regionCount} vector regions. Edges stay straight under
               the perspective map, so the vector stays clean at any zoom.
             </p>
+          </div>
+        </div>
+
+        {/* Low power mode — battery saver, pinned at the foot of the page */}
+        <div style={{ marginTop: 20, paddingTop: 14, borderTop: "1px solid #1b2530",
+          display: "flex", alignItems: "center", justifyContent: "space-between",
+          gap: 12, flexWrap: "wrap" }}>
+          <div style={{ maxWidth: 480 }}>
+            <div style={{ fontSize: 12.5, color: "#cdd9e3", letterSpacing: 0.3,
+              fontFamily: "ui-monospace, monospace" }}>Low power mode</div>
+            <div style={{ fontSize: 10.5, color: "#6d808f", lineHeight: 1.5, marginTop: 3,
+              fontFamily: "ui-monospace, monospace" }}>
+              Caps the render grid to a coarser resolution and throttles the ripple
+              animation to ~15fps. Trades some fidelity for much lower battery use
+              on phones{lowPower ? " — currently on." : "."}
+            </div>
+          </div>
+          <div style={{ flexShrink: 0, minWidth: 132 }}>
+            <Toggle label={lowPower ? "On" : "Off"} value={lowPower} onChange={setLowPower} />
           </div>
         </div>
       </div>
