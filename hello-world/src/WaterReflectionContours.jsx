@@ -269,6 +269,16 @@ function fresnelDeepW(cosI) {
   return 1 - (0.02 + 0.98 * m * m * m * m * m);
 }
 
+// Reflection detail ("angular zoom"): stretch the reflected-direction
+// mapping about the middle of the environment window. At mag = 1 the window
+// [eLo, eHi] spans the environment exactly as painted; at mag > 1 the same
+// environment is compressed into a 1/mag-narrower cone about the window
+// center, so a small ripple tilt sweeps a larger fraction of the colors —
+// the telephoto close-up look where every wavelet carries the whole gradient.
+function magFrac(f, mag) {
+  return mag === 1 ? f : 0.5 + (f - 0.5) * mag;
+}
+
 // quantized Lab mix toward the deep-water color: band b of K, b = 0 pure
 // reflection, b = K-1 fully "deep". Cached — called per region per band.
 function makeDeepMixer(deep, strength, K) {
@@ -984,11 +994,16 @@ function buildGeometry(S) {
     }
   }
   // banded palettes carry their own (non-uniform) band fractions — this is
-  // what lets a 2%-thick ink strip survive regardless of the band count
+  // what lets a 2%-thick ink strip survive regardless of the band count.
+  // Reflection detail narrows the window the boundaries sit in (values stay
+  // raw φ, so the reported lo/hi — and auto-fit — are unaffected by mag).
   const NB = S.bands;
+  const mag = S.reflMag || 1;
+  const mid = (S.eLo + S.eHi) / 2, magSpan = (S.eHi - S.eLo) / mag;
+  const bnd = (f) => mid + (f - 0.5) * magSpan;
   const boundaries = S.bandFractions
-    ? S.bandFractions.map((f) => S.eLo + (S.eHi - S.eLo) * f)
-    : d3.range(1, NB).map((k) => S.eLo + ((S.eHi - S.eLo) * k) / NB);
+    ? S.bandFractions.map(bnd)
+    : d3.range(1, NB).map((k) => bnd(k / NB));
   const fit = computeFit(S);
   const contours = d3.contours().size([nx, ny]).thresholds(boundaries)(values);
   let fres = null;
@@ -1054,10 +1069,11 @@ function buildSegmentation(S, env2d, azSpan) {
     blurField(fG, nx, ny, tmp, passes);
     if (fW) blurField(fW, nx, ny, tmp, passes);
   }
-  // convert to cell units
+  // convert to cell units (through the reflection-detail magnification)
+  const mag = S.reflMag || 1;
   for (let p = 0; p < nx * ny; p++) {
-    let v = (fF[p] - eLo) / span; v = v < 0 ? 0 : v > 1 ? 1 : v; fF[p] = v * EH;
-    let u = (fG[p] + az) / (2 * az); u = u < 0 ? 0 : u > 1 ? 1 : u; fG[p] = u * EW;
+    let v = magFrac((fF[p] - eLo) / span, mag); v = v < 0 ? 0 : v > 1 ? 1 : v; fF[p] = v * EH;
+    let u = magFrac((fG[p] + az) / (2 * az), mag); u = u < 0 ? 0 : u > 1 ? 1 : u; fG[p] = u * EW;
   }
 
   const fit = computeFit(S);
@@ -1716,7 +1732,9 @@ export default function App() {
         size: 1.0, amp: 0.8, spread: 25, roughness: 0.45, detail: 10 }]);
   const removeEmitter = (id) => setEmitters((es) => es.filter((e) => e.id !== id));
   const [halfW, setHalfW] = useState(12);
+  const [yNear, setYNear] = useState(3);
   const [yFar, setYFar] = useState(46);
+  const [reflMag, setReflMag] = useState(1); // reflection detail (angular zoom)
 
   // reflected objects: stamped into the environment panorama across the
   // water, so only their reflection appears in the frame
@@ -1786,7 +1804,13 @@ export default function App() {
     () => typeof window === "undefined" || window.innerWidth >= 820);
   const camRef = useRef({ panX: 0, panY: 0, zoom: 1 });
   camRef.current = { panX, panY, zoom };
-  const clampPan = (v) => Math.max(-2.5, Math.min(2.5, v));
+  // pan is in half-viewport units, so the shift needed to reach the scene's
+  // edge grows with zoom — a fixed clamp would silently recenter an anchored
+  // zoom toward the scene center. Scale the clamp with the zoom level.
+  const clampPan = (v, z = camRef.current.zoom) => {
+    const m = Math.max(2.5, 1.2 * z + 0.5);
+    return Math.max(-m, Math.min(m, v));
+  };
   const resetCamera = () => { setZoom(1); setPanX(0); setPanY(0); };
 
   useEffect(() => {
@@ -1798,14 +1822,14 @@ export default function App() {
       e.preventDefault();
       const r = el.getBoundingClientRect();
       const { panX: px, panY: py, zoom: z } = camRef.current;
-      const z2 = Math.max(1, Math.min(14, z * Math.exp(-e.deltaY * 0.0016)));
+      const z2 = Math.max(1, Math.min(30, z * Math.exp(-e.deltaY * 0.0016)));
       const k = z2 / z;
       if (k === 1) return;
       const ocx = ((e.clientX - r.left) / r.width - 0.5) * 2;  // -1..1 across
       const ocy = ((e.clientY - r.top) / r.height - 0.5) * 2;
       setZoom(z2);
-      setPanX(clampPan(px + (1 - k) * (ocx - px)));
-      setPanY(clampPan(py + (1 - k) * (ocy - py)));
+      setPanX(clampPan(px + (1 - k) * (ocx - px), z2));
+      setPanY(clampPan(py + (1 - k) * (ocy - py), z2));
     };
     el.addEventListener("wheel", onWheel, { passive: false });
     return () => el.removeEventListener("wheel", onWheel);
@@ -1852,7 +1876,7 @@ export default function App() {
 
   const S = useMemo(() => ({
     nx: quality, ny: quality,
-    xMin: -halfW, xMax: halfW, yMin: 3, yMax: yFar,
+    xMin: -halfW, xMax: halfW, yMin: Math.min(yNear, yFar - 2), yMax: yFar,
     H: 0.4 * Math.pow(22.5, steep),
     pitch: (pitchDeg * Math.PI) / 180,
     k: (2 * Math.PI) / wavelength,
@@ -1862,7 +1886,7 @@ export default function App() {
     omega: 1.0,
     t: animate ? tRef.current : 0,
     bands, perspective, eLo, eHi, zoom, panX, panY, smooth, coherence, rectOutput,
-    surface3d, waveScale, bandFractions, fresOn, fresBands,
+    surface3d, waveScale, bandFractions, fresOn, fresBands, reflMag,
     // waves scatter off the buoy's hull: a ring source pinned to the object,
     // with a tight decay so the disturbance stays local
     emitters: objOn && objRipple > 0
@@ -1870,8 +1894,8 @@ export default function App() {
           size: Math.max(0.3, objSize * objRippleScale), amp: objRipple * 1.5, decay: 0.28 }]
       : emitters,
   }), [quality, steep, pitchDeg, wavelength, strength, sharp, spread, bands, perspective,
-       halfW, yFar, eLo, eHi, zoom, panX, panY, smooth, coherence, rectOutput, surface3d, waveScale,
-       bandFractions, fresOn, fresBands,
+       halfW, yNear, yFar, eLo, eHi, zoom, panX, panY, smooth, coherence, rectOutput, surface3d, waveScale,
+       bandFractions, fresOn, fresBands, reflMag,
        emitters, animate, speed, tRef.current,
        objOn, objX, objY, objSize, objRipple, objRippleScale]);
 
@@ -1929,6 +1953,7 @@ export default function App() {
   const penLines = useMemo(() => {
     if (!penMode) return null;
     const fit = computeFit(S);
+    const mag = S.reflMag || 1;
     S._ems = S.emitters.filter((e) => e.on).map((e) => prepEmitter(e, S));
     const deepMix = (c, cosI) => {
       if (!fresOn) return c;
@@ -1943,8 +1968,8 @@ export default function App() {
         const R = reflectAt(gx, gy, S);
         const phi = Math.asin(Math.max(-1, Math.min(1, R[2]))) * 180 / Math.PI;
         let psi = Math.atan2(R[0], R[1]) * 180 / Math.PI; psi = psi < -az ? -az : psi > az ? az : psi;
-        let v = (phi - S.eLo) / ((S.eHi - S.eLo) || 1); v = v < 0 ? 0 : v > 1 ? 1 : v;
-        let u = (psi + az) / (2 * az); u = u < 0 ? 0 : u > 1 ? 1 : u;
+        let v = magFrac((phi - S.eLo) / ((S.eHi - S.eLo) || 1), mag); v = v < 0 ? 0 : v > 1 ? 1 : v;
+        let u = magFrac((psi + az) / (2 * az), mag); u = u < 0 ? 0 : u > 1 ? 1 : u;
         const c = cells[Math.min(EH - 1, Math.floor(v * EH)) * EW + Math.min(EW - 1, Math.floor(u * EW))];
         return deepMix(c, R[3]);
       };
@@ -1955,7 +1980,7 @@ export default function App() {
       colorAt = (gx, gy) => {
         const R = reflectAt(gx, gy, S);
         const phi = Math.asin(Math.max(-1, Math.min(1, R[2]))) * 180 / Math.PI;
-        let v = (phi - S.eLo) / ((S.eHi - S.eLo) || 1); v = v < 0 ? 0 : v >= 1 ? 0.999999 : v;
+        let v = magFrac((phi - S.eLo) / ((S.eHi - S.eLo) || 1), mag); v = v < 0 ? 0 : v >= 1 ? 0.999999 : v;
         let c;
         if (fr) {
           let idx = 0;
@@ -2081,6 +2106,7 @@ export default function App() {
   const paperColorGrid = () => {
     S._ems = S.emitters.filter((e) => e.on).map((e) => prepEmitter(e, S));
     const { nx, ny } = S;
+    const mag = S.reflMag || 1;
     const grid = new Int32Array(nx * ny);
     const deepMix = (c, cosI) => {
       if (!fresOn) return c;
@@ -2101,8 +2127,8 @@ export default function App() {
           const R = reflectAt(gx, gy, S);
           const phi = Math.asin(Math.max(-1, Math.min(1, R[2]))) * 180 / Math.PI;
           let psi = Math.atan2(R[0], R[1]) * 180 / Math.PI; psi = psi < -az ? -az : psi > az ? az : psi;
-          let v = (phi - S.eLo) / ((S.eHi - S.eLo) || 1); v = v < 0 ? 0 : v > 1 ? 1 : v;
-          let u = (psi + az) / (2 * az); u = u < 0 ? 0 : u > 1 ? 1 : u;
+          let v = magFrac((phi - S.eLo) / ((S.eHi - S.eLo) || 1), mag); v = v < 0 ? 0 : v > 1 ? 1 : v;
+          let u = magFrac((psi + az) / (2 * az), mag); u = u < 0 ? 0 : u > 1 ? 1 : u;
           const c = cells[Math.min(EH - 1, Math.floor(v * EH)) * EW + Math.min(EW - 1, Math.floor(u * EW))];
           grid[j * nx + i] = idFor(deepMix(c, R[3]));
         }
@@ -2116,7 +2142,7 @@ export default function App() {
         const [gx, gy] = cell2ground(i + 0.5, j + 0.5, S);
         const R = reflectAt(gx, gy, S);
         const phi = Math.asin(Math.max(-1, Math.min(1, R[2]))) * 180 / Math.PI;
-        let v = (phi - S.eLo) / ((S.eHi - S.eLo) || 1); v = v < 0 ? 0 : v >= 1 ? 0.999999 : v;
+        let v = magFrac((phi - S.eLo) / ((S.eHi - S.eLo) || 1), mag); v = v < 0 ? 0 : v >= 1 ? 0.999999 : v;
         let c;
         if (fr) {
           let idx = 0;
@@ -2324,18 +2350,18 @@ export default function App() {
               <div style={heading}>Camera</div>
               <Slider label="Height (view angle at near edge)" value={steep} min={0} max={1} step={0.01}
                 onChange={setSteep}
-                fmt={(v) => Math.round(Math.atan((0.4 * Math.pow(22.5, v)) / 3) * 180 / Math.PI) + "°"} />
+                fmt={(v) => Math.round(Math.atan((0.4 * Math.pow(22.5, v)) / Math.min(yNear, yFar - 2)) * 180 / Math.PI) + "°"} />
               {perspective && (
-                <Slider label="Pitch (perspective squash)" value={pitchDeg} min={4} max={55} step={0.5}
+                <Slider label="Pitch (perspective squash)" value={pitchDeg} min={4} max={80} step={0.5}
                   onChange={setPitchDeg} fmt={(v) => v.toFixed(1) + "°"} />
               )}
               <Slider label="Roll" value={rollDeg} min={-30} max={30} step={0.5}
                 onChange={setRollDeg} fmt={(v) => (v === 0 ? "level" : v.toFixed(1) + "°")} />
-              <Slider label="Zoom (focal length)" value={zoom} min={1} max={14} step={0.05}
+              <Slider label="Zoom (focal length)" value={zoom} min={1} max={30} step={0.05}
                 onChange={setZoom} fmt={(v) => v.toFixed(2) + "×"} />
-              <Slider label="Pan ← →" value={panX} min={-2} max={2} step={0.02}
+              <Slider label="Pan ← →" value={panX} min={-Math.max(2, Math.ceil(zoom))} max={Math.max(2, Math.ceil(zoom))} step={0.02}
                 onChange={setPanX} fmt={(v) => (v === 0 ? "center" : v.toFixed(2))} />
-              <Slider label="Pan ↑ ↓" value={panY} min={-2} max={2} step={0.02}
+              <Slider label="Pan ↑ ↓" value={panY} min={-Math.max(2, Math.ceil(zoom))} max={Math.max(2, Math.ceil(zoom))} step={0.02}
                 onChange={setPanY} fmt={(v) => (v === 0 ? "center" : v.toFixed(2))} />
               <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
                 <button style={miniBtn} onClick={resetCamera}>Full scene</button>
@@ -2343,6 +2369,12 @@ export default function App() {
                   onClick={() => { setZoom(3.2); setPanX(0); setPanY(0.5); }}>Mid-field</button>
                 <button style={miniBtn}
                   onClick={() => { setZoom(5.5); setPanX(0); setPanY(0.75); }}>Far band</button>
+                <button style={miniBtn} title="steep-down telephoto shot of a close patch of water"
+                  onClick={() => {
+                    setSteep(0.95); setPitchDeg(62); setZoom(1); setPanX(0); setPanY(0);
+                    setYNear(1.5); setYFar(10); setHalfW(4); setWavelength(1.4);
+                    setReflMag(4); setAutoFit(true); setRectOutput(true);
+                  }}>Close-up</button>
               </div>
               <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5,
                 fontFamily: "ui-monospace, monospace" }}>
@@ -2354,7 +2386,7 @@ export default function App() {
 
             <div style={panel}>
               <div style={heading}>Water surface</div>
-              <Slider label="Ripple scale (λ)" value={wavelength} min={1.2} max={7} step={0.1}
+              <Slider label="Ripple scale (λ)" value={wavelength} min={0.6} max={7} step={0.1}
                 onChange={setWavelength} fmt={(v) => v.toFixed(1)} />
               <Slider label="Ripple strength" value={strength} min={0.05} max={1} step={0.01}
                 onChange={setStrength} fmt={(v) => v.toFixed(2)} />
@@ -2363,7 +2395,7 @@ export default function App() {
                 fmt={(v) => (v === 0 ? "sine (soft)" : v < 0.35 ? "gentle" : v < 0.6 ? "peaked" : "steep")} />
               <Slider label="Spread / reach" value={spread} min={0} max={1} step={0.01}
                 onChange={setSpread} fmt={(v) => (v < 0.4 ? "tight" : v < 0.75 ? "medium" : "wide")} />
-              <Slider label="Plane width" value={halfW} min={4} max={40} step={1}
+              <Slider label="Plane width" value={halfW} min={2} max={40} step={1}
                 onChange={setHalfW} fmt={(v) => v * 2 + " units"} />
             </div>
 
@@ -2410,6 +2442,16 @@ export default function App() {
                   border: "1px solid " + (mode === "paint2d" ? "#9a7a3a" : "#26313c") }}>
                   Paint 2D ✎ (panorama)
                 </button>
+              </div>
+
+              <Slider label="Reflection detail (angular zoom)" value={reflMag} min={0.5} max={10}
+                step={0.1} onChange={setReflMag}
+                fmt={(v) => (v === 1 ? "1.0× (off)" : v.toFixed(1) + "×")} />
+              <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 10, lineHeight: 1.5,
+                fontFamily: "ui-monospace, monospace" }}>
+                Compresses the environment into a narrower reflected cone, so a small ripple
+                tilt sweeps more of the colors — the telephoto close-up look where every
+                wavelet carries the whole gradient. Pair with auto-fit for steep-down shots.
               </div>
 
               {mode === "paint1d" && (
@@ -2696,11 +2738,13 @@ export default function App() {
                         fontFamily: "ui-monospace, monospace", fontSize: 11, marginBottom: 12 }}>
                       ⤢ fit elevation range to water ({rng.lo.toFixed(0)}° – {rng.hi.toFixed(0)}°)
                     </button>
-                    <Slider label="elevation low" value={eLo} min={-5} max={20} step={1} onChange={setELo} fmt={(v) => v + "°"} />
-                    <Slider label="elevation high" value={eHi} min={8} max={80} step={1} onChange={setEHi} fmt={(v) => v + "°"} />
+                    <Slider label="elevation low" value={eLo} min={-5} max={60} step={1} onChange={setELo} fmt={(v) => v + "°"} />
+                    <Slider label="elevation high" value={eHi} min={8} max={90} step={1} onChange={setEHi} fmt={(v) => v + "°"} />
                   </>
                 )}
-                <Slider label="plane depth (far edge)" value={yFar} min={20} max={90} step={2} onChange={setYFar} />
+                <Slider label="plane near edge" value={yNear} min={1} max={15} step={0.5}
+                  onChange={setYNear} fmt={(v) => v.toFixed(1)} />
+                <Slider label="plane depth (far edge)" value={yFar} min={10} max={90} step={2} onChange={setYFar} />
                 <Slider label="sample grid" value={quality} min={60} max={220} step={10} onChange={setQuality} />
               </div>
             )}
