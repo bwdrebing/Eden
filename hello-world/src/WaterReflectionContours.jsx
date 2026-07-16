@@ -66,9 +66,9 @@ const VB_W = 760;
 const VB_H = 500;
 
 const DEFAULT_EMITTERS = [
-  { id: 1, on: true, type: "swell",    x: 0, y: 20, dir: 75,  size: 2.8, amp: 0.55, spread: 25, roughness: 0.4, detail: 14 },
-  { id: 2, on: true, type: "spectrum", x: 0, y: 20, dir: 105, size: 1.4, amp: 0.6,  spread: 24, roughness: 0.4, detail: 14 },
-  { id: 3, on: true, type: "rings",    x: 0, y: 20, dir: 90,  size: 1.0, amp: 0.9,  spread: 25, roughness: 0.45, detail: 11 },
+  { id: 1, on: true, type: "swell",    x: 0, y: 20, dir: 65,  size: 3.2, amp: 1.85, spread: 25, roughness: 0.4,  detail: 14 },
+  { id: 2, on: true, type: "spectrum", x: 0, y: 20, dir: 125, size: 1.5, amp: 1.1,  spread: 59, roughness: 0.1,  detail: 15 },
+  { id: 3, on: true, type: "spectrum", x: 0, y: 20, dir: 90,  size: 1.7, amp: 1.9,  spread: 17, roughness: 0.15, detail: 19 },
 ];
 
 // quick-pick colors for the environment painter: treeline/earth → sunset → sky
@@ -437,7 +437,19 @@ function multiToPath(multi, S, fit, off = 0, ex = null) {
       const ring = iters ? chaikin(ring0, iters) : ring0;
       const pts = [];
       for (let idx = 0; idx < ring.length; idx++) {
-        const gi = ring[idx][0] + off, gj = ring[idx][1] + off;
+        let gi = ring[idx][0] + off, gj = ring[idx][1] + off;
+        // Pad-zone vertices exist to overshoot the flat watertrap clip — but
+        // 3D mode skips that clip so crests can rise above the trapezoid,
+        // which would leave the overshoot visible: every layer's rim would
+        // drape one cell (plus the `ex` expansion) outside the plane, stacked
+        // colored walls that read as the sides of a container. Pin them onto
+        // the water boundary instead, so each layer's rim lands exactly on
+        // the lifted edge silhouette. (The `ex` branch below then never fires
+        // in 3D: clamped points are no longer in the pad zone.)
+        if (lift) {
+          gi = gi < 0 ? 0 : gi > S.nx ? S.nx : gi;
+          gj = gj < 0 ? 0 : gj > S.ny ? S.ny : gj;
+        }
         const [gx, gy] = cell2ground(gi, gj, S);
         let X, Y;
         if (lift) {
@@ -1061,7 +1073,10 @@ function buildSegmentation(S, env2d, azSpan) {
       if (phi < lo) lo = phi; if (phi > hi) hi = phi;
     }
   }
-  // light de-jitter (keeps the rippled character; just removes speckle)
+  // optional smoothing (the "edge ripple" slider): each pass box-blurs the
+  // reflected-direction fields in water space — calmer, broader regions at
+  // the cost of per-ripple detail. At 0 every wavelet keeps its full
+  // excursion, matching the 1D path.
   const passes = Math.max(0, S.coherence | 0);
   if (passes) {
     const tmp = new Float64Array(nx * ny);
@@ -1109,7 +1124,8 @@ function buildSegmentation(S, env2d, azSpan) {
     for (let p = 0; p < EW * EH; p++) rowSum[labels[p]] += (p / EW) | 0;
     const order = d3.range(K).sort((a, b) => rowSum[a] / areas[a] - rowSum[b] / areas[b]);
     const union = new Float64Array(EW * EH), inv = new Float64Array(EW * EH);
-    const F = new Float64Array(nx * ny), tmp = new Float64Array(nx * ny);
+    const D0 = new Float64Array(EW * EH), tmpP = new Float64Array(EW * EH);
+    const F = new Float64Array(nx * ny);
     // fields are contoured on a one-cell-padded grid (edge values replicated)
     // so every region overshoots the water's edge instead of tracing it; the
     // whole stack is then clipped to the exact trapezoid. Otherwise each
@@ -1138,6 +1154,23 @@ function buildSegmentation(S, env2d, azSpan) {
       const D = distTransform(union, EW, EH), Dout = distTransform(inv, EW, EH);
       let thick = 0;
       for (let p = 0; p < EW * EH; p++) { D[p] -= Dout[p]; if (D[p] > thick) thick = D[p]; }
+      // a light blur rounds the pixel-corner bevels of the painted boundary —
+      // in PANORAMA space, where the corners live. (Blurring the composed
+      // field in water space instead flattens every small ripple's φ
+      // excursion, erasing the fine reflection rings the 1D path keeps.)
+      // For a stripe boundary the SDF is linear across it, so the blur is a
+      // no-op there and stripes stay in exact 1D parity. Skip thin unions
+      // (the topmost gradient rows): nothing to round, and the blur would
+      // erase them. The sign clamp keeps solidly-inside/outside cells on
+      // their own side, so 1-cell features (object ink rims) survive.
+      if (thick >= 2) {
+        for (let p = 0; p < EW * EH; p++) D0[p] = D[p];
+        blurField(D, EW, EH, tmpP, 1);
+        for (let p = 0; p < EW * EH; p++) {
+          if (D0[p] >= 1 && D[p] < 0.25) D[p] = 0.25;
+          else if (D0[p] <= -1 && D[p] > -0.25) D[p] = -0.25;
+        }
+      }
       // compose through the reflection: bilinear sample at each water
       // sample's continuous (azimuth, elevation) panorama coordinate
       for (let p = 0; p < nx * ny; p++) {
@@ -1148,10 +1181,6 @@ function buildSegmentation(S, env2d, azSpan) {
         F[p] = (D[q] * (1 - fx) + D[q + 1] * fx) * (1 - fy)
              + (D[q + EW] * (1 - fx) + D[q + EW + 1] * fx) * fy;
       }
-      // a light blur rounds the pixel-corner bevels the bilinear sampling
-      // leaves behind. Skip it for thin unions (the topmost gradient rows):
-      // the blur would erase them, and they have no corners to round.
-      if (thick >= 2) blurField(F, nx, ny, tmp, 1);
       for (let j = 0; j < py; j++) {
         const jj = Math.min(ny - 1, Math.max(0, j - 1));
         for (let i = 0; i < px; i++) {
@@ -1200,6 +1229,14 @@ function buildSegmentation(S, env2d, azSpan) {
   const count = rows.reduce((n, row) => n + 1 + row.az.length, 0);
   return { bg: cells[0], rows, fres, lo, hi, count, twoD: true };
 }
+
+// exported for tests: the two render paths plus the helpers needed to feed
+// them, so 1D/2D fidelity parity can be checked without mounting the UI
+export {
+  buildGeometry, buildSegmentation, envFromRows, stampObjects,
+  paletteStops, paletteColorAt, DERIVED_ENV_H, ENV2D_W, DEFAULT_EMITTERS,
+  computeFit, cell2ground, heightAt, clampLift, penProject,
+};
 
 // ---- layered-paper stack export -----------------------------------
 // Decompose the scene into a stack of physical paper sheets. Each sheet is
@@ -1698,28 +1735,28 @@ export default function App() {
   const width = useWidth();
   const isNarrow = width < 820;
 
-  const [steep, setSteep] = useState(0.35);
+  const [steep, setSteep] = useState(1); // shows as a 72° view angle at the near edge
   const [pitchDeg, setPitchDeg] = useState(12.6); // 0.22 rad, the old fixed value
   const [rollDeg, setRollDeg] = useState(0);
   const [fresOn, setFresOn] = useState(false);
   const [fresBands, setFresBands] = useState(3);
   const [fresStrength, setFresStrength] = useState(0.75);
   const [deepColor, setDeepColor] = useState("#08131d");
-  const [wavelength, setWavelength] = useState(3.0);
-  const [strength, setStrength] = useState(0.52);
+  const [wavelength, setWavelength] = useState(2.8);
+  const [strength, setStrength] = useState(0.78);
   const [sharp, setSharp] = useState(0.3);   // crest sharpening (2nd harmonic)
   const [spread, setSpread] = useState(0.5);
   const [bands, setBands] = useState(9);
   const [palette, setPalette] = useState("Sunset Lake");
   const [perspective, setPerspective] = useState(true);
   const [rectOutput, setRectOutput] = useState(false);
-  const [surface3d, setSurface3d] = useState(false); // lift color regions onto the waves
-  const [waveScale, setWaveScale] = useState(1.5);    // 3D wave-height exaggeration
+  const [surface3d, setSurface3d] = useState(true); // lift color regions onto the waves
+  const [waveScale, setWaveScale] = useState(8);     // 3D wave-height exaggeration
   const [edges, setEdges] = useState(false);
   const [animate, setAnimate] = useState(false);
   const [speed, setSpeed] = useState(0.5);
   const [quality, setQuality] = useState(() =>
-    (typeof window !== "undefined" && window.innerWidth < 820) ? 72 : 100);
+    (typeof window !== "undefined" && window.innerWidth < 820) ? 100 : 140);
   const [advanced, setAdvanced] = useState(false);
 
   const [emitters, setEmitters] = useState(DEFAULT_EMITTERS);
@@ -1731,9 +1768,9 @@ export default function App() {
       [...es, { id: nextId.current++, on: true, type: "rings", x: 0, y: 20, dir: 90,
         size: 1.0, amp: 0.8, spread: 25, roughness: 0.45, detail: 10 }]);
   const removeEmitter = (id) => setEmitters((es) => es.filter((e) => e.id !== id));
-  const [halfW, setHalfW] = useState(12);
+  const [halfW, setHalfW] = useState(22); // 44 units across
   const [yNear, setYNear] = useState(3);
-  const [yFar, setYFar] = useState(46);
+  const [yFar, setYFar] = useState(78);
   const [reflMag, setReflMag] = useState(1); // reflection detail (angular zoom)
 
   // reflected objects: stamped into the environment panorama across the
@@ -1760,7 +1797,7 @@ export default function App() {
   const [objRippleScale, setObjRippleScale] = useState(0.8);
   const [objBands, setObjBands] = useState(5);      // cel-shade tone count
   const [objLight, setObjLight] = useState(325);    // light direction, degrees
-  const [eLo, setELo] = useState(0), [eHi, setEHi] = useState(20);
+  const [eLo, setELo] = useState(-5), [eHi, setEHi] = useState(33);
   const [autoFit, setAutoFit] = useState(false);
   const [penMode, setPenMode] = useState(false);
   const [penCount, setPenCount] = useState(48);   // number of scan lines
@@ -1772,17 +1809,19 @@ export default function App() {
   const [penEven, setPenEven] = useState(false);     // even spacing on screen
   const [bgColor, setBgColor] = useState("");       // "" = auto
 
-  const [zoom, setZoom] = useState(1);
+  const [zoom, setZoom] = useState(5);
   const [panX, setPanX] = useState(0);
   const [panY, setPanY] = useState(0);
-  const [smooth, setSmooth] = useState(2);
+  const [smooth, setSmooth] = useState(3);
   const [mode, setMode] = useState("preset"); // "preset" | "paint1d" | "paint2d"
   const [envColors, setEnvColors] = useState(() => seedEnv("Sunset Lake", ENV_N));
   const [env2d, setEnv2d] = useState(() => seedEnv2D("Sunset Lake", ENV2D_W, ENV2D_H));
   const [segEnv, setSegEnv] = useState(env2d);          // committed copy that drives the water
   const env2dRef = useRef(env2d); env2dRef.current = env2d;
   const [azSpan, setAzSpan] = useState(45);
-  const [coherence, setCoherence] = useState(2);
+  // 0 = no de-jitter blur of the reflected-direction fields, so the 2D path
+  // keeps the same per-ripple detail as the 1D path out of the box
+  const [coherence, setCoherence] = useState(0);
   const [activeColor, setActiveColor] = useState("#11324a");
   const [brushSize, setBrushSize] = useState(1);       // radius in cells
   const [brushShape, setBrushShape] = useState("round"); // round | square | diamond
@@ -2611,8 +2650,13 @@ export default function App() {
               {objectsOn && (
                 <>
                   {!is2d && (
-                    <Slider label="azimuth span (reflection width)" value={azSpan} min={15} max={80}
-                      step={1} onChange={setAzSpan} fmt={(v) => "±" + v + "°"} />
+                    <>
+                      <Slider label="azimuth span (reflection width)" value={azSpan} min={15} max={80}
+                        step={1} onChange={setAzSpan} fmt={(v) => "±" + v + "°"} />
+                      <Slider label="edge ripple" value={coherence} min={0} max={8} step={1}
+                        onChange={setCoherence}
+                        fmt={(v) => (v === 0 ? "sharp" : v <= 2 ? "rippled" : v <= 5 ? "smooth" : "broad")} />
+                    </>
                   )}
                   <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 6,
                     fontFamily: "ui-monospace, monospace" }}>
@@ -2673,7 +2717,7 @@ export default function App() {
               )}
               {!penMode && perspective && surface3d && (
                 <>
-                  <Slider label="Wave height (3D)" value={waveScale} min={0} max={3} step={0.05}
+                  <Slider label="Wave height (3D)" value={waveScale} min={0} max={10} step={0.05}
                     onChange={setWaveScale} fmt={(v) => (v === 0 ? "flat" : v.toFixed(2))} />
                   <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 8, lineHeight: 1.5,
                     fontFamily: "ui-monospace, monospace" }}>
