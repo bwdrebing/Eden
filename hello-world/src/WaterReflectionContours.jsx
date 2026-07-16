@@ -1061,7 +1061,10 @@ function buildSegmentation(S, env2d, azSpan) {
       if (phi < lo) lo = phi; if (phi > hi) hi = phi;
     }
   }
-  // light de-jitter (keeps the rippled character; just removes speckle)
+  // optional smoothing (the "edge ripple" slider): each pass box-blurs the
+  // reflected-direction fields in water space — calmer, broader regions at
+  // the cost of per-ripple detail. At 0 every wavelet keeps its full
+  // excursion, matching the 1D path.
   const passes = Math.max(0, S.coherence | 0);
   if (passes) {
     const tmp = new Float64Array(nx * ny);
@@ -1109,7 +1112,8 @@ function buildSegmentation(S, env2d, azSpan) {
     for (let p = 0; p < EW * EH; p++) rowSum[labels[p]] += (p / EW) | 0;
     const order = d3.range(K).sort((a, b) => rowSum[a] / areas[a] - rowSum[b] / areas[b]);
     const union = new Float64Array(EW * EH), inv = new Float64Array(EW * EH);
-    const F = new Float64Array(nx * ny), tmp = new Float64Array(nx * ny);
+    const D0 = new Float64Array(EW * EH), tmpP = new Float64Array(EW * EH);
+    const F = new Float64Array(nx * ny);
     // fields are contoured on a one-cell-padded grid (edge values replicated)
     // so every region overshoots the water's edge instead of tracing it; the
     // whole stack is then clipped to the exact trapezoid. Otherwise each
@@ -1138,6 +1142,23 @@ function buildSegmentation(S, env2d, azSpan) {
       const D = distTransform(union, EW, EH), Dout = distTransform(inv, EW, EH);
       let thick = 0;
       for (let p = 0; p < EW * EH; p++) { D[p] -= Dout[p]; if (D[p] > thick) thick = D[p]; }
+      // a light blur rounds the pixel-corner bevels of the painted boundary —
+      // in PANORAMA space, where the corners live. (Blurring the composed
+      // field in water space instead flattens every small ripple's φ
+      // excursion, erasing the fine reflection rings the 1D path keeps.)
+      // For a stripe boundary the SDF is linear across it, so the blur is a
+      // no-op there and stripes stay in exact 1D parity. Skip thin unions
+      // (the topmost gradient rows): nothing to round, and the blur would
+      // erase them. The sign clamp keeps solidly-inside/outside cells on
+      // their own side, so 1-cell features (object ink rims) survive.
+      if (thick >= 2) {
+        for (let p = 0; p < EW * EH; p++) D0[p] = D[p];
+        blurField(D, EW, EH, tmpP, 1);
+        for (let p = 0; p < EW * EH; p++) {
+          if (D0[p] >= 1 && D[p] < 0.25) D[p] = 0.25;
+          else if (D0[p] <= -1 && D[p] > -0.25) D[p] = -0.25;
+        }
+      }
       // compose through the reflection: bilinear sample at each water
       // sample's continuous (azimuth, elevation) panorama coordinate
       for (let p = 0; p < nx * ny; p++) {
@@ -1148,10 +1169,6 @@ function buildSegmentation(S, env2d, azSpan) {
         F[p] = (D[q] * (1 - fx) + D[q + 1] * fx) * (1 - fy)
              + (D[q + EW] * (1 - fx) + D[q + EW + 1] * fx) * fy;
       }
-      // a light blur rounds the pixel-corner bevels the bilinear sampling
-      // leaves behind. Skip it for thin unions (the topmost gradient rows):
-      // the blur would erase them, and they have no corners to round.
-      if (thick >= 2) blurField(F, nx, ny, tmp, 1);
       for (let j = 0; j < py; j++) {
         const jj = Math.min(ny - 1, Math.max(0, j - 1));
         for (let i = 0; i < px; i++) {
@@ -1200,6 +1217,13 @@ function buildSegmentation(S, env2d, azSpan) {
   const count = rows.reduce((n, row) => n + 1 + row.az.length, 0);
   return { bg: cells[0], rows, fres, lo, hi, count, twoD: true };
 }
+
+// exported for tests: the two render paths plus the helpers needed to feed
+// them, so 1D/2D fidelity parity can be checked without mounting the UI
+export {
+  buildGeometry, buildSegmentation, envFromRows, stampObjects,
+  paletteStops, paletteColorAt, DERIVED_ENV_H, ENV2D_W, DEFAULT_EMITTERS,
+};
 
 // ---- layered-paper stack export -----------------------------------
 // Decompose the scene into a stack of physical paper sheets. Each sheet is
@@ -1782,7 +1806,9 @@ export default function App() {
   const [segEnv, setSegEnv] = useState(env2d);          // committed copy that drives the water
   const env2dRef = useRef(env2d); env2dRef.current = env2d;
   const [azSpan, setAzSpan] = useState(45);
-  const [coherence, setCoherence] = useState(2);
+  // 0 = no de-jitter blur of the reflected-direction fields, so the 2D path
+  // keeps the same per-ripple detail as the 1D path out of the box
+  const [coherence, setCoherence] = useState(0);
   const [activeColor, setActiveColor] = useState("#11324a");
   const [brushSize, setBrushSize] = useState(1);       // radius in cells
   const [brushShape, setBrushShape] = useState("round"); // round | square | diamond
@@ -2611,8 +2637,13 @@ export default function App() {
               {objectsOn && (
                 <>
                   {!is2d && (
-                    <Slider label="azimuth span (reflection width)" value={azSpan} min={15} max={80}
-                      step={1} onChange={setAzSpan} fmt={(v) => "±" + v + "°"} />
+                    <>
+                      <Slider label="azimuth span (reflection width)" value={azSpan} min={15} max={80}
+                        step={1} onChange={setAzSpan} fmt={(v) => "±" + v + "°"} />
+                      <Slider label="edge ripple" value={coherence} min={0} max={8} step={1}
+                        onChange={setCoherence}
+                        fmt={(v) => (v === 0 ? "sharp" : v <= 2 ? "rippled" : v <= 5 ? "smooth" : "broad")} />
+                    </>
                   )}
                   <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 6,
                     fontFamily: "ui-monospace, monospace" }}>
