@@ -177,6 +177,65 @@ function buildStrip(centers, labels, w, h, n) {
 //   - the dominant luminance-gradient orientation = ripple heading
 // All measured on the same k-means label grid the palette came from.
 
+// in-place radix-2 FFT (re, im same length, power of two)
+function fft(re, im) {
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      let t = re[i]; re[i] = re[j]; re[j] = t;
+      t = im[i]; im[i] = im[j]; im[j] = t;
+    }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = (-2 * Math.PI) / len;
+    const wr = Math.cos(ang), wi = Math.sin(ang);
+    for (let i = 0; i < n; i += len) {
+      let cr = 1, ci = 0;
+      for (let j = 0; j < len / 2; j++) {
+        const ur = re[i + j], ui = im[i + j];
+        const vr = re[i + j + len / 2] * cr - im[i + j + len / 2] * ci;
+        const vi = re[i + j + len / 2] * ci + im[i + j + len / 2] * cr;
+        re[i + j] = ur + vr; im[i + j] = ui + vi;
+        re[i + j + len / 2] = ur - vr; im[i + j + len / 2] = ui - vi;
+        const ncr = cr * wr - ci * wi;
+        ci = cr * wi + ci * wr; cr = ncr;
+      }
+    }
+  }
+}
+
+// dominant horizontal half-period (~blob width) of the luminance over a row
+// band, from the row-averaged power spectrum. More robust than run lengths:
+// speckle noise shatters runs but barely moves the spectral fundamental.
+// Falls back to mean run length when the band has no periodic signal.
+function dominantHalfPeriod(labs, labels, w, h, rows) {
+  let P = 1;
+  while (P < w) P <<= 1;
+  const power = new Float64Array(P / 2);
+  const re = new Float64Array(P), im = new Float64Array(P);
+  let ac = 0;
+  for (const r of rows) {
+    let mean = 0;
+    for (let x = 0; x < w; x++) mean += labs[r * w + x][0];
+    mean /= w;
+    re.fill(0); im.fill(0);
+    for (let x = 0; x < w; x++) {
+      const hann = 0.5 - 0.5 * Math.cos((2 * Math.PI * x) / (w - 1));
+      re[x] = (labs[r * w + x][0] - mean) * hann;
+      ac += re[x] * re[x];
+    }
+    fft(re, im);
+    for (let k = 1; k < P / 2; k++) power[k] += re[k] * re[k] + im[k] * im[k];
+  }
+  let peak = 2;
+  for (let k = 3; k < P / 2; k++) if (power[k] > power[peak]) peak = k;
+  if (ac < 1e-9 || power[peak] < 1e-9) return meanRunH(labels, w, rows); // flat band
+  return P / peak / 2;
+}
+
 function meanRunH(labels, w, rows) {
   let runs = 0, rowsUsed = 0;
   for (const r of rows) {
@@ -200,8 +259,8 @@ function meanRunV(labels, w, h) {
 export function measurePhotoStats(labs, labels, w, h) {
   const third = Math.max(1, Math.floor(h / 3));
   const rows = (a, b) => { const out = []; for (let r = a; r < b; r++) out.push(r); return out; };
-  const runTop = meanRunH(labels, w, rows(0, third));
-  const runBot = meanRunH(labels, w, rows(h - third, h));
+  const blobTop = dominantHalfPeriod(labs, labels, w, h, rows(0, third));
+  const blobBot = dominantHalfPeriod(labs, labels, w, h, rows(h - third, h));
   const runAll = meanRunH(labels, w, rows(0, h));
   const runV = meanRunV(labels, w, h);
 
@@ -222,8 +281,8 @@ export function measurePhotoStats(labs, labels, w, h) {
     ? Math.sqrt((sxx - syy) * (sxx - syy) + 4 * sxy * sxy) / denom : 0;
 
   return {
-    blobFrac: runBot / w,                                 // near-blob width, frame fraction
-    growth: Math.max(1, runBot / Math.max(1, runTop)),    // near / far blob size
+    blobFrac: blobBot / w,                                // near-blob width, frame fraction
+    growth: Math.max(1, blobBot / Math.max(1, blobTop)),  // near / far blob size
     aniso: runAll / Math.max(0.5, runV),                  // streakiness
     angle,                                                // gradient orientation, degrees
     coherence,                                            // 0 = isotropic, 1 = one direction

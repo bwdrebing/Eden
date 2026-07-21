@@ -1765,6 +1765,11 @@ export default function App() {
       // geometric relief — exaggerated 3D wave height only warps the frame
       // and obscures how well the match landed
       setWaveScale(1);
+      // fit the elevation window to the range the scene actually sweeps, so
+      // the frame samples the WHOLE extracted strip in the photo's
+      // proportions — with a fixed window most of the strip never shows and
+      // the overall color balance drifts far from the photo
+      setAutoFit(true);
       // coherent photo (one streak direction): pull every emitter onto the
       // estimated axis, swell included. Directionless chop: keep the default
       // fan but mute the straight-crested swell, which would draw stripes

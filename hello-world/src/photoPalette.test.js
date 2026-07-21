@@ -162,6 +162,24 @@ describe("measurePhotoStats", () => {
     expect(s.growth).toBeLessThan(5);
   });
 
+  it("recovers blob width through speckle noise that shatters the runs", () => {
+    // stripes 8px wide with 12% of pixels flipped: run lengths collapse to
+    // fragments, but the spectral fundamental stays at the stripe period
+    const w = 64, h = 64;
+    let seed = 7;
+    const rand = () => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed / 0x7fffffff;
+    };
+    const { labs, labels } = statsInput((x, r) => {
+      const v = Math.floor(x / 8) % 2;
+      return rand() < 0.12 ? 1 - v : v;
+    }, w, h);
+    const s = measurePhotoStats(labs, labels, w, h);
+    expect(s.blobFrac).toBeGreaterThan(0.09);
+    expect(s.blobFrac).toBeLessThan(0.17);
+  });
+
   it("reads horizontal streaks as high anisotropy with a ~90° gradient", () => {
     const w = 64, h = 64;
     const { labs, labels } = statsInput((x, r) => Math.floor(r / 2) % 2, w, h);
