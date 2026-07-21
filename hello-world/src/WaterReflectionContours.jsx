@@ -110,8 +110,8 @@ function prepEmitter(em, S) {
   const q = S.sharp || 0;   // Stokes-style crest sharpening, 2nd harmonic weight
 
   if (em.type === "point") {
-    // em.decay overrides the global reach — used by the buoy's scattered
-    // ripples, which should stay local to the hull
+    // em.decay overrides the global reach for sources whose disturbance
+    // should stay local
     const decay = (em.decay ?? S.decay) / Math.max(0.6, em.size);
     return { type: "point", x: em.x, y: em.y, k0: 2 * Math.PI / baseLambda, A, decay, wt };
   }
@@ -358,7 +358,7 @@ function computeFit(S) {
 // camera roll: rotate the finished picture about the viewport center, scaled
 // up just enough that the rotated frame still covers the viewport (cover-fit,
 // like rotating a photo). Applied as one SVG group transform so every mode —
-// regions, pen lines, buoy, clips — rolls consistently.
+// regions, pen lines, clips — rolls consistently.
 function rollTransform(rollDeg) {
   if (!rollDeg) return null;
   const r = (rollDeg * Math.PI) / 180;
@@ -501,122 +501,6 @@ function penProject(gx, gy, gz, S, fit) {
   return [fit.ox + fit.scale * rx, fit.oy + (fit.scaleY || fit.scale) * ry, depth];
 }
 
-// ---- floating object (buoy) ----------------------------------------
-// A sphere floating at the surface, drawn through the same camera as the
-// water. Visible shape = the spherical cap above the waterline; the hull
-// below z = 0 is clipped away by the projected sphere ∩ water-plane circle.
-// The reflection is the cap mirrored across the plane, wobbled by a
-// screen-space ripple and clipped to below the waterline.
-function buildBuoy(S, fit, obj) {
-  const r = obj.size;
-  let zc = r * (1 - 2 * obj.sub);              // center height from submersion
-  // ride the local wave (exaggerated, like pen-mode relief)
-  const bob = heightAt(obj.x, obj.y, S) * 10;
-  zc += Math.max(-0.3 * r, Math.min(0.3 * r, bob));
-  if (zc < -r * 0.98) return null;             // fully under -> nothing to draw
-  const syS = fit.scaleY || fit.scale;
-  const [cx, cy, Zc] = penProject(obj.x, obj.y, zc, S, fit);
-  let rx, ry;
-  if (S.perspective) {
-    rx = fit.scale * r / Zc; ry = syS * r / Zc;
-  } else {
-    rx = fit.scale * r / (S.xMax - S.xMin);
-    ry = syS * r / (S.yMax - S.yMin);
-  }
-  if (rx < 0.5) return null;
-
-  // waterline: the circle where the sphere crosses z = 0, projected
-  const rw = Math.sqrt(Math.max(0, r * r - zc * zc));
-  let ringD = "", nearD = "", clipAbove = null, clipBelow = null;
-  if (rw > 0.02) {
-    const NP = 40, ring = [];
-    for (let i = 0; i <= NP; i++) {
-      const th = (i / NP) * Math.PI * 2;
-      const [sx, sy] = penProject(obj.x + rw * Math.cos(th), obj.y + rw * Math.sin(th), 0, S, fit);
-      ring.push([sx, sy]);
-    }
-    ringD = "M" + ring.map((p) => p[0].toFixed(1) + " " + p[1].toFixed(1)).join(" L") + " Z";
-    if (S.perspective) {
-      // θ ∈ [π, 2π]: the near (camera-side) half of the waterline, left → right
-      const near = ring.slice(NP / 2);
-      nearD = "M" + near.map((p) => p[0].toFixed(1) + " " + p[1].toFixed(1)).join(" L");
-      const a = near[0], b = near[near.length - 1], L = 4000;
-      const arc = near.map((p) => "L" + p[0].toFixed(1) + " " + p[1].toFixed(1)).join(" ");
-      const lead = `M${(a[0] - L).toFixed(1)} ${a[1].toFixed(1)} ${arc} L${(b[0] + L).toFixed(1)} ${b[1].toFixed(1)}`;
-      clipAbove = `${lead} L${(b[0] + L).toFixed(1)} ${-L} L${(a[0] - L).toFixed(1)} ${-L} Z`;
-      clipBelow = `${lead} L${(b[0] + L).toFixed(1)} ${L} L${(a[0] - L).toFixed(1)} ${L} Z`;
-    }
-  }
-
-  // reflection: mirror the sphere across z = 0 (virtual image is farther from
-  // the camera, so it projects slightly smaller — correct for a plane mirror)
-  let reflD = null;
-  if (S.perspective) {
-    const [mx, my, mZc] = penProject(obj.x, obj.y, -zc, S, fit);
-    const mrx = fit.scale * r / mZc, mry = syS * r / mZc;
-    const strength = S.amp / 0.06;               // global ripple strength 0..1
-    const wAmp = Math.min(8, mrx * 0.25 * strength);
-    const wLen = Math.max(3, mry * 0.8);
-    const N = 60;
-    let d = "";
-    for (let i = 0; i <= N; i++) {
-      const a = (i / N) * Math.PI * 2;
-      const py = my + mry * Math.sin(a);
-      const px = mx + mrx * Math.cos(a)
-        + wAmp * Math.sin(((py - my) / wLen) * Math.PI * 2 + S.t * 1.7 + 1.3);
-      d += (i === 0 ? "M" : "L") + px.toFixed(1) + " " + py.toFixed(1) + " ";
-    }
-    reflD = d + "Z";
-  }
-  return { cx, cy, rx, ry, ringD, nearD, clipAbove, clipBelow, reflD, ortho: !S.perspective };
-}
-
-// cel-shade bands: flat tones only, like the water's isobands. Each band is
-// the same ellipse shrunk and pushed toward the light, clipped to the ball
-// silhouette — the overlaps read as thick crescent color bands.
-// n = number of tones, lightDeg = where the light sits around the ball
-// (0° = above, 90° = right, 180° = below, 270° = left).
-const BUOY_RAMP = ["#7e150e", "#c02c1f", "#e8503c", "#ff8a66", "#ffd9b8"];
-function makeBuoyBands(n, lightDeg) {
-  const interp = d3.interpolateRgbBasis(BUOY_RAMP);
-  const a = (lightDeg * Math.PI) / 180;
-  const dx = Math.sin(a), dy = -Math.cos(a);
-  return d3.range(n).map((k) => {
-    const t = k / (n - 1);            // 0 = shadow base, 1 = glint
-    return {
-      f: 1 - 0.82 * Math.pow(t, 1.6), // radius factor
-      ox: 0.72 * t * dx,              // center offset, in units of rx/ry
-      oy: 0.72 * t * dy,
-      color: d3.color(interp(t)).formatHex(),
-    };
-  });
-}
-
-function buoyBandGeo(b, bands) {
-  return bands.map((band) => ({
-    cx: b.cx + band.ox * b.rx, cy: b.cy + band.oy * b.ry,
-    rx: b.rx * band.f, ry: b.ry * band.f, color: band.color,
-  }));
-}
-
-function buoySvg(b, bands) {
-  let s = `<defs>`;
-  if (b.clipAbove) s += `<clipPath id="buoyAbove"><path d="${b.clipAbove}"/></clipPath>`;
-  if (b.clipBelow) s += `<clipPath id="buoyBelow"><path d="${b.clipBelow}"/></clipPath>`;
-  s += `<clipPath id="buoyBall"><ellipse cx="${b.cx.toFixed(1)}" cy="${b.cy.toFixed(1)}" rx="${b.rx.toFixed(1)}" ry="${b.ry.toFixed(1)}"/></clipPath></defs>`;
-  if (b.reflD) s += `<g${b.clipBelow ? ' clip-path="url(#buoyBelow)"' : ""}>`
-    + `<path d="${b.reflD}" fill="#b03328" opacity="0.45"/></g>`;
-  s += `<g${b.clipAbove ? ' clip-path="url(#buoyAbove)"' : ""}><g clip-path="url(#buoyBall)">`
-    + buoyBandGeo(b, bands).map((e) =>
-        `<ellipse cx="${e.cx.toFixed(1)}" cy="${e.cy.toFixed(1)}" rx="${e.rx.toFixed(1)}" ry="${e.ry.toFixed(1)}" fill="${e.color}"/>`
-      ).join("")
-    + `</g></g>`;
-  if (b.nearD) s += `<path d="${b.nearD}" fill="none" stroke="#000" stroke-opacity="0.4" stroke-width="1.1"/>`;
-  if (b.ortho && b.ringD) s += `<path d="${b.ringD}" fill="none" stroke="#000" stroke-opacity="0.3" stroke-width="1"/>`;
-  return s;
-}
-
-// equally-spaced scan lines across the surface. Each line is split into
 // constant-width strokes carrying the color the surface has beneath them, so
 // it plots like a set of same-width pen strokes. Returns one path per color.
 // With hidden-line removal, a nearer row's silhouette (a per-column "floating
@@ -1789,16 +1673,6 @@ export default function App() {
         az: -12, size: 4, color: "#241a12", color2: "#d64127" }]);
   const removeObject = (id) => setObjects((os) => os.filter((o) => o.id !== id));
 
-  // floating object (red buoy)
-  const [objOn, setObjOn] = useState(true);
-  const [objX, setObjX] = useState(0);
-  const [objY, setObjY] = useState(14);
-  const [objSize, setObjSize] = useState(1.2);
-  const [objSub, setObjSub] = useState(0.5);        // fraction of hull under water
-  const [objRipple, setObjRipple] = useState(0.9);  // scattered-wave strength
-  const [objRippleScale, setObjRippleScale] = useState(0.8);
-  const [objBands, setObjBands] = useState(5);      // cel-shade tone count
-  const [objLight, setObjLight] = useState(325);    // light direction, degrees
   const [eLo, setELo] = useState(-5), [eHi, setEHi] = useState(33);
   const [autoFit, setAutoFit] = useState(false);
   const [penMode, setPenMode] = useState(false);
@@ -1856,10 +1730,6 @@ export default function App() {
     advanced: [advanced, setAdvanced], emitters: [emitters, setEmitters],
     halfW: [halfW, setHalfW], yNear: [yNear, setYNear], yFar: [yFar, setYFar],
     reflMag: [reflMag, setReflMag], objects: [objects, setObjects],
-    objOn: [objOn, setObjOn], objX: [objX, setObjX], objY: [objY, setObjY],
-    objSize: [objSize, setObjSize], objSub: [objSub, setObjSub],
-    objRipple: [objRipple, setObjRipple], objRippleScale: [objRippleScale, setObjRippleScale],
-    objBands: [objBands, setObjBands], objLight: [objLight, setObjLight],
     eLo: [eLo, setELo], eHi: [eHi, setEHi], autoFit: [autoFit, setAutoFit],
     penMode: [penMode, setPenMode], penCount: [penCount, setPenCount],
     penRelief: [penRelief, setPenRelief], penWidth: [penWidth, setPenWidth],
@@ -2018,17 +1888,11 @@ export default function App() {
     t: animate ? tRef.current : manualTime,
     bands, perspective, eLo, eHi, zoom, panX, panY, smooth, coherence, rectOutput,
     surface3d, waveScale, bandFractions, fresOn, fresBands, reflMag,
-    // waves scatter off the buoy's hull: a ring source pinned to the object,
-    // with a tight decay so the disturbance stays local
-    emitters: objOn && objRipple > 0
-      ? [...emitters, { id: "buoy", on: true, type: "point", x: objX, y: objY,
-          size: Math.max(0.3, objSize * objRippleScale), amp: objRipple * 1.5, decay: 0.28 }]
-      : emitters,
+    emitters,
   }), [effQuality, steep, pitchDeg, wavelength, strength, sharp, spread, bands, perspective,
        halfW, yNear, yFar, eLo, eHi, zoom, panX, panY, smooth, coherence, rectOutput, surface3d, waveScale,
        bandFractions, fresOn, fresBands, reflMag,
-       emitters, animate, speed, tRef.current, manualTime,
-       objOn, objX, objY, objSize, objRipple, objRippleScale]);
+       emitters, animate, speed, tRef.current, manualTime]);
 
   const is2d = mode === "paint2d";
   const presetColors = useMemo(
@@ -2134,14 +1998,6 @@ export default function App() {
   }, [penMode, penStyle, penCount, penSpacing, penRelief, penHidden, penEven, S, use2d, mode,
       envEffective, azSpan, colors1d, presetColors, fresOn, fresBands, mixDeep]);
 
-  // floating buoy: projected cap + waterline clip + mirrored reflection
-  const buoy = useMemo(() => {
-    if (!objOn) return null;
-    const fit = computeFit(S);
-    S._ems = S.emitters.filter((e) => e.on).map((e) => prepEmitter(e, S));
-    return buildBuoy(S, fit, { x: objX, y: objY, size: objSize, sub: objSub });
-  }, [objOn, objX, objY, objSize, objSub, S]);
-  const buoyShade = useMemo(() => makeBuoyBands(objBands, objLight), [objBands, objLight]);
 
   // auto-fit the elevation range to the actual reflected φ, so steep/near water
   // never silently clamps to one band. φ min/max don't depend on eLo/eHi, so
@@ -2155,14 +2011,13 @@ export default function App() {
   }, [autoFit, rng.lo, rng.hi, eLo, eHi]);
 
   const buildSvg = () => {
-    const buoyStr = buoy ? buoySvg(buoy, buoyShade) : "";
     const rollOpen = rollTf ? `<g transform="${rollTf}">` : `<g>`;
     if (penMode) {
       let body = `<rect width="${VB_W}" height="${VB_H}" fill="${bgFill}"/>` + rollOpen;
       penLines.forEach((l) => {
         body += `<path d="${l.d}" fill="none" stroke="${l.color}" stroke-width="${penWidth}" stroke-linecap="round" stroke-linejoin="round"/>`;
       });
-      body += buoyStr + `</g>`;
+      body += `</g>`;
       return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${VB_W} ${VB_H}">${body}</svg>`;
     }
     let body = `<rect width="${VB_W}" height="${VB_H}" fill="${bgFill}"/>` + rollOpen;
@@ -2189,7 +2044,7 @@ export default function App() {
         });
         body += `</g>`;
       });
-      body += buoyStr + `</g>`;
+      body += `</g>`;
       return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${VB_W} ${VB_H}"><defs>${defs}</defs>${body}</svg>`;
     }
     // layered paths, preset & 2D alike. With Fresnel on, the geometry is
@@ -2212,7 +2067,7 @@ export default function App() {
       });
       body += `</g>`;
     });
-    body += `</g>` + buoyStr + `</g>`;
+    body += `</g></g>`;
     return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${VB_W} ${VB_H}">${defs ? `<defs>${defs}</defs>` : ""}${body}</svg>`;
   };
   const saveSvg = (svg, name) => {
@@ -2427,35 +2282,6 @@ export default function App() {
                     ))}
                   </g>
                 </>
-              )}
-              {buoy && (
-                <g>
-                  <defs>
-                    {buoy.clipAbove && <clipPath id="buoyAboveP"><path d={buoy.clipAbove} /></clipPath>}
-                    {buoy.clipBelow && <clipPath id="buoyBelowP"><path d={buoy.clipBelow} /></clipPath>}
-                    <clipPath id="buoyBallP">
-                      <ellipse cx={buoy.cx} cy={buoy.cy} rx={buoy.rx} ry={buoy.ry} />
-                    </clipPath>
-                  </defs>
-                  {buoy.reflD && (
-                    <g clipPath={buoy.clipBelow ? "url(#buoyBelowP)" : undefined}>
-                      <path d={buoy.reflD} fill="#b03328" opacity={0.45} />
-                    </g>
-                  )}
-                  <g clipPath={buoy.clipAbove ? "url(#buoyAboveP)" : undefined}>
-                    <g clipPath="url(#buoyBallP)">
-                      {buoyBandGeo(buoy, buoyShade).map((e, i) => (
-                        <ellipse key={i} cx={e.cx} cy={e.cy} rx={e.rx} ry={e.ry} fill={e.color} />
-                      ))}
-                    </g>
-                  </g>
-                  {buoy.nearD && (
-                    <path d={buoy.nearD} fill="none" stroke="#000" strokeOpacity={0.4} strokeWidth={1.1} />
-                  )}
-                  {buoy.ortho && buoy.ringD && (
-                    <path d={buoy.ringD} fill="none" stroke="#000" strokeOpacity={0.3} strokeWidth={1} />
-                  )}
-                </g>
               )}
               </g>
             </svg>
@@ -2795,39 +2621,6 @@ export default function App() {
               )}
             </div>
 
-            <div style={panel}>
-              <div style={heading}>Floating buoy (in frame)</div>
-              <Toggle label="Red buoy" value={objOn} onChange={setObjOn} />
-              {objOn && (
-                <div style={{ marginTop: 6 }}>
-                  <Slider label="position ← →" value={objX} min={-halfW + 1} max={halfW - 1} step={0.5}
-                    onChange={setObjX} fmt={(v) => (v === 0 ? "center" : v.toFixed(1))} />
-                  <Slider label="distance (near → far)" value={objY} min={5} max={yFar - 3} step={0.5}
-                    onChange={setObjY} fmt={(v) => v.toFixed(1)} />
-                  <Slider label="size" value={objSize} min={0.4} max={3} step={0.1}
-                    onChange={setObjSize} fmt={(v) => v.toFixed(1)} />
-                  <Slider label="submersion" value={objSub} min={0.08} max={0.92} step={0.02}
-                    onChange={setObjSub} fmt={(v) => Math.round(v * 100) + "%"} />
-                  <Slider label="shading bands" value={objBands} min={2} max={8} step={1}
-                    onChange={setObjBands} />
-                  <Slider label="light direction" value={objLight} min={0} max={360} step={5}
-                    onChange={setObjLight}
-                    fmt={(v) => v + "° " + ["↑","↗","→","↘","↓","↙","←","↖"][Math.round(v / 45) % 8]} />
-                  <Slider label="scattered ripples" value={objRipple} min={0} max={2} step={0.05}
-                    onChange={setObjRipple} fmt={(v) => (v === 0 ? "off" : v.toFixed(2))} />
-                  {objRipple > 0 && (
-                    <Slider label="scattered wavelength" value={objRippleScale} min={0.3} max={2} step={0.05}
-                      onChange={setObjRippleScale} fmt={(v) => v.toFixed(2) + "×"} />
-                  )}
-                  <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5,
-                    fontFamily: "ui-monospace, monospace" }}>
-                    The hull below the waterline is hidden; the cap above it mirrors into the
-                    water. Scattered ripples are waves bouncing off the hull — they bend the
-                    color regions around the buoy and animate with the rest of the surface.
-                  </div>
-                </div>
-              )}
-            </div>
 
             <div style={panel}>
               <div style={heading}>Display</div>
