@@ -2,6 +2,7 @@ import React, { useState, useMemo, useRef, useEffect } from "react";
 import * as d3 from "d3";
 import { labelRegions, buildAdjacency, denoiseGrid, planCollapse } from "./paperStack";
 import { useUrlSync } from "./urlSettings";
+import { extractPhotoStrip } from "./photoPalette";
 
 /* ------------------------------------------------------------------ *
  *  Water-reflection contour studio
@@ -1816,6 +1817,12 @@ export default function App() {
   const [smooth, setSmooth] = useState(3);
   const [mode, setMode] = useState("preset"); // "preset" | "paint1d" | "paint2d"
   const [envColors, setEnvColors] = useState(() => seedEnv("Sunset Lake", ENV_N));
+  // photo -> palette: downscaled pixels kept in a ref so changing the color
+  // count re-extracts without re-reading the file
+  const photoRef = useRef(null);
+  const photoFileRef = useRef(null);
+  const [photoK, setPhotoK] = useState(5);
+  const [photoInfo, setPhotoInfo] = useState(null); // { name, swatches } | { error }
   const [env2d, setEnv2d] = useState(() => seedEnv2D("Sunset Lake", ENV2D_W, ENV2D_H));
   const [segEnv, setSegEnv] = useState(env2d);          // committed copy that drives the water
   const env2dRef = useRef(env2d); env2dRef.current = env2d;
@@ -1860,12 +1867,48 @@ export default function App() {
     penSpacing: [penSpacing, setPenSpacing], penEven: [penEven, setPenEven],
     bgColor: [bgColor, setBgColor], zoom: [zoom, setZoom], panX: [panX, setPanX],
     panY: [panY, setPanY], smooth: [smooth, setSmooth], mode: [mode, setMode],
+    envColors: [envColors, setEnvColors],
     azSpan: [azSpan, setAzSpan], coherence: [coherence, setCoherence],
     activeColor: [activeColor, setActiveColor], brushSize: [brushSize, setBrushSize],
     brushShape: [brushShape, setBrushShape],
   });
 
   const enter1d = () => { setEnvColors(seedEnv(palette, ENV_N)); setMode("paint1d"); };
+
+  // photo -> palette: quantize the photo to a few dominant colors and lift
+  // its top-to-bottom color profile into the paint-1D strip (top of the
+  // photo = far water = horizon). Runs fully client-side on a downscaled copy.
+  const applyPhoto = (img, k, name) => {
+    const res = extractPhotoStrip(img, k, ENV_N);
+    if (!res) { setPhotoInfo({ error: "Couldn't read that image." }); return; }
+    setEnvColors(res.strip);
+    setDeepColor(res.deep);
+    setMode("paint1d");
+    setPhotoInfo({ name, swatches: res.swatches });
+  };
+  const loadPhotoFile = (file) => {
+    if (!file) return;
+    const url = URL.createObjectURL(file);
+    const im = new Image();
+    im.onload = () => {
+      URL.revokeObjectURL(url);
+      const scale = Math.min(1, 128 / Math.max(im.width, im.height));
+      const w = Math.max(1, Math.round(im.width * scale));
+      const h = Math.max(1, Math.round(im.height * scale));
+      const cv = document.createElement("canvas");
+      cv.width = w; cv.height = h;
+      const ctx = cv.getContext("2d", { willReadFrequently: true });
+      ctx.drawImage(im, 0, 0, w, h);
+      const img = ctx.getImageData(0, 0, w, h);
+      photoRef.current = { img, name: file.name };
+      applyPhoto(img, photoK, file.name);
+    };
+    im.onerror = () => {
+      URL.revokeObjectURL(url);
+      setPhotoInfo({ error: "Couldn't decode that image — HEIC photos may need converting to JPEG first." });
+    };
+    im.src = url;
+  };
   const enter2d = () => {
     const seeded = seedEnv2D(palette, ENV2D_W, ENV2D_H);
     setEnv2d(seeded); setSegEnv(seeded); setMode("paint2d");
@@ -2530,6 +2573,42 @@ export default function App() {
                   border: "1px solid " + (mode === "paint2d" ? "#9a7a3a" : "#26313c") }}>
                   Paint 2D ✎ (panorama)
                 </button>
+              </div>
+
+              <div style={{ marginBottom: 12 }}>
+                <input ref={photoFileRef} type="file" accept="image/*" style={{ display: "none" }}
+                  onChange={(e) => { loadPhotoFile(e.target.files && e.target.files[0]); e.target.value = ""; }} />
+                <button style={{ ...miniBtn, width: "100%" }}
+                  onClick={() => photoFileRef.current && photoFileRef.current.click()}>
+                  From photo… 📷
+                </button>
+                {photoInfo && photoInfo.error && (
+                  <div style={{ fontSize: 9.5, color: "#c96f5f", marginTop: 6, lineHeight: 1.5,
+                    fontFamily: "ui-monospace, monospace" }}>
+                    {photoInfo.error}
+                  </div>
+                )}
+                {photoInfo && !photoInfo.error && (
+                  <div style={{ marginTop: 10 }}>
+                    <Slider label="Photo colors" value={photoK} min={3} max={7} step={1}
+                      onChange={(v) => { setPhotoK(v);
+                        const p = photoRef.current; if (p) applyPhoto(p.img, v, p.name); }} />
+                    <div style={{ display: "flex", gap: 4, marginBottom: 6 }}>
+                      {photoInfo.swatches.map((c, i) => (
+                        <button key={i} title={c + " — set as paint color"}
+                          onClick={() => setActiveColor(c)}
+                          style={{ flex: 1, height: 22, borderRadius: 5, cursor: "pointer",
+                            background: c, border: "1px solid #26313c" }} />
+                      ))}
+                    </div>
+                    <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5,
+                      fontFamily: "ui-monospace, monospace" }}>
+                      {photoInfo.name} → paint-1D strip: top of the photo lands at the horizon,
+                      bottom at the zenith end, band widths follow the photo. Click a swatch to
+                      make it the paint color for touch-ups.
+                    </div>
+                  </div>
+                )}
               </div>
 
               <Slider label="Reflection detail (angular zoom)" value={reflMag} min={0.5} max={10}
