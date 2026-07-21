@@ -90,6 +90,17 @@ function labToHex(c) {
   return d3.lab(c[0], c[1], c[2]).formatHex();
 }
 
+function quantize(image, k) {
+  const { data, width: w, height: h } = image;
+  const labs = new Array(w * h);
+  for (let i = 0; i < w * h; i++) {
+    const c = d3.lab(d3.rgb(data[i * 4], data[i * 4 + 1], data[i * 4 + 2]));
+    labs[i] = [c.l, c.a, c.b];
+  }
+  const { centers, labels } = kmeansLab(labs, k);
+  return { labs, centers, labels };
+}
+
 // image: { data: RGBA byte array, width, height } (an ImageData works).
 // k: number of dominant colors. n: cells in the output strip.
 // Returns:
@@ -97,15 +108,13 @@ function labToHex(c) {
 //   swatches - the k cluster hexes ordered horizon -> zenith by mean row
 //   deep     - the darkest cluster hex (a ready-made deep-water color)
 export function extractPhotoStrip(image, k = 5, n = 64) {
-  const { data, width: w, height: h } = image;
+  const { width: w, height: h } = image;
   if (!w || !h) return null;
+  const { centers, labels } = quantize(image, k);
+  return buildStrip(centers, labels, w, h, n);
+}
 
-  const labs = new Array(w * h);
-  for (let i = 0; i < w * h; i++) {
-    const c = d3.lab(d3.rgb(data[i * 4], data[i * 4 + 1], data[i * 4 + 2]));
-    labs[i] = [c.l, c.a, c.b];
-  }
-  const { centers, labels } = kmeansLab(labs, k);
+function buildStrip(centers, labels, w, h, n) {
   const nc = centers.length;
 
   // per-row cluster shares
@@ -157,4 +166,101 @@ export function extractPhotoStrip(image, k = 5, n = 64) {
   for (let c = 1; c < centers.length; c++) if (centers[c][0] < centers[deep][0]) deep = c;
 
   return { strip, swatches, deep: hexes[deep] };
+}
+
+// ---- scene statistics ----------------------------------------------
+// The color-blob geometry of a water photo carries the scene parameters:
+//   - mean horizontal run length of the quantized colors = blob width
+//   - how much blobs shrink from the bottom (near) to the top (far) of
+//     the frame = perspective squash
+//   - horizontal vs vertical run length = how streaked the glints are
+//   - the dominant luminance-gradient orientation = ripple heading
+// All measured on the same k-means label grid the palette came from.
+
+function meanRunH(labels, w, rows) {
+  let runs = 0, rowsUsed = 0;
+  for (const r of rows) {
+    let t = 1;
+    for (let x = 1; x < w; x++) if (labels[r * w + x] !== labels[r * w + x - 1]) t++;
+    runs += t; rowsUsed++;
+  }
+  return rowsUsed ? (rowsUsed * w) / runs : w;
+}
+
+function meanRunV(labels, w, h) {
+  let runs = 0;
+  for (let x = 0; x < w; x++) {
+    let t = 1;
+    for (let r = 1; r < h; r++) if (labels[r * w + x] !== labels[(r - 1) * w + x]) t++;
+    runs += t;
+  }
+  return (w * h) / runs;
+}
+
+export function measurePhotoStats(labs, labels, w, h) {
+  const third = Math.max(1, Math.floor(h / 3));
+  const rows = (a, b) => { const out = []; for (let r = a; r < b; r++) out.push(r); return out; };
+  const runTop = meanRunH(labels, w, rows(0, third));
+  const runBot = meanRunH(labels, w, rows(h - third, h));
+  const runAll = meanRunH(labels, w, rows(0, h));
+  const runV = meanRunV(labels, w, h);
+
+  // structure tensor of L: dominant gradient orientation + its coherence.
+  // Horizontal glint streaks -> near-vertical gradients -> angle ~ 90°.
+  let sxx = 0, syy = 0, sxy = 0;
+  for (let r = 1; r < h - 1; r++) {
+    for (let x = 1; x < w - 1; x++) {
+      const gx = labs[r * w + x + 1][0] - labs[r * w + x - 1][0];
+      const gy = labs[(r + 1) * w + x][0] - labs[(r - 1) * w + x][0];
+      sxx += gx * gx; syy += gy * gy; sxy += gx * gy;
+    }
+  }
+  let angle = (0.5 * Math.atan2(2 * sxy, sxx - syy) * 180) / Math.PI; // (-90, 90]
+  if (angle < 0) angle += 180;                                        // [0, 180)
+  const denom = sxx + syy;
+  const coherence = denom > 0
+    ? Math.sqrt((sxx - syy) * (sxx - syy) + 4 * sxy * sxy) / denom : 0;
+
+  return {
+    blobFrac: runBot / w,                                 // near-blob width, frame fraction
+    growth: Math.max(1, runBot / Math.max(1, runTop)),    // near / far blob size
+    aniso: runAll / Math.max(0.5, runV),                  // streakiness
+    angle,                                                // gradient orientation, degrees
+    coherence,                                            // 0 = isotropic, 1 = one direction
+  };
+}
+
+// Map the measured statistics onto the studio's scene settings. These are
+// calibrated heuristics, not an inversion: several parameter combinations
+// produce the same statistics, and any of them is a valid match.
+export function sceneFromStats(stats, { zoom = 5 } = {}) {
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  // default scene: λ 2.8 at zoom 5 reads as ~20%-of-frame blobs near the
+  // bottom edge; scale λ from there, correcting for the current focal zoom
+  const wavelength = clamp(2.8 * (stats.blobFrac / 0.2) * (zoom / 5), 0.6, 7);
+  const strength = clamp(0.3 + 0.18 * stats.aniso, 0.35, 1);
+  const sharp = clamp(0.1 + 0.12 * (stats.aniso - 1), 0, 0.7);
+  // strong near-to-far shrink = grazing view; none = looking down
+  const pitchDeg = clamp(45 / Math.pow(stats.growth, 1.2), 6, 50);
+  // rotate the wave field only when the photo clearly leans one way;
+  // image y points down, ground y points away -> mirror around 90°
+  const dirOffset = stats.coherence > 0.25 ? (180 - stats.angle) - 90 : 0;
+  // a long straight swell reads as one coherent stripe direction; choppy
+  // directionless water (low coherence) should mute the swell emitter and
+  // leave the spread-out wind spectra to carry the texture
+  const swellMix = clamp((stats.coherence - 0.15) / 0.45, 0, 1);
+  return { wavelength, strength, sharp, pitchDeg, dirOffset, swellMix };
+}
+
+// one-stop analysis: palette strip + scene estimate from a single k-means
+export function analyzePhoto(image, k = 5, n = 64, opts = {}) {
+  const { width: w, height: h } = image;
+  if (!w || !h) return null;
+  const { labs, centers, labels } = quantize(image, k);
+  const stats = measurePhotoStats(labs, labels, w, h);
+  return {
+    ...buildStrip(centers, labels, w, h, n),
+    stats,
+    scene: sceneFromStats(stats, opts),
+  };
 }

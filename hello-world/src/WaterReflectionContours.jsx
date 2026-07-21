@@ -2,7 +2,7 @@ import React, { useState, useMemo, useRef, useEffect } from "react";
 import * as d3 from "d3";
 import { labelRegions, buildAdjacency, denoiseGrid, planCollapse } from "./paperStack";
 import { useUrlSync } from "./urlSettings";
-import { extractPhotoStrip } from "./photoPalette";
+import { analyzePhoto } from "./photoPalette";
 
 /* ------------------------------------------------------------------ *
  *  Water-reflection contour studio
@@ -1696,7 +1696,8 @@ export default function App() {
   const photoRef = useRef(null);
   const photoFileRef = useRef(null);
   const [photoK, setPhotoK] = useState(5);
-  const [photoInfo, setPhotoInfo] = useState(null); // { name, swatches } | { error }
+  const [photoMatch, setPhotoMatch] = useState(true); // also estimate waves + camera
+  const [photoInfo, setPhotoInfo] = useState(null); // { name, swatches, scene } | { error }
   const [env2d, setEnv2d] = useState(() => seedEnv2D("Sunset Lake", ENV2D_W, ENV2D_H));
   const [segEnv, setSegEnv] = useState(env2d);          // committed copy that drives the water
   const env2dRef = useRef(env2d); env2dRef.current = env2d;
@@ -1748,13 +1749,28 @@ export default function App() {
   // photo -> palette: quantize the photo to a few dominant colors and lift
   // its top-to-bottom color profile into the paint-1D strip (top of the
   // photo = far water = horizon). Runs fully client-side on a downscaled copy.
-  const applyPhoto = (img, k, name) => {
-    const res = extractPhotoStrip(img, k, ENV_N);
+  const applyPhoto = (img, k, name, match = photoMatch) => {
+    const res = analyzePhoto(img, k, ENV_N, { zoom });
     if (!res) { setPhotoInfo({ error: "Couldn't read that image." }); return; }
     setEnvColors(res.strip);
     setDeepColor(res.deep);
     setMode("paint1d");
-    setPhotoInfo({ name, swatches: res.swatches });
+    if (match) {
+      const sc = res.scene;
+      setWavelength(Math.round(sc.wavelength * 10) / 10);
+      setStrength(Math.round(sc.strength * 100) / 100);
+      setSharp(Math.round(sc.sharp * 20) / 20);
+      setPitchDeg(Math.round(sc.pitchDeg * 2) / 2);
+      // coherent photo (one streak direction): pull every emitter onto the
+      // estimated axis, swell included. Directionless chop: keep the default
+      // fan but mute the straight-crested swell, which would draw stripes
+      // the photo doesn't have.
+      setEmitters(DEFAULT_EMITTERS.map((e) => ({ ...e,
+        dir: Math.round((90 + sc.dirOffset + (1 - sc.swellMix) * (e.dir - 90) + 360) % 360),
+        amp: e.type === "swell"
+          ? Math.round(e.amp * (0.15 + 0.85 * sc.swellMix) * 100) / 100 : e.amp })));
+    }
+    setPhotoInfo({ name, swatches: res.swatches, scene: res.scene });
   };
   const loadPhotoFile = (file) => {
     if (!file) return;
@@ -2427,11 +2443,22 @@ export default function App() {
                             background: c, border: "1px solid #26313c" }} />
                       ))}
                     </div>
-                    <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5,
+                    <Toggle label="Match waves & camera" value={photoMatch}
+                      onChange={(v) => { setPhotoMatch(v);
+                        const p = photoRef.current; if (v && p) applyPhoto(p.img, photoK, p.name, true); }} />
+                    <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5, marginTop: 6,
                       fontFamily: "ui-monospace, monospace" }}>
                       {photoInfo.name} → paint-1D strip: top of the photo lands at the horizon,
                       bottom at the zenith end, band widths follow the photo. Click a swatch to
                       make it the paint color for touch-ups.
+                      {photoInfo.scene && photoMatch && (
+                        <> Estimated from the blob shapes: λ {photoInfo.scene.wavelength.toFixed(1)},
+                        strength {photoInfo.scene.strength.toFixed(2)},
+                        pitch {photoInfo.scene.pitchDeg.toFixed(0)}°
+                        {photoInfo.scene.dirOffset
+                          ? <>, heading {photoInfo.scene.dirOffset > 0 ? "+" : ""}
+                            {photoInfo.scene.dirOffset.toFixed(0)}°</> : null}.</>
+                      )}
                     </div>
                   </div>
                 )}
