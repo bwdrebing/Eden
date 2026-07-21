@@ -1761,6 +1761,10 @@ export default function App() {
       setStrength(Math.round(sc.strength * 100) / 100);
       setSharp(Math.round(sc.sharp * 20) / 20);
       setPitchDeg(Math.round(sc.pitchDeg * 2) / 2);
+      // the photo's texture is carried by the reflected colors, not by
+      // geometric relief — exaggerated 3D wave height only warps the frame
+      // and obscures how well the match landed
+      setWaveScale(1);
       // coherent photo (one streak direction): pull every emitter onto the
       // estimated axis, swell included. Directionless chop: keep the default
       // fan but mute the straight-crested swell, which would draw stripes
