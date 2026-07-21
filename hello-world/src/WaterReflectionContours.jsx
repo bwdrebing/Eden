@@ -80,6 +80,26 @@ const SWATCHES = [
   "#cfe1ef", "#9cc3e8", "#6a96c8", "#3f5f93", "#27406b", "#141d33",
 ];
 
+// normalize a css color to a canonical lowercase hex for dedup/comparison
+function normHex(c) {
+  const col = d3.color(c);
+  return col ? col.formatHex().toLowerCase() : null;
+}
+const SWATCH_SET = new Set(SWATCHES.map(normHex));
+
+// append one or more colors to the running list of custom chits, dropping
+// anything unparseable, already a built-in swatch, or already pinned.
+function mergeChits(existing, colors) {
+  const seen = new Set(existing.map(normHex));
+  const out = existing.slice();
+  for (const c of Array.isArray(colors) ? colors : [colors]) {
+    const h = normHex(c);
+    if (!h || SWATCH_SET.has(h) || seen.has(h)) continue;
+    seen.add(h); out.push(h);
+  }
+  return out;
+}
+
 // ---- surface slope & elevation field -------------------------------
 // Real water is a superposition of straight-crested waves over many
 // wavelengths. We work with the surface *slope* (which sets the normal,
@@ -1831,6 +1851,11 @@ export default function App() {
   // keeps the same per-ripple detail as the 1D path out of the box
   const [coherence, setCoherence] = useState(0);
   const [activeColor, setActiveColor] = useState("#11324a");
+  // Custom paint chits — extra swatches pinned by hand or lifted from a photo
+  // palette. Session-lived (not serialized), deduped against the built-in
+  // SWATCHES and each other so a chit stays easy to re-select all session.
+  const [customChits, setCustomChits] = useState([]);
+  const addChits = (colors) => setCustomChits((prev) => mergeChits(prev, colors));
   const [brushSize, setBrushSize] = useState(1);       // radius in cells
   const [brushShape, setBrushShape] = useState("round"); // round | square | diamond
   const [svgOut, setSvgOut] = useState(null);
@@ -1885,6 +1910,9 @@ export default function App() {
     setDeepColor(res.deep);
     setMode("paint1d");
     setPhotoInfo({ name, swatches: res.swatches });
+    // pin every extracted color as a custom chit so the whole photo palette
+    // stays one click away for the rest of the session
+    addChits(res.swatches);
   };
   const loadPhotoFile = (file) => {
     if (!file) return;
@@ -2654,6 +2682,14 @@ export default function App() {
                         style={{ width: 24, height: 24, borderRadius: 5, background: c, cursor: "pointer",
                           padding: 0, border: activeColor === c ? "2px solid #fff" : "1px solid #00000055" }} />
                     ))}
+                    {customChits.map((c) => (
+                      <button key={c} onClick={() => setActiveColor(c)}
+                        onContextMenu={(e) => { e.preventDefault();
+                          setCustomChits((prev) => prev.filter((x) => x !== c)); }}
+                        title={c + " — custom chit (right-click to remove)"}
+                        style={{ width: 24, height: 24, borderRadius: 5, background: c, cursor: "pointer",
+                          padding: 0, border: normHex(activeColor) === c ? "2px solid #fff" : "1px solid #00000055" }} />
+                    ))}
                     <label style={{ width: 24, height: 24, borderRadius: 5, cursor: "pointer",
                       border: "1px solid #44525e", position: "relative", overflow: "hidden",
                       background: activeColor, display: "inline-block" }}>
@@ -2661,6 +2697,12 @@ export default function App() {
                         onChange={(e) => setActiveColor(e.target.value)}
                         style={{ position: "absolute", inset: -4, opacity: 0, cursor: "pointer" }} />
                     </label>
+                    <button onClick={() => addChits(activeColor)}
+                      title="Pin the current color as a custom chit for this session"
+                      style={{ width: 24, height: 24, borderRadius: 5, background: "#1a232c", cursor: "pointer",
+                        padding: 0, color: "#9fb0c0", fontSize: 16, lineHeight: 1,
+                        border: "1px dashed #44525e", display: "inline-flex",
+                        alignItems: "center", justifyContent: "center" }}>+</button>
                   </div>
                   <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 8, flexWrap: "wrap" }}>
                     <span style={{ fontSize: 10.5, color: "#6d808f", fontFamily: "ui-monospace, monospace",
