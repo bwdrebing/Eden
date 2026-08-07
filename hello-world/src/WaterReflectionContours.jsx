@@ -700,6 +700,61 @@ function buildPenLines(S, fit, colorAt, opts) {
   return [...byColor.entries()].map(([color, subs]) => ({ color, d: subs.join("") }));
 }
 
+// ---- 3D solid surface (filled, hidden-surface-correct) ------------
+// The stacked color layers (buildSegmentation / buildGeometry) are ordered by
+// the reflected backdrop's *elevation* — a 2D seam-avoidance trick with no
+// notion of camera depth. Lift that stack onto tall waves and the grazing
+// back-face reflections (the bottom of the backdrop) get painted LAST, on top
+// of everything, so a wave's far side bleeds THROUGH the crest in front of it:
+// the taller the wave, the MORE of the "backside" you see. This builder
+// instead tessellates the lifted surface into per-row color bands and paints
+// them strictly far-to-near, so a nearer crest's band overpaints whatever it
+// occludes — genuine hidden-surface removal for the filled 3D water. `colorAt`
+// returns the already-(Fresnel-)mixed fill color at a ground point, exactly as
+// the pen-plot path feeds it.
+function buildSurfaceBands(S, fit, colorAt) {
+  const nx = S.nx, ny = S.ny, stride = nx + 1;
+  // project every grid vertex once, lifted to the wave height
+  const PX = new Float64Array(stride * (ny + 1)), PY = new Float64Array(stride * (ny + 1));
+  for (let j = 0; j <= ny; j++) {
+    for (let i = 0; i <= nx; i++) {
+      const [gx, gy] = cell2ground(i, j, S);
+      const gz = clampLift(heightAt(gx, gy, S) * S.waveScale, S, fit);
+      const [sx, sy] = penProject(gx, gy, gz, S, fit);
+      const q = j * stride + i; PX[q] = sx; PY[q] = sy;
+    }
+  }
+  // color of each cell, sampled at its center
+  const cellCol = new Array(nx * ny);
+  for (let j = 0; j < ny; j++) {
+    for (let i = 0; i < nx; i++) {
+      const [gx, gy] = cell2ground(i + 0.5, j + 0.5, S);
+      cellCol[j * nx + i] = colorAt(gx, gy);
+    }
+  }
+  // Far rows first (larger gy is farther from the camera), so the nearer rows
+  // paint last and win. Each row's cells are merged into runs of one color and
+  // emitted as a single quad-strip band (top edge on grid line j, bottom edge
+  // on line j+1) — neighbouring bands share exact vertices, so the surface
+  // tiles without cracks.
+  const bands = [];
+  for (let j = ny - 1; j >= 0; j--) {
+    const top = j * stride, bot = (j + 1) * stride, base = j * nx;
+    let runStart = 0;
+    for (let i = 1; i <= nx; i++) {
+      if (i === nx || cellCol[base + i] !== cellCol[base + runStart]) {
+        let d = "M" + PX[top + runStart].toFixed(1) + " " + PY[top + runStart].toFixed(1);
+        for (let c = runStart + 1; c <= i; c++) d += " L" + PX[top + c].toFixed(1) + " " + PY[top + c].toFixed(1);
+        for (let c = i; c >= runStart; c--) d += " L" + PX[bot + c].toFixed(1) + " " + PY[bot + c].toFixed(1);
+        d += " Z";
+        bands.push({ color: cellCol[base + runStart], d });
+        runStart = i;
+      }
+    }
+  }
+  return bands;
+}
+
 // ---- concentric / "wood-knot" pen style ---------------------------
 // chamfer distance transform: 0 outside the region, growing inward
 function distTransform(mask, nx, ny) {
@@ -1269,7 +1324,7 @@ function buildSegmentation(S, env2d, azSpan) {
 export {
   buildGeometry, buildSegmentation, envFromRows, stampObjects,
   paletteStops, paletteColorAt, DERIVED_ENV_H, ENV2D_W, DEFAULT_EMITTERS,
-  computeFit, cell2ground, heightAt, clampLift, penProject,
+  computeFit, cell2ground, heightAt, clampLift, penProject, buildSurfaceBands,
 };
 
 // ---- layered-paper stack export -----------------------------------
@@ -2107,6 +2162,12 @@ export default function App() {
   const layers = use2d ? (seg.layers || null)
     : geom.ds.map((d, k) => ({ d, color: isobandColors[k + 1] }));
   const rng = use2d ? seg : geom;
+  // 3D "solid" surface: paint the lifted water as depth-sorted filled bands so
+  // near crests correctly occlude the wave's far side (no more seeing the
+  // backside through a tall wave). Replaces the elevation-ordered color layers,
+  // which have no depth ordering once lifted. Pen mode has its own z-buffered
+  // hidden-line path, so this only covers the filled-region renderer.
+  const solid3d = !penMode && surface3d && perspective;
 
   // Fresnel depth bands: clip paths + the color mixer for each band
   const mixDeep = useMemo(
@@ -2174,6 +2235,52 @@ export default function App() {
   }, [penMode, penStyle, penCount, penSpacing, penRelief, penHidden, penEven, S, use2d, mode,
       envEffective, azSpan, colors1d, presetColors, fresOn, fresBands, mixDeep]);
 
+  // depth-sorted filled bands for the 3D solid surface (same per-point color
+  // the pen path uses, so Fresnel etc. stay baked in), replacing the
+  // depth-agnostic color layers when the water is lifted into 3D
+  const surfaceBands = useMemo(() => {
+    if (!solid3d) return null;
+    const fit = computeFit(S);
+    const mag = S.reflMag || 1;
+    S._ems = S.emitters.filter((e) => e.on).map((e) => prepEmitter(e, S));
+    const deepMix = (c, cosI) => {
+      if (!fresOn) return c;
+      const b = Math.min(fresBands - 1, Math.floor(fresnelDeepW(cosI) * fresBands));
+      return mixDeep(c, b);
+    };
+    let colorAt;
+    if (use2d) {
+      const { w: EW, h: EH, cells } = envEffective;
+      const az = azSpan;
+      colorAt = (gx, gy) => {
+        const R = reflectAt(gx, gy, S);
+        const phi = Math.asin(Math.max(-1, Math.min(1, R[2]))) * 180 / Math.PI;
+        let psi = Math.atan2(R[0], R[1]) * 180 / Math.PI; psi = psi < -az ? -az : psi > az ? az : psi;
+        let v = magFrac((phi - S.eLo) / ((S.eHi - S.eLo) || 1), mag); v = v < 0 ? 0 : v > 1 ? 1 : v;
+        let u = magFrac((psi + az) / (2 * az), mag); u = u < 0 ? 0 : u > 1 ? 1 : u;
+        const c = cells[Math.min(EH - 1, Math.floor(v * EH)) * EW + Math.min(EW - 1, Math.floor(u * EW))];
+        return deepMix(c, R[3]);
+      };
+    } else {
+      const cols = mode === "paint1d" ? colors1d : presetColors;
+      const NB = cols.length;
+      const fr = S.bandFractions;
+      colorAt = (gx, gy) => {
+        const R = reflectAt(gx, gy, S);
+        const phi = Math.asin(Math.max(-1, Math.min(1, R[2]))) * 180 / Math.PI;
+        let v = magFrac((phi - S.eLo) / ((S.eHi - S.eLo) || 1), mag); v = v < 0 ? 0 : v >= 1 ? 0.999999 : v;
+        let c;
+        if (fr) {
+          let idx = 0;
+          for (const f of fr) { if (v >= f) idx++; else break; }
+          c = cols[idx] || cols[0];
+        } else c = cols[Math.floor(v * NB)] || cols[0];
+        return deepMix(c, R[3]);
+      };
+    }
+    return buildSurfaceBands(S, fit, colorAt);
+  }, [solid3d, S, use2d, mode, envEffective, azSpan, colors1d, presetColors, fresOn, fresBands, mixDeep]);
+
   // floating buoy: projected cap + waterline clip + mirrored reflection
   const buoy = useMemo(() => {
     if (!objOn) return null;
@@ -2201,6 +2308,16 @@ export default function App() {
       let body = `<rect width="${VB_W}" height="${VB_H}" fill="${bgFill}"/>` + rollOpen;
       penLines.forEach((l) => {
         body += `<path d="${l.d}" fill="none" stroke="${l.color}" stroke-width="${penWidth}" stroke-linecap="round" stroke-linejoin="round"/>`;
+      });
+      body += buoyStr + `</g>`;
+      return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${VB_W} ${VB_H}">${body}</svg>`;
+    }
+    if (solid3d) {
+      // depth-sorted filled bands, painted far-to-near. A matching-color
+      // hairline seals the antialiased seams between adjacent bands.
+      let body = `<rect width="${VB_W}" height="${VB_H}" fill="${bgFill}"/>` + rollOpen;
+      surfaceBands.forEach((l) => {
+        body += `<path d="${l.d}" fill="${l.color}" stroke="${l.color}" stroke-width="0.6" stroke-linejoin="round"/>`;
       });
       body += buoyStr + `</g>`;
       return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${VB_W} ${VB_H}">${body}</svg>`;
@@ -2410,6 +2527,12 @@ export default function App() {
                   <path key={i} d={l.d} fill="none" stroke={l.color}
                     strokeWidth={penWidth} strokeLinecap="round" strokeLinejoin="round" />
                 ))
+              ) : solid3d ? (
+                // depth-sorted filled bands (far-to-near); hairline seals seams
+                surfaceBands.map((l, i) => (
+                  <path key={i} d={l.d} fill={l.color} stroke={l.color}
+                    strokeWidth={0.6} strokeLinejoin="round" />
+                ))
               ) : use2d && !layers ? (
                 <>
                   <defs>
@@ -2502,6 +2625,7 @@ export default function App() {
             <div style={{ position: "absolute", left: 12, bottom: 10, fontSize: 10.5,
               color: "#6d808f", fontFamily: "ui-monospace, monospace", letterSpacing: 0.5 }}>
               {penMode ? `${penStyle === "rings" ? "rings" : penCount + " lines"} · ${penLines.length} pens${S.perspective && penRelief > 0 ? " · 3D" : ""}${penHidden ? " · hidden-line" : ""}`
+                : solid3d ? `${surfaceBands.length} bands · ${S.nx}×${S.ny} sample grid · 3D`
                 : `${regionCount} regions · ${S.nx}×${S.ny} sample grid${surface3d && perspective ? " · 3D" : ""}`}
             </div>
             <button onClick={() => setCamDrag((v) => !v)}
