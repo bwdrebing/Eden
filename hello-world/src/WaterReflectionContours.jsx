@@ -1027,6 +1027,18 @@ function buildGeometry(S) {
       if (v < lo) lo = v; if (v > hi) hi = v;
     }
   }
+  // "edge ripple" (coherence): box-blur the reflected-elevation field in water
+  // space, exactly as the 2D/panorama path does. Without this the 1D path
+  // silently ignored the slider, so the whole surface snapped between sharp
+  // (no object) and smoothed (an object forces the 2D path) — the reflection
+  // far from the object visibly degrading even though nothing there changed.
+  // lo/hi stay the raw range (computed above), so auto-fit is unaffected.
+  const passes = Math.max(0, S.coherence | 0);
+  if (passes) {
+    const tmp = new Float64Array(nx * ny);
+    blurField(values, nx, ny, tmp, passes);
+    if (wVals) blurField(wVals, nx, ny, tmp, passes);
+  }
   // banded palettes carry their own (non-uniform) band fractions — this is
   // what lets a 2%-thick ink strip survive regardless of the band count.
   // Reflection detail narrows the window the boundaries sit in (values stay
@@ -2875,6 +2887,15 @@ export default function App() {
               <div style={heading}>Display</div>
               <Slider label="Edge smoothing" value={smooth} min={0} max={4} step={1}
                 onChange={setSmooth} fmt={(v) => (v === 0 ? "off (crisp)" : v + "×")} />
+              <Slider label="edge ripple" value={coherence} min={0} max={8} step={1}
+                onChange={setCoherence}
+                fmt={(v) => (v === 0 ? "sharp" : v <= 2 ? "rippled" : v <= 5 ? "smooth" : "broad")} />
+              {coherence > 0 && (
+                <div style={{ fontSize: 9.5, color: "#6d808f", marginTop: -4, marginBottom: 4,
+                  lineHeight: 1.5, fontFamily: "ui-monospace, monospace" }}>
+                  Blurs the reflection everywhere — sharp (0) keeps every wavelet's ripple.
+                </div>
+              )}
               <Toggle label="Grazing perspective" value={perspective} onChange={setPerspective} />
               {perspective && (
                 <Toggle label="Rectangular output (fill frame)" value={rectOutput} onChange={setRectOutput} />
