@@ -113,3 +113,35 @@ test("the de-jitter blur is opt-in: coherence 0 must not smooth", () => {
   const nCalm = subpaths(calm.layers.map((l) => l.d));
   expect(nSharp).toBeGreaterThan(nCalm);
 });
+
+// The 1D (no-object) path must honor "edge ripple" (coherence) the same way
+// the 2D path does. Before the fix it ignored the slider, so the water snapped
+// between sharp (no object) and smoothed (an object forces the 2D path) — the
+// reflection degrading far from the object even where nothing changed.
+test("edge ripple applies to the 1D path too (no object present)", () => {
+  const sharp = buildGeometry({ ...baseS(), coherence: 0 });
+  const calm = buildGeometry({ ...baseS(), coherence: 4 });
+  const nSharp = subpaths(sharp.ds);
+  const nCalm = subpaths(calm.ds);
+  expect(nSharp).toBeGreaterThan(nCalm); // blur now genuinely reduces 1D detail
+});
+
+test("adding an object does not change the reflection where it isn't", () => {
+  // at a shared coherence, the whole-surface 1D render and the object-forced 2D
+  // render must carry the same amount of ripple structure: the object is local,
+  // not a global quality switch. Checked at a non-zero coherence, the setting
+  // that used to diverge between the two paths.
+  const COH = 3;
+  const noObj = buildGeometry({ ...baseS(), coherence: COH });
+  const objects = [
+    { id: 1, on: true, type: "sailboat", az: 14, size: 8, color: "#c2521f", color2: "#efe9d9" },
+  ];
+  const env = stampObjects(stripedEnv(), objects, AZ, 0, 20);
+  const withObj = buildSegmentation({ ...baseS(), coherence: COH }, env, AZ);
+  const n1 = subpaths(noObj.ds);
+  const n2 = subpaths(withObj.layers.map((l) => l.d));
+  // the object adds a little (its own silhouette + ink rim) but must not
+  // collapse the surrounding ripples: parity to within the same band the 1D/2D
+  // fidelity tests use.
+  expect(n2).toBeGreaterThanOrEqual(0.8 * n1);
+});
