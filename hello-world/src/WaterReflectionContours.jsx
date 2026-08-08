@@ -766,13 +766,32 @@ function buildDepthBuffer(S, fit, relief, threeD, BW, BH) {
 // front of it (the taller the wave, the more "backside" you saw). Doing the
 // hidden-surface removal geometrically on the vector layers is the hard part;
 // doing it on a raster is easy. So we rasterize the lifted surface into a
-// screen-space z-buffer that keeps, at every pixel, the SCALAR of the
-// front-most surface point (reflected elevation, a colour rank, the Fresnel
-// weight…). Contouring that already-occluded raster with the very same
-// marching-squares + Chaikin + bezier pipeline the flat modes use gives back
-// smooth, sub-pixel region outlines — but now their silhouettes are the real
-// wave crests, so nothing behind a crest leaks through. One scalar field in,
-// one set of nested smooth region paths out.
+// screen-space z-buffer and contour what it sees with the very same
+// marching-squares + Chaikin + bezier pipeline the flat modes use: the region
+// silhouettes become the real wave crests, so nothing behind a crest leaks
+// through.
+//
+// Two things decide whether the result still looks like the flat modes —
+// smooth color regions — rather than a faceted polygon soup:
+//
+//  * WHAT the raster carries. Keeping the scalar of the front-most point and
+//    interpolating it across each projected grid triangle sounds free, but the
+//    sample grid is uniform in GROUND space: under a grazing camera one
+//    near-field cell covers a tenth of the frame. A linearly interpolated
+//    scalar makes each such cell contribute one straight facet, and the Chaikin
+//    pass — which in raster space works at pixel scale, not cell scale — can't
+//    round a facet that big. So the raster keeps the perspective-correct GRID
+//    COORDINATE of the front-most point instead, and scalars are reconstructed
+//    from the grid with a Catmull-Rom kernel: a C1 field, curved inside a cell.
+//
+//  * WHICH scalar. For preset/1D palettes it's the reflected elevation,
+//    continuous by construction. A painted panorama has no such scalar: any
+//    per-cell quantity (a color index, a color rank) is a step function of the
+//    panorama grid, and contouring it snaps every boundary back onto that grid
+//    — precisely the staircase buildSegmentation goes to such lengths to avoid.
+//    So the panorama path reuses buildSegmentation's own construction: the
+//    per-color signed distance fields, composed through the reflection and
+//    contoured at zero (buildSurface3DPanorama).
 
 // smooth a raster-space contour multipolygon into a bezier path in viewBox
 // coordinates (the raster is BW×BH, the viewBox VB_W×VB_H)
@@ -793,51 +812,61 @@ function contourToScreenPath(multi, BW, BH, iters) {
   return d;
 }
 
-// Rasterize the lifted surface once, carrying up to two scalar fields (the
-// band/rank scalar and, optionally, the Fresnel deep-water weight), then
-// contour each field at its thresholds. Returns smooth screen-space region
-// paths (nested upper sets, one per threshold) plus the occluded Fresnel
-// bands. `scalarAt`/`fresAt` are sampled at ground points; uncovered pixels
-// sit below every threshold so regions stop exactly at the wave silhouette.
-const SURF_SENTINEL = -1e9;
-function buildSurface3D(S, fit, opts) {
-  const { scalarAt, thresholds, fresAt, fresThresholds, gN = 140, BW = 420 } = opts;
+// Catmull-Rom through four consecutive samples (t in [0,1] between b and c)
+function cr4(a, b, c, d, t) {
+  return b + 0.5 * t * (c - a + t * (2 * a - 5 * b + 4 * c - d + t * (3 * (b - c) + d - a)));
+}
+
+// Z-buffer the lifted surface into a BW×BH raster. Every pixel keeps the
+// perspective-correct SURFACE-GRID COORDINATE of the front-most point, so any
+// quantity sampled on that grid can be reconstructed at the visible surface,
+// already occluded. `cov` marks the pixels the water reaches; `sil` is its
+// signed distance field in raster pixels, which lets a region end half a pixel
+// out from the last covered pixel instead of tracing that pixel's square edge.
+function rasterizeSurface(S, fit, gN, BW) {
   const BH = Math.max(2, Math.round(BW * VB_H / VB_W));
-  const stride = gN + 1, NV = stride * stride;
-  const SX = new Float64Array(NV), SY = new Float64Array(NV), DP = new Float64Array(NV);
-  const VS = new Float64Array(NV), VF = fresAt ? new Float64Array(NV) : null;
+  const stride = gN + 1, NV = stride * stride, NP = BW * BH;
+  const GX = new Float64Array(NV), GY = new Float64Array(NV);
+  const SX = new Float64Array(NV), SY = new Float64Array(NV), QW = new Float64Array(NV);
   for (let j = 0; j <= gN; j++) for (let i = 0; i <= gN; i++) {
     const [gx, gy] = cell2ground((i / gN) * S.nx, (j / gN) * S.ny, S);
     const gz = clampLift(heightAt(gx, gy, S) * S.waveScale, S, fit);
     const [sx, sy, dp] = penProject(gx, gy, gz, S, fit);
     const q = j * stride + i;
-    SX[q] = sx / VB_W * BW; SY[q] = sy / VB_H * BH; DP[q] = dp;
-    VS[q] = scalarAt(gx, gy);
-    if (VF) VF[q] = fresAt(gx, gy);
+    GX[q] = gx; GY[q] = gy;
+    SX[q] = (sx / VB_W) * BW; SY[q] = (sy / VB_H) * BH;
+    QW[q] = dp > 1e-6 ? 1 / dp : 0;      // 1/depth: the perspective divide
   }
-  const zb = new Float64Array(BW * BH).fill(Infinity);
-  const fs = new Float32Array(BW * BH).fill(SURF_SENTINEL);
-  const ff = VF ? new Float32Array(BW * BH).fill(SURF_SENTINEL) : null;
+  const zb = new Float64Array(NP).fill(Infinity);
+  const GI = new Float32Array(NP), GJ = new Float32Array(NP);
+  const cov = new Uint8Array(NP);
   const tri = (a, b, c) => {
-    // inlined barycentric raster: z-test, then write both scalars at winners
-    const x0 = SX[a], y0 = SY[a], z0 = DP[a], x1 = SX[b], y1 = SY[b], z1 = DP[b], x2 = SX[c], y2 = SY[c], z2 = DP[c];
+    const q0 = QW[a], q1 = QW[b], q2 = QW[c];
+    if (!q0 || !q1 || !q2) return;                 // vertex at/behind the eye
+    const x0 = SX[a], y0 = SY[a], x1 = SX[b], y1 = SY[b], x2 = SX[c], y2 = SY[c];
     const minX = Math.max(0, Math.floor(Math.min(x0, x1, x2))), maxX = Math.min(BW - 1, Math.ceil(Math.max(x0, x1, x2)));
     const minY = Math.max(0, Math.floor(Math.min(y0, y1, y2))), maxY = Math.min(BH - 1, Math.ceil(Math.max(y0, y1, y2)));
     if (minX > maxX || minY > maxY) return;
     const den = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2);
     if (Math.abs(den) < 1e-9) return;
-    const s0 = VS[a], s1 = VS[b], s2 = VS[c];
-    const f0 = VF ? VF[a] : 0, f1 = VF ? VF[b] : 0, f2 = VF ? VF[c] : 0;
+    const ia = a % stride, ja = (a - ia) / stride;
+    const ib = b % stride, jb = (b - ib) / stride;
+    const ic = c % stride, jc = (c - ic) / stride;
     for (let y = minY; y <= maxY; y++) for (let x = minX; x <= maxX; x++) {
       const w0 = ((y1 - y2) * (x - x2) + (x2 - x1) * (y - y2)) / den;
       const w1 = ((y2 - y0) * (x - x2) + (x0 - x2) * (y - y2)) / den;
       const w2 = 1 - w0 - w1;
       if (w0 < -0.002 || w1 < -0.002 || w2 < -0.002) continue;
-      const z = w0 * z0 + w1 * z1 + w2 * z2, p = y * BW + x;
+      // interpolate grid coordinates in 1/depth, the only way they stay put
+      // across a near-field cell the camera stretches over half the frame
+      const iw = w0 * q0 + w1 * q1 + w2 * q2;
+      if (iw <= 0) continue;
+      const z = 1 / iw, p = y * BW + x;
       if (z < zb[p]) {
         zb[p] = z;
-        fs[p] = w0 * s0 + w1 * s1 + w2 * s2;
-        if (ff) ff[p] = w0 * f0 + w1 * f1 + w2 * f2;
+        GI[p] = (w0 * q0 * ia + w1 * q1 * ib + w2 * q2 * ic) / iw;
+        GJ[p] = (w0 * q0 * ja + w1 * q1 * jb + w2 * q2 * jc) / iw;
+        cov[p] = 1;
       }
     }
   };
@@ -845,15 +874,136 @@ function buildSurface3D(S, fit, opts) {
     const a = j * stride + i, b = a + 1, c = a + stride, e = c + 1;
     tri(a, b, c); tri(b, e, c);
   }
+  const inn = new Uint8Array(NP), out = new Uint8Array(NP);
+  for (let p = 0; p < NP; p++) { inn[p] = cov[p]; out[p] = 1 - cov[p]; }
+  const Din = distTransform(inn, BW, BH), Dout = distTransform(out, BW, BH);
+  const sil = new Float64Array(NP);
+  for (let p = 0; p < NP; p++) sil[p] = cov[p] ? Din[p] - 0.5 : -(Dout[p] - 0.5);
+  // coverage is point-sampled, so that distance field steps in whole pixels and
+  // its zero set is the staircase of pixel edges the mask happens to have. A
+  // couple of box passes turn the steps into a ramp, and the crossing then
+  // slides sub-pixel along the edge — the silhouette reads as the smooth curve
+  // the crest actually is instead of a flight of stairs.
+  blurField(sil, BW, BH, new Float64Array(NP), 2);
+  return { BW, BH, NP, stride, GX, GY, GI, GJ, cov, sil };
+}
+
+// sample a ground-space function at every surface-grid vertex
+function gridSamples(R, fn) {
+  const n = R.GX.length, out = new Float64Array(n);
+  for (let q = 0; q < n; q++) out[q] = fn(R.GX[q], R.GY[q]);
+  return out;
+}
+
+// reconstruct a grid-sampled scalar at every covered pixel, Catmull-Rom in
+// both axes — the smoothness that keeps a boundary curved inside one projected
+// cell instead of collapsing to that cell's straight facet
+function rasterField(R, vals) {
+  const { NP, stride, GI, GJ, cov } = R;
+  const dst = new Float32Array(NP);
+  const cl = (v) => (v < 0 ? 0 : v > stride - 1 ? stride - 1 : v);
+  for (let p = 0; p < NP; p++) {
+    if (!cov[p]) continue;
+    const fi = GI[p], fj = GJ[p];
+    const i0 = Math.floor(fi), j0 = Math.floor(fj);
+    const tx = fi - i0, ty = fj - j0;
+    const ia = cl(i0 - 1), ib = cl(i0), ic = cl(i0 + 1), id = cl(i0 + 2);
+    const ra = cl(j0 - 1) * stride, rb = cl(j0) * stride, rc = cl(j0 + 1) * stride, rd = cl(j0 + 2) * stride;
+    dst[p] = cr4(
+      cr4(vals[ra + ia], vals[ra + ib], vals[ra + ic], vals[ra + id], tx),
+      cr4(vals[rb + ia], vals[rb + ib], vals[rb + ic], vals[rb + id], tx),
+      cr4(vals[rc + ia], vals[rc + ib], vals[rc + ic], vals[rc + id], tx),
+      cr4(vals[rd + ia], vals[rd + ib], vals[rd + ic], vals[rd + id], tx),
+      ty);
+  }
+  return dst;
+}
+
+// {field >= t} intersected with the wave silhouette, as one smooth screen
+// path. Both operands are signed distances to their own boundary, so the min
+// is the intersection and the zero crossing lands on whichever edge is nearer.
+function contourRegion(R, field, t, iters, buf) {
+  const { NP, BW, BH, cov, sil } = R;
+  for (let p = 0; p < NP; p++) {
+    const s = sil[p];
+    if (!cov[p]) { buf[p] = s; continue; }
+    const v = field[p] - t;
+    buf[p] = v < s ? v : s;
+  }
+  const multi = d3.contours().size([BW, BH]).thresholds([0])(buf)[0];
+  return contourToScreenPath(multi, BW, BH, iters);
+}
+
+// Preset / 1D path: one continuous scalar (the reflected elevation), contoured
+// at the palette's band boundaries into nested upper sets, plus the occluded
+// Fresnel bands. `scalarAt`/`fresAt` are sampled at ground points.
+function buildSurface3D(S, fit, opts) {
+  const { scalarAt, thresholds, fresAt, fresThresholds, gN = 140, BW = 420 } = opts;
+  const R = rasterizeSurface(S, fit, gN, BW);
   const iters = S.smooth || 0;
-  const layers = d3.contours().size([BW, BH]).thresholds(thresholds)(fs)
-    .map((c) => contourToScreenPath(c, BW, BH, iters));
+  const buf = new Float64Array(R.NP);
+  const fs = rasterField(R, gridSamples(R, scalarAt));
+  const layers = thresholds.map((t) => contourRegion(R, fs, t, iters, buf));
   let fres = null;
-  if (ff) {
-    fres = d3.contours().size([BW, BH]).thresholds(fresThresholds)(ff)
-      .map((c) => contourToScreenPath(c, BW, BH, iters));
+  if (fresAt) {
+    const ff = rasterField(R, gridSamples(R, fresAt));
+    fres = fresThresholds.map((t) => contourRegion(R, ff, t, iters, buf));
   }
   return { layers, fres };
+}
+
+// 2D panorama path: no single scalar exists, so take the flat path's stack of
+// per-color signed distance fields (panoramaStack / eachPanoramaLayer) and
+// compose each one through the reflection at the visible surface point — the
+// same construction buildSegmentation uses, evaluated on the occluded raster
+// instead of the flat water grid. `uvAt` returns the reflected panorama
+// coordinate in cells, matching buildSegmentation's fG/fF.
+function buildSurface3DPanorama(S, fit, opts) {
+  const { uvAt, env2d, fresAt, fresThresholds, gN = 140, BW = 420 } = opts;
+  const R = rasterizeSurface(S, fit, gN, BW);
+  const { NP, BH, cov, sil } = R;
+  const iters = S.smooth || 0;
+  const stack = panoramaStack(env2d);
+  const { EW, EH, colorOf, order, K } = stack;
+
+  const nv = R.GX.length;
+  const su = new Float64Array(nv), sv = new Float64Array(nv);
+  for (let q = 0; q < nv; q++) {
+    const uv = uvAt(R.GX[q], R.GY[q]); su[q] = uv[0]; sv[q] = uv[1];
+  }
+  const fu = rasterField(R, su), fv = rasterField(R, sv);
+
+  // bilinear taps into panorama space, shared by every layer
+  const tap = new Int32Array(NP), tx = new Float32Array(NP), ty = new Float32Array(NP);
+  for (let p = 0; p < NP; p++) {
+    if (!cov[p]) continue;
+    let x = fu[p] - 0.5; x = x < 0 ? 0 : x > EW - 1 ? EW - 1 : x;
+    let y = fv[p] - 0.5; y = y < 0 ? 0 : y > EH - 1 ? EH - 1 : y;
+    const i0 = Math.min(EW - 2, Math.floor(x)), j0 = Math.min(EH - 2, Math.floor(y));
+    tap[p] = j0 * EW + i0; tx[p] = x - i0; ty[p] = y - j0;
+  }
+
+  const buf = new Float64Array(NP);
+  const layers = new Array(K);
+  eachPanoramaLayer(stack, (k, D) => {
+    for (let p = 0; p < NP; p++) {
+      const s = sil[p];
+      if (!cov[p]) { buf[p] = s; continue; }
+      const q = tap[p], fx = tx[p], fy = ty[p];
+      const d = (D[q] * (1 - fx) + D[q + 1] * fx) * (1 - fy)
+              + (D[q + EW] * (1 - fx) + D[q + EW + 1] * fx) * fy;
+      buf[p] = d < s ? d : s;
+    }
+    const multi = d3.contours().size([BW, BH]).thresholds([0])(buf)[0];
+    layers[k] = { d: contourToScreenPath(multi, BW, BH, iters), color: colorOf[order[k]] };
+  });
+
+  let fres = null;
+  if (fresAt) {
+    const ff = rasterField(R, gridSamples(R, fresAt));
+    fres = fresThresholds.map((t) => contourRegion(R, ff, t, iters, buf));
+  }
+  return { bg: colorOf[order[0]], layers: layers.filter((l) => l.d), fres };
 }
 
 // each color region is filled with nested rings that follow its edge shape
@@ -1178,6 +1328,67 @@ function buildGeometry(S) {
 // per-cell structure is invisible because neighbouring colors are near-equal.
 const SEG_MAX_COLORS = 160;
 
+// Distinct panorama colors, stacked bottom-up by the mean elevation row of
+// their painted cells — the 2D generalization of the 1D band order.
+function panoramaStack(env2d) {
+  const { w: EW, h: EH, cells } = env2d;
+  const colorId = new Map(), colorOf = [], areas = [];
+  const labels = new Int32Array(EW * EH);
+  for (let p = 0; p < EW * EH; p++) {
+    const c = cells[p];
+    let id = colorId.get(c);
+    if (id === undefined) { id = colorOf.length; colorId.set(c, id); colorOf.push(c); areas.push(0); }
+    labels[p] = id; areas[id]++;
+  }
+  const K = colorOf.length;
+  const rowSum = new Float64Array(K);
+  for (let p = 0; p < EW * EH; p++) rowSum[labels[p]] += (p / EW) | 0;
+  const order = d3.range(K).sort((a, b) => rowSum[a] / areas[a] - rowSum[b] / areas[b]);
+  return { EW, EH, cells, labels, colorOf, areas, order, K };
+}
+
+// Walk the stack from the top down, handing each layer its signed distance
+// field in panorama cells: >0 inside, <0 outside, zero crossing on the painted
+// boundary. Layer k is the UNION of color k and every color above it, so like
+// the 1D upper sets each layer solidly contains the next — smoothing can shift
+// a shared edge but can never open a background seam between neighbours.
+// Composing this field through the reflection and contouring it at zero is
+// what keeps a painted region's boundary a smooth curve rather than a trace of
+// the panorama's cell grid; both the flat path and the 3D surface use it.
+function eachPanoramaLayer(stack, visit) {
+  const { EW, EH, labels, order, K } = stack;
+  const N = EW * EH;
+  const union = new Float64Array(N), inv = new Float64Array(N);
+  const D0 = new Float64Array(N), tmpP = new Float64Array(N);
+  for (let k = K - 1; k >= 0; k--) {   // top of the stack down, growing the union
+    for (let p = 0; p < N; p++) {
+      if (labels[p] === order[k]) union[p] = 1;
+      inv[p] = 1 - union[p];
+    }
+    const D = distTransform(union, EW, EH), Dout = distTransform(inv, EW, EH);
+    let thick = 0;
+    for (let p = 0; p < N; p++) { D[p] -= Dout[p]; if (D[p] > thick) thick = D[p]; }
+    // a light blur rounds the pixel-corner bevels of the painted boundary —
+    // in PANORAMA space, where the corners live. (Blurring the composed
+    // field in water space instead flattens every small ripple's φ
+    // excursion, erasing the fine reflection rings the 1D path keeps.)
+    // For a stripe boundary the SDF is linear across it, so the blur is a
+    // no-op there and stripes stay in exact 1D parity. Skip thin unions
+    // (the topmost gradient rows): nothing to round, and the blur would
+    // erase them. The sign clamp keeps solidly-inside/outside cells on
+    // their own side, so 1-cell features (object ink rims) survive.
+    if (thick >= 2) {
+      for (let p = 0; p < N; p++) D0[p] = D[p];
+      blurField(D, EW, EH, tmpP, 1);
+      for (let p = 0; p < N; p++) {
+        if (D0[p] >= 1 && D[p] < 0.25) D[p] = 0.25;
+        else if (D0[p] <= -1 && D[p] > -0.25) D[p] = -0.25;
+      }
+    }
+    visit(k, D);
+  }
+}
+
 function buildSegmentation(S, env2d, azSpan) {
   const { nx, ny } = S;
   S._ems = S.emitters.filter((e) => e.on).map((e) => prepEmitter(e, S));
@@ -1233,28 +1444,11 @@ function buildSegmentation(S, env2d, azSpan) {
       .map((c) => multiToPath(c, S, fit));
   }
 
-  // distinct panorama colors, with cell counts for stacking order
-  const colorId = new Map(), colorOf = [], areas = [];
-  const labels = new Int32Array(EW * EH);
-  for (let p = 0; p < EW * EH; p++) {
-    const c = cells[p];
-    let id = colorId.get(c);
-    if (id === undefined) { id = colorOf.length; colorId.set(c, id); colorOf.push(c); areas.push(0); }
-    labels[p] = id; areas[id]++;
-  }
+  // distinct panorama colors, stacked bottom-up by painted elevation
+  const stack = panoramaStack(env2d);
+  const { colorOf, order, K } = stack;
 
-  if (colorOf.length <= SEG_MAX_COLORS) {
-    const K = colorOf.length;
-    // stack colors bottom-up by the mean elevation of their painted cells —
-    // the 2D generalization of the 1D band order. Layer k is drawn as the
-    // UNION of color k and every color above it, so like the 1D upper sets
-    // each layer solidly contains the next: smoothing can shift a shared
-    // edge but can never open a background seam between neighbours.
-    const rowSum = new Float64Array(K);
-    for (let p = 0; p < EW * EH; p++) rowSum[labels[p]] += (p / EW) | 0;
-    const order = d3.range(K).sort((a, b) => rowSum[a] / areas[a] - rowSum[b] / areas[b]);
-    const union = new Float64Array(EW * EH), inv = new Float64Array(EW * EH);
-    const D0 = new Float64Array(EW * EH), tmpP = new Float64Array(EW * EH);
+  if (K <= SEG_MAX_COLORS) {
     const F = new Float64Array(nx * ny);
     // fields are contoured on a one-cell-padded grid (edge values replicated)
     // so every region overshoots the water's edge instead of tracing it; the
@@ -1274,33 +1468,7 @@ function buildSegmentation(S, env2d, azSpan) {
     const ex = { cx: (cs[0][0] + cs[1][0] + cs[2][0] + cs[3][0]) / 4,
                  cy: (cs[0][1] + cs[1][1] + cs[2][1] + cs[3][1]) / 4, s: 1.05 };
     const layers = new Array(K);
-    for (let k = K - 1; k >= 0; k--) {   // top of the stack down, growing the union
-      for (let p = 0; p < EW * EH; p++) {
-        if (labels[p] === order[k]) union[p] = 1;
-        inv[p] = 1 - union[p];
-      }
-      // signed distance in panorama cells: >0 inside the union, <0 outside,
-      // zero crossing on the painted boundary
-      const D = distTransform(union, EW, EH), Dout = distTransform(inv, EW, EH);
-      let thick = 0;
-      for (let p = 0; p < EW * EH; p++) { D[p] -= Dout[p]; if (D[p] > thick) thick = D[p]; }
-      // a light blur rounds the pixel-corner bevels of the painted boundary —
-      // in PANORAMA space, where the corners live. (Blurring the composed
-      // field in water space instead flattens every small ripple's φ
-      // excursion, erasing the fine reflection rings the 1D path keeps.)
-      // For a stripe boundary the SDF is linear across it, so the blur is a
-      // no-op there and stripes stay in exact 1D parity. Skip thin unions
-      // (the topmost gradient rows): nothing to round, and the blur would
-      // erase them. The sign clamp keeps solidly-inside/outside cells on
-      // their own side, so 1-cell features (object ink rims) survive.
-      if (thick >= 2) {
-        for (let p = 0; p < EW * EH; p++) D0[p] = D[p];
-        blurField(D, EW, EH, tmpP, 1);
-        for (let p = 0; p < EW * EH; p++) {
-          if (D0[p] >= 1 && D[p] < 0.25) D[p] = 0.25;
-          else if (D0[p] <= -1 && D[p] > -0.25) D[p] = -0.25;
-        }
-      }
+    eachPanoramaLayer(stack, (k, D) => {
       // compose through the reflection: bilinear sample at each water
       // sample's continuous (azimuth, elevation) panorama coordinate
       for (let p = 0; p < nx * ny; p++) {
@@ -1320,7 +1488,7 @@ function buildSegmentation(S, env2d, azSpan) {
       }
       const cont = d3.contours().size([px, py]).thresholds([0])(FP)[0];
       layers[k] = { d: multiToPath(cont, S, fit, -1, ex), color: colorOf[order[k]] };
-    }
+    });
     const drawn = layers.filter((l) => l.d);
     return { bg: cells[0], layers: drawn, clip, fres, lo, hi, count: drawn.length, twoD: true };
   }
@@ -1365,7 +1533,8 @@ function buildSegmentation(S, env2d, azSpan) {
 export {
   buildGeometry, buildSegmentation, envFromRows, stampObjects,
   paletteStops, paletteColorAt, DERIVED_ENV_H, ENV2D_W, DEFAULT_EMITTERS,
-  computeFit, cell2ground, heightAt, clampLift, penProject, buildSurface3D,
+  computeFit, cell2ground, heightAt, clampLift, penProject, reflectAt, magFrac,
+  buildSurface3D, buildSurface3DPanorama,
 };
 
 // ---- layered-paper stack export -----------------------------------
@@ -2293,33 +2462,23 @@ export default function App() {
     const fresThresholds = fresOn ? d3.range(1, fresBands).map((k) => k / fresBands) : null;
 
     if (use2d) {
-      // arbitrary panorama colors have no single scalar, so rank each distinct
-      // color by its mean reflected elevation (the 2D generalization of the
-      // flat path's band order) and contour that rank field — nested upper
-      // sets, one color per rank, base rank filling the whole silhouette.
-      const { w: EW, h: EH, cells } = envEffective, az = azSpan, { nx, ny } = S;
-      const colorAt = (gx, gy) => {
+      // arbitrary panorama colors have no single scalar to contour, so run the
+      // flat path's construction on the occluded raster: the reflected
+      // panorama coordinate at each visible surface point, composed with the
+      // per-color signed distance fields. Same outlines as the flat 2D render,
+      // now stopping at the wave crests in front of them.
+      const { w: EW, h: EH } = envEffective, az = azSpan;
+      const uvAt = (gx, gy) => {
         const R = reflectAt(gx, gy, S);
         const phi = Math.asin(Math.max(-1, Math.min(1, R[2]))) * 180 / Math.PI;
         let psi = Math.atan2(R[0], R[1]) * 180 / Math.PI; psi = psi < -az ? -az : psi > az ? az : psi;
         let v = magFrac((phi - S.eLo) / ((S.eHi - S.eLo) || 1), mag); v = v < 0 ? 0 : v > 1 ? 1 : v;
         let u = magFrac((psi + az) / (2 * az), mag); u = u < 0 ? 0 : u > 1 ? 1 : u;
-        return { c: cells[Math.min(EH - 1, Math.floor(v * EH)) * EW + Math.min(EW - 1, Math.floor(u * EW))], phi };
+        return [u * EW, v * EH];
       };
-      const sum = new Map(), cnt = new Map();
-      for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
-        const [gx, gy] = cell2ground(i + 0.5, j + 0.5, S);
-        const { c, phi } = colorAt(gx, gy);
-        sum.set(c, (sum.get(c) || 0) + phi); cnt.set(c, (cnt.get(c) || 0) + 1);
-      }
-      const distinct = [...sum.keys()].sort((a, b) => sum.get(a) / cnt.get(a) - sum.get(b) / cnt.get(b));
-      const rank = new Map(distinct.map((c, k) => [c, k]));
-      const K = distinct.length;
-      const scalarAt = (gx, gy) => rank.get(colorAt(gx, gy).c);
-      const thresholds = [-0.5, ...d3.range(1, K).map((k) => k - 0.5)]; // base + upper sets
-      const colors = distinct;
-      const { layers, fres } = buildSurface3D(S, fit, { scalarAt, thresholds, fresAt, fresThresholds, ...raster });
-      return { bg: distinct[0], layers: layers.map((d, k) => ({ d, color: colors[k] })), fres };
+      return buildSurface3DPanorama(S, fit, {
+        uvAt, env2d: envEffective, fresAt, fresThresholds, ...raster,
+      });
     }
 
     // preset / paint1d: contour the continuous reflected elevation at the
