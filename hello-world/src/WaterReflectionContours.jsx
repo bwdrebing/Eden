@@ -700,61 +700,6 @@ function buildPenLines(S, fit, colorAt, opts) {
   return [...byColor.entries()].map(([color, subs]) => ({ color, d: subs.join("") }));
 }
 
-// ---- 3D solid surface (filled, hidden-surface-correct) ------------
-// The stacked color layers (buildSegmentation / buildGeometry) are ordered by
-// the reflected backdrop's *elevation* — a 2D seam-avoidance trick with no
-// notion of camera depth. Lift that stack onto tall waves and the grazing
-// back-face reflections (the bottom of the backdrop) get painted LAST, on top
-// of everything, so a wave's far side bleeds THROUGH the crest in front of it:
-// the taller the wave, the MORE of the "backside" you see. This builder
-// instead tessellates the lifted surface into per-row color bands and paints
-// them strictly far-to-near, so a nearer crest's band overpaints whatever it
-// occludes — genuine hidden-surface removal for the filled 3D water. `colorAt`
-// returns the already-(Fresnel-)mixed fill color at a ground point, exactly as
-// the pen-plot path feeds it.
-function buildSurfaceBands(S, fit, colorAt) {
-  const nx = S.nx, ny = S.ny, stride = nx + 1;
-  // project every grid vertex once, lifted to the wave height
-  const PX = new Float64Array(stride * (ny + 1)), PY = new Float64Array(stride * (ny + 1));
-  for (let j = 0; j <= ny; j++) {
-    for (let i = 0; i <= nx; i++) {
-      const [gx, gy] = cell2ground(i, j, S);
-      const gz = clampLift(heightAt(gx, gy, S) * S.waveScale, S, fit);
-      const [sx, sy] = penProject(gx, gy, gz, S, fit);
-      const q = j * stride + i; PX[q] = sx; PY[q] = sy;
-    }
-  }
-  // color of each cell, sampled at its center
-  const cellCol = new Array(nx * ny);
-  for (let j = 0; j < ny; j++) {
-    for (let i = 0; i < nx; i++) {
-      const [gx, gy] = cell2ground(i + 0.5, j + 0.5, S);
-      cellCol[j * nx + i] = colorAt(gx, gy);
-    }
-  }
-  // Far rows first (larger gy is farther from the camera), so the nearer rows
-  // paint last and win. Each row's cells are merged into runs of one color and
-  // emitted as a single quad-strip band (top edge on grid line j, bottom edge
-  // on line j+1) — neighbouring bands share exact vertices, so the surface
-  // tiles without cracks.
-  const bands = [];
-  for (let j = ny - 1; j >= 0; j--) {
-    const top = j * stride, bot = (j + 1) * stride, base = j * nx;
-    let runStart = 0;
-    for (let i = 1; i <= nx; i++) {
-      if (i === nx || cellCol[base + i] !== cellCol[base + runStart]) {
-        let d = "M" + PX[top + runStart].toFixed(1) + " " + PY[top + runStart].toFixed(1);
-        for (let c = runStart + 1; c <= i; c++) d += " L" + PX[top + c].toFixed(1) + " " + PY[top + c].toFixed(1);
-        for (let c = i; c >= runStart; c--) d += " L" + PX[bot + c].toFixed(1) + " " + PY[bot + c].toFixed(1);
-        d += " Z";
-        bands.push({ color: cellCol[base + runStart], d });
-        runStart = i;
-      }
-    }
-  }
-  return bands;
-}
-
 // ---- concentric / "wood-knot" pen style ---------------------------
 // chamfer distance transform: 0 outside the region, growing inward
 function distTransform(mask, nx, ny) {
@@ -813,6 +758,102 @@ function buildDepthBuffer(S, fit, relief, threeD, BW, BH) {
     rasterTri(buf, BW, BH, SX[b], SY[b], DP[b], SX[e], SY[e], DP[e], SX[c], SY[c], DP[c]);
   }
   return buf;
+}
+
+// ---- 3D solid surface: hidden-surface removal, THEN smooth contours ---
+// Lifting the flat color layers onto tall waves and painting them in the old
+// backdrop-elevation order let a wave's far side show through the crest in
+// front of it (the taller the wave, the more "backside" you saw). Doing the
+// hidden-surface removal geometrically on the vector layers is the hard part;
+// doing it on a raster is easy. So we rasterize the lifted surface into a
+// screen-space z-buffer that keeps, at every pixel, the SCALAR of the
+// front-most surface point (reflected elevation, a colour rank, the Fresnel
+// weight…). Contouring that already-occluded raster with the very same
+// marching-squares + Chaikin + bezier pipeline the flat modes use gives back
+// smooth, sub-pixel region outlines — but now their silhouettes are the real
+// wave crests, so nothing behind a crest leaks through. One scalar field in,
+// one set of nested smooth region paths out.
+
+// smooth a raster-space contour multipolygon into a bezier path in viewBox
+// coordinates (the raster is BW×BH, the viewBox VB_W×VB_H)
+function contourToScreenPath(multi, BW, BH, iters) {
+  const kx = VB_W / BW, ky = VB_H / BH;
+  let d = "";
+  for (const poly of multi.coordinates) {
+    for (const ring0 of poly) {
+      let ring = ring0.map((p) => [p[0] * kx, p[1] * ky]);
+      ring = iters ? chaikin(ring, iters) : ring;
+      const simp = simplifyRing(ring, 0.6);
+      if (simp.length >= 3) { d += ringToBezier(simp); continue; }
+      for (let idx = 0; idx < ring.length; idx++)
+        d += (idx === 0 ? "M" : "L") + ring[idx][0].toFixed(1) + " " + ring[idx][1].toFixed(1) + " ";
+      d += "Z ";
+    }
+  }
+  return d;
+}
+
+// Rasterize the lifted surface once, carrying up to two scalar fields (the
+// band/rank scalar and, optionally, the Fresnel deep-water weight), then
+// contour each field at its thresholds. Returns smooth screen-space region
+// paths (nested upper sets, one per threshold) plus the occluded Fresnel
+// bands. `scalarAt`/`fresAt` are sampled at ground points; uncovered pixels
+// sit below every threshold so regions stop exactly at the wave silhouette.
+const SURF_SENTINEL = -1e9;
+function buildSurface3D(S, fit, opts) {
+  const { scalarAt, thresholds, fresAt, fresThresholds, gN = 140, BW = 420 } = opts;
+  const BH = Math.max(2, Math.round(BW * VB_H / VB_W));
+  const stride = gN + 1, NV = stride * stride;
+  const SX = new Float64Array(NV), SY = new Float64Array(NV), DP = new Float64Array(NV);
+  const VS = new Float64Array(NV), VF = fresAt ? new Float64Array(NV) : null;
+  for (let j = 0; j <= gN; j++) for (let i = 0; i <= gN; i++) {
+    const [gx, gy] = cell2ground((i / gN) * S.nx, (j / gN) * S.ny, S);
+    const gz = clampLift(heightAt(gx, gy, S) * S.waveScale, S, fit);
+    const [sx, sy, dp] = penProject(gx, gy, gz, S, fit);
+    const q = j * stride + i;
+    SX[q] = sx / VB_W * BW; SY[q] = sy / VB_H * BH; DP[q] = dp;
+    VS[q] = scalarAt(gx, gy);
+    if (VF) VF[q] = fresAt(gx, gy);
+  }
+  const zb = new Float64Array(BW * BH).fill(Infinity);
+  const fs = new Float32Array(BW * BH).fill(SURF_SENTINEL);
+  const ff = VF ? new Float32Array(BW * BH).fill(SURF_SENTINEL) : null;
+  const tri = (a, b, c) => {
+    // inlined barycentric raster: z-test, then write both scalars at winners
+    const x0 = SX[a], y0 = SY[a], z0 = DP[a], x1 = SX[b], y1 = SY[b], z1 = DP[b], x2 = SX[c], y2 = SY[c], z2 = DP[c];
+    const minX = Math.max(0, Math.floor(Math.min(x0, x1, x2))), maxX = Math.min(BW - 1, Math.ceil(Math.max(x0, x1, x2)));
+    const minY = Math.max(0, Math.floor(Math.min(y0, y1, y2))), maxY = Math.min(BH - 1, Math.ceil(Math.max(y0, y1, y2)));
+    if (minX > maxX || minY > maxY) return;
+    const den = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2);
+    if (Math.abs(den) < 1e-9) return;
+    const s0 = VS[a], s1 = VS[b], s2 = VS[c];
+    const f0 = VF ? VF[a] : 0, f1 = VF ? VF[b] : 0, f2 = VF ? VF[c] : 0;
+    for (let y = minY; y <= maxY; y++) for (let x = minX; x <= maxX; x++) {
+      const w0 = ((y1 - y2) * (x - x2) + (x2 - x1) * (y - y2)) / den;
+      const w1 = ((y2 - y0) * (x - x2) + (x0 - x2) * (y - y2)) / den;
+      const w2 = 1 - w0 - w1;
+      if (w0 < -0.002 || w1 < -0.002 || w2 < -0.002) continue;
+      const z = w0 * z0 + w1 * z1 + w2 * z2, p = y * BW + x;
+      if (z < zb[p]) {
+        zb[p] = z;
+        fs[p] = w0 * s0 + w1 * s1 + w2 * s2;
+        if (ff) ff[p] = w0 * f0 + w1 * f1 + w2 * f2;
+      }
+    }
+  };
+  for (let j = 0; j < gN; j++) for (let i = 0; i < gN; i++) {
+    const a = j * stride + i, b = a + 1, c = a + stride, e = c + 1;
+    tri(a, b, c); tri(b, e, c);
+  }
+  const iters = S.smooth || 0;
+  const layers = d3.contours().size([BW, BH]).thresholds(thresholds)(fs)
+    .map((c) => contourToScreenPath(c, BW, BH, iters));
+  let fres = null;
+  if (ff) {
+    fres = d3.contours().size([BW, BH]).thresholds(fresThresholds)(ff)
+      .map((c) => contourToScreenPath(c, BW, BH, iters));
+  }
+  return { layers, fres };
 }
 
 // each color region is filled with nested rings that follow its edge shape
@@ -1312,7 +1353,7 @@ function buildSegmentation(S, env2d, azSpan) {
 export {
   buildGeometry, buildSegmentation, envFromRows, stampObjects,
   paletteStops, paletteColorAt, DERIVED_ENV_H, ENV2D_W, DEFAULT_EMITTERS,
-  computeFit, cell2ground, heightAt, clampLift, penProject, buildSurfaceBands,
+  computeFit, cell2ground, heightAt, clampLift, penProject, buildSurface3D,
 };
 
 // ---- layered-paper stack export -----------------------------------
@@ -2150,11 +2191,11 @@ export default function App() {
   const layers = use2d ? (seg.layers || null)
     : geom.ds.map((d, k) => ({ d, color: isobandColors[k + 1] }));
   const rng = use2d ? seg : geom;
-  // 3D "solid" surface: paint the lifted water as depth-sorted filled bands so
-  // near crests correctly occlude the wave's far side (no more seeing the
-  // backside through a tall wave). Replaces the elevation-ordered color layers,
-  // which have no depth ordering once lifted. Pen mode has its own z-buffered
-  // hidden-line path, so this only covers the filled-region renderer.
+  // 3D "solid" surface: the lifted color layers have no depth ordering, so a
+  // tall wave's far side used to show through the crest in front of it. In this
+  // mode we instead z-buffer the surface into a raster and re-contour it (see
+  // surf3d) — smooth regions like the flat modes, but occlusion-correct. Pen
+  // mode has its own hidden-line path, so this only covers filled regions.
   const solid3d = !penMode && surface3d && perspective;
 
   // Fresnel depth bands: clip paths + the color mixer for each band
@@ -2223,51 +2264,72 @@ export default function App() {
   }, [penMode, penStyle, penCount, penSpacing, penRelief, penHidden, penEven, S, use2d, mode,
       envEffective, azSpan, colors1d, presetColors, fresOn, fresBands, mixDeep]);
 
-  // depth-sorted filled bands for the 3D solid surface (same per-point color
-  // the pen path uses, so Fresnel etc. stay baked in), replacing the
-  // depth-agnostic color layers when the water is lifted into 3D
-  const surfaceBands = useMemo(() => {
+  // 3D solid surface: hidden-surface removal on a z-buffered raster, then the
+  // usual smooth contouring on top — so the lifted water keeps the flat modes'
+  // smooth region outlines but a near crest correctly hides the wave's far
+  // side. Produces occluded { layers, fres } that slot straight into the same
+  // render path the flat layers use (Fresnel, edges and all).
+  const surf3d = useMemo(() => {
     if (!solid3d) return null;
     const fit = computeFit(S);
     const mag = S.reflMag || 1;
     S._ems = S.emitters.filter((e) => e.on).map((e) => prepEmitter(e, S));
-    const deepMix = (c, cosI) => {
-      if (!fresOn) return c;
-      const b = Math.min(fresBands - 1, Math.floor(fresnelDeepW(cosI) * fresBands));
-      return mixDeep(c, b);
-    };
-    let colorAt;
+    const raster = { gN: lowPower ? 110 : 150, BW: lowPower ? 320 : 440 };
+    // occluded Fresnel: the deep-water weight at the front-most surface point,
+    // contoured into the same bands the flat path clips with
+    const fresAt = fresOn ? (gx, gy) => fresnelDeepW(reflectAt(gx, gy, S)[3]) : null;
+    const fresThresholds = fresOn ? d3.range(1, fresBands).map((k) => k / fresBands) : null;
+
     if (use2d) {
-      const { w: EW, h: EH, cells } = envEffective;
-      const az = azSpan;
-      colorAt = (gx, gy) => {
+      // arbitrary panorama colors have no single scalar, so rank each distinct
+      // color by its mean reflected elevation (the 2D generalization of the
+      // flat path's band order) and contour that rank field — nested upper
+      // sets, one color per rank, base rank filling the whole silhouette.
+      const { w: EW, h: EH, cells } = envEffective, az = azSpan, { nx, ny } = S;
+      const colorAt = (gx, gy) => {
         const R = reflectAt(gx, gy, S);
         const phi = Math.asin(Math.max(-1, Math.min(1, R[2]))) * 180 / Math.PI;
         let psi = Math.atan2(R[0], R[1]) * 180 / Math.PI; psi = psi < -az ? -az : psi > az ? az : psi;
         let v = magFrac((phi - S.eLo) / ((S.eHi - S.eLo) || 1), mag); v = v < 0 ? 0 : v > 1 ? 1 : v;
         let u = magFrac((psi + az) / (2 * az), mag); u = u < 0 ? 0 : u > 1 ? 1 : u;
-        const c = cells[Math.min(EH - 1, Math.floor(v * EH)) * EW + Math.min(EW - 1, Math.floor(u * EW))];
-        return deepMix(c, R[3]);
+        return { c: cells[Math.min(EH - 1, Math.floor(v * EH)) * EW + Math.min(EW - 1, Math.floor(u * EW))], phi };
       };
-    } else {
-      const cols = mode === "paint1d" ? colors1d : presetColors;
-      const NB = cols.length;
-      const fr = S.bandFractions;
-      colorAt = (gx, gy) => {
-        const R = reflectAt(gx, gy, S);
-        const phi = Math.asin(Math.max(-1, Math.min(1, R[2]))) * 180 / Math.PI;
-        let v = magFrac((phi - S.eLo) / ((S.eHi - S.eLo) || 1), mag); v = v < 0 ? 0 : v >= 1 ? 0.999999 : v;
-        let c;
-        if (fr) {
-          let idx = 0;
-          for (const f of fr) { if (v >= f) idx++; else break; }
-          c = cols[idx] || cols[0];
-        } else c = cols[Math.floor(v * NB)] || cols[0];
-        return deepMix(c, R[3]);
-      };
+      const sum = new Map(), cnt = new Map();
+      for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+        const [gx, gy] = cell2ground(i + 0.5, j + 0.5, S);
+        const { c, phi } = colorAt(gx, gy);
+        sum.set(c, (sum.get(c) || 0) + phi); cnt.set(c, (cnt.get(c) || 0) + 1);
+      }
+      const distinct = [...sum.keys()].sort((a, b) => sum.get(a) / cnt.get(a) - sum.get(b) / cnt.get(b));
+      const rank = new Map(distinct.map((c, k) => [c, k]));
+      const K = distinct.length;
+      const scalarAt = (gx, gy) => rank.get(colorAt(gx, gy).c);
+      const thresholds = [-0.5, ...d3.range(1, K).map((k) => k - 0.5)]; // base + upper sets
+      const colors = distinct;
+      const { layers, fres } = buildSurface3D(S, fit, { scalarAt, thresholds, fresAt, fresThresholds, ...raster });
+      return { bg: distinct[0], layers: layers.map((d, k) => ({ d, color: colors[k] })), fres };
     }
-    return buildSurfaceBands(S, fit, colorAt);
-  }, [solid3d, S, use2d, mode, envEffective, azSpan, colors1d, presetColors, fresOn, fresBands, mixDeep]);
+
+    // preset / paint1d: contour the continuous reflected elevation at the
+    // palette's band boundaries — same banding as the flat path (buildGeometry),
+    // now with the wave silhouette doing the occlusion. Lowest band shows the
+    // background, exactly like the flat render, so no base layer is drawn.
+    const cols = mode === "paint1d" ? colors1d : presetColors, NB = cols.length;
+    const mid = (S.eLo + S.eHi) / 2, magSpan = (S.eHi - S.eLo) / mag;
+    const bnd = (f) => mid + (f - 0.5) * magSpan;
+    const boundaries = S.bandFractions ? S.bandFractions.map(bnd) : d3.range(1, NB).map((k) => bnd(k / NB));
+    const scalarAt = (gx, gy) =>
+      Math.asin(Math.max(-1, Math.min(1, reflectAt(gx, gy, S)[2]))) * 180 / Math.PI;
+    const { layers, fres } = buildSurface3D(S, fit, { scalarAt, thresholds: boundaries, fresAt, fresThresholds, ...raster });
+    return { bg: cols[0], layers: layers.map((d, k) => ({ d, color: cols[k + 1] })), fres };
+  }, [solid3d, S, use2d, mode, envEffective, azSpan, colors1d, presetColors, fresOn, fresBands, lowPower]);
+
+  // in 3D-solid mode the occluded surf3d geometry drives every filled-region
+  // code path below (live preview, SVG export, Fresnel clips) in place of the
+  // flat/lifted layers, so the rest of the renderer stays untouched
+  const drawLayers = solid3d ? surf3d.layers : layers;
+  const drawFres = solid3d ? surf3d.fres : fresPaths;
+  const drawBg = solid3d ? surf3d.bg : bg;
 
   // floating buoy: projected cap + waterline clip + mirrored reflection
   const buoy = useMemo(() => {
@@ -2300,24 +2362,14 @@ export default function App() {
       body += buoyStr + `</g>`;
       return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${VB_W} ${VB_H}">${body}</svg>`;
     }
-    if (solid3d) {
-      // depth-sorted filled bands, painted far-to-near. A matching-color
-      // hairline seals the antialiased seams between adjacent bands.
-      let body = `<rect width="${VB_W}" height="${VB_H}" fill="${bgFill}"/>` + rollOpen;
-      surfaceBands.forEach((l) => {
-        body += `<path d="${l.d}" fill="${l.color}" stroke="${l.color}" stroke-width="0.6" stroke-linejoin="round"/>`;
-      });
-      body += buoyStr + `</g>`;
-      return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${VB_W} ${VB_H}">${body}</svg>`;
-    }
     let body = `<rect width="${VB_W}" height="${VB_H}" fill="${bgFill}"/>` + rollOpen;
     const stroke = edges ? ` stroke="#000" stroke-opacity="0.25" stroke-width="0.6"` : "";
     let defs = "";
-    if (fresOn && fresPaths) fresPaths.forEach((d, i) => {
+    if (fresOn && drawFres) drawFres.forEach((d, i) => {
       if (d) defs += `<clipPath id="fres${i + 1}"><path d="${d}"/></clipPath>`;
     });
     const bandOpen = (b) => (b > 0 ? `<g clip-path="url(#fres${b})">` : `<g>`);
-    if (use2d && !seg.layers) {
+    if (!solid3d && use2d && !seg.layers) {
       seg.rows.forEach((row, ri) => {
         if (row.clip) defs += `<clipPath id="el${ri}"><path d="${row.clip}"/></clipPath>`;
       });
@@ -2339,18 +2391,18 @@ export default function App() {
     }
     // layered paths, preset & 2D alike. With Fresnel on, the geometry is
     // shared via <use> so each depth band re-colors the same paths.
-    if (use2d) defs += `<clipPath id="watertrap"><path d="${seg.clip}"/></clipPath>`;
-    if (fresOn) layers.forEach((l, i) => { defs += `<path id="lyr${i}" d="${l.d}"/>`; });
+    if (use2d && !solid3d) defs += `<clipPath id="watertrap"><path d="${seg.clip}"/></clipPath>`;
+    if (fresOn) drawLayers.forEach((l, i) => { defs += `<path id="lyr${i}" d="${l.d}"/>`; });
     // in 3D the waves rise above the flat water trapezoid, so skip the clip
     // (the padded regions already overshoot the frame) — otherwise crests
     // near the edges would be sheared off flat
     body += use2d && !surface3d
       ? `<g clip-path="url(#watertrap)" opacity="0.999">` : `<g opacity="0.999">`;
     fresIdx.forEach((b) => {
-      if (b > 0 && !fresPaths[b - 1]) return;
+      if (b > 0 && !drawFres[b - 1]) return;
       body += bandOpen(b);
-      if (b > 0) body += `<rect width="${VB_W}" height="${VB_H}" fill="${mixDeep(bg, b)}"/>`;
-      layers.forEach((l, i) => {
+      if (b > 0) body += `<rect width="${VB_W}" height="${VB_H}" fill="${mixDeep(drawBg, b)}"/>`;
+      drawLayers.forEach((l, i) => {
         body += fresOn
           ? `<use href="#lyr${i}" fill="${mixDeep(l.color, b)}" fill-rule="evenodd"${stroke}/>`
           : `<path d="${l.d}" fill="${l.color}" fill-rule="evenodd"${stroke}/>`;
@@ -2515,13 +2567,7 @@ export default function App() {
                   <path key={i} d={l.d} fill="none" stroke={l.color}
                     strokeWidth={penWidth} strokeLinecap="round" strokeLinejoin="round" />
                 ))
-              ) : solid3d ? (
-                // depth-sorted filled bands (far-to-near); hairline seals seams
-                surfaceBands.map((l, i) => (
-                  <path key={i} d={l.d} fill={l.color} stroke={l.color}
-                    strokeWidth={0.6} strokeLinejoin="round" />
-                ))
-              ) : use2d && !layers ? (
+              ) : !solid3d && use2d && !layers ? (
                 <>
                   <defs>
                     {seg.rows.map((row, ri) => row.clip ? (
@@ -2550,11 +2596,11 @@ export default function App() {
               ) : (
                 <>
                   <defs>
-                    {use2d && <clipPath id="watertrap"><path d={seg.clip} /></clipPath>}
-                    {fresOn && fresPaths.map((d, i) => d ? (
+                    {use2d && !solid3d && <clipPath id="watertrap"><path d={seg.clip} /></clipPath>}
+                    {fresOn && drawFres.map((d, i) => d ? (
                       <clipPath key={`f${i}`} id={`fres${i + 1}`}><path d={d} /></clipPath>
                     ) : null)}
-                    {fresOn && layers.map((l, i) => (
+                    {fresOn && drawLayers.map((l, i) => (
                       <path key={i} id={`lyr${i}`} d={l.d} />
                     ))}
                   </defs>
@@ -2562,10 +2608,10 @@ export default function App() {
                       clip is antialiased once against the composite instead of
                       per layer (per-layer clip AA leaks the colors beneath) */}
                   <g clipPath={use2d && !surface3d ? "url(#watertrap)" : undefined} opacity={0.999}>
-                    {fresIdx.map((b) => (b > 0 && !fresPaths[b - 1]) ? null : (
+                    {fresIdx.map((b) => (b > 0 && !drawFres[b - 1]) ? null : (
                       <g key={`fb${b}`} clipPath={b > 0 ? `url(#fres${b})` : undefined}>
-                        {b > 0 && <rect width={VB_W} height={VB_H} fill={mixDeep(bg, b)} />}
-                        {layers.map((l, i) => fresOn ? (
+                        {b > 0 && <rect width={VB_W} height={VB_H} fill={mixDeep(drawBg, b)} />}
+                        {drawLayers.map((l, i) => fresOn ? (
                           <use key={i} href={`#lyr${i}`} fill={mixDeep(l.color, b)} fillRule="evenodd"
                             stroke={edges ? "#000" : "none"} strokeOpacity={edges ? 0.28 : 0}
                             strokeWidth={edges ? 0.6 : 0} />
@@ -2613,7 +2659,7 @@ export default function App() {
             <div style={{ position: "absolute", left: 12, bottom: 10, fontSize: 10.5,
               color: "#6d808f", fontFamily: "ui-monospace, monospace", letterSpacing: 0.5 }}>
               {penMode ? `${penStyle === "rings" ? "rings" : penCount + " lines"} · ${penLines.length} pens${S.perspective && penRelief > 0 ? " · 3D" : ""}${penHidden ? " · hidden-line" : ""}`
-                : solid3d ? `${surfaceBands.length} bands · ${S.nx}×${S.ny} sample grid · 3D`
+                : solid3d ? `${drawLayers.length + 1} regions · ${S.nx}×${S.ny} sample grid · 3D`
                 : `${regionCount} regions · ${S.nx}×${S.ny} sample grid${surface3d && perspective ? " · 3D" : ""}`}
             </div>
             <button onClick={() => setCamDrag((v) => !v)}
