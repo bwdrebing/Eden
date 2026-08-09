@@ -1,6 +1,7 @@
 import {
   buildSurface3D, buildSurface3DPanorama, buildSegmentation, computeFit, penProject,
   reflectAt, magFrac, envFromRows, paletteColorAt, ENV2D_W, DEFAULT_EMITTERS,
+  crestField, RASTER_LEVELS, RASTER_DEFAULT,
 } from "./WaterReflectionContours";
 
 /* ------------------------------------------------------------------ *
@@ -249,4 +250,58 @@ test("a farther band lands higher on screen (occluded raster projects correctly)
   const ys = pathYs(layers[0]);
   const meanY = ys.reduce((a, b) => a + b, 0) / ys.length;
   expect(meanY).toBeLessThan(250);
+});
+
+/* ------------------------------------------------------------------ *
+ * Crest seams and render resolution
+ * ------------------------------------------------------------------ */
+
+test("raster levels step up from the long-standing defaults", () => {
+  expect(RASTER_LEVELS[RASTER_DEFAULT]).toEqual({ name: "normal", BW: 440, gN: 150 });
+  expect(RASTER_LEVELS[0]).toEqual({ name: "draft", BW: 320, gN: 110 });   // low-power pin
+  for (let i = 1; i < RASTER_LEVELS.length; i++) {
+    expect(RASTER_LEVELS[i].BW).toBeGreaterThan(RASTER_LEVELS[i - 1].BW);
+    expect(RASTER_LEVELS[i].gN).toBeGreaterThan(RASTER_LEVELS[i - 1].gN);
+  }
+});
+
+test("no crest field when nothing occludes anything", () => {
+  const BW = 40, BH = 30, NP = BW * BH;
+  const cov = new Uint8Array(NP).fill(1);
+  expect(crestField(new Uint8Array(NP), cov, BW, BH, NP)).toBeNull();
+});
+
+test("a crest field crosses zero sub-pixel along a staircase edge", () => {
+  // an occluding sheet whose raster boundary is a shallow staircase: one step
+  // down every four pixels, exactly the pattern a near-horizontal crest makes
+  const BW = 64, BH = 40, NP = BW * BH;
+  const cov = new Uint8Array(NP).fill(1);
+  const occ = new Uint8Array(NP);
+  const edgeAt = (x) => 20 + Math.floor(x / 4);
+  for (let y = 0; y < BH; y++) for (let x = 0; x < BW; x++)
+    if (y >= edgeAt(x)) occ[y * BW + x] = 1;
+  const cr = crestField(occ, cov, BW, BH, NP);
+  expect(cr).not.toBeNull();
+
+  // where the field crosses zero down each column, in sub-pixel rows
+  const crossings = [];
+  for (let x = 2; x < BW - 2; x++) {
+    for (let y = 1; y < BH - 1; y++) {
+      const a = cr[y * BW + x], b = cr[(y + 1) * BW + x];
+      if (a && b && ((a < 0) !== (b < 0))) { crossings.push(y + a / (a - b)); break; }
+    }
+  }
+  expect(crossings.length).toBeGreaterThan(40);
+  // the staircase itself only ever crosses at whole pixels; a sub-pixel
+  // estimate has to land off the integers most of the time
+  const fracs = crossings.map((c) => Math.abs(c - Math.round(c)));
+  const offGrid = fracs.filter((f) => f > 0.08).length;
+  expect(offGrid / fracs.length).toBeGreaterThan(0.5);
+  // and it has to stay monotone along the edge — a smoothed staircase, not noise
+  for (let i = 1; i < crossings.length; i++)
+    expect(crossings[i]).toBeGreaterThanOrEqual(crossings[i - 1] - 0.01);
+
+  // away from the edge there is no band, so nothing gets snapped
+  expect(cr[2 * BW + 30]).toBe(0);
+  expect(cr[(BH - 3) * BW + 30]).toBe(0);
 });

@@ -793,6 +793,11 @@ function buildDepthBuffer(S, fit, relief, threeD, BW, BH) {
 //    per-color signed distance fields, composed through the reflection and
 //    contoured at zero (buildSurface3DPanorama).
 
+// depth ratio at which a second fragment counts as "behind" rather than the
+// same sheet seen twice (adjacent triangles share edges and land on the same
+// pixel at almost equal depth)
+const CREST_MARGIN = 0.98, CREST_MARGIN_INV = 1 / CREST_MARGIN;
+
 // smooth a raster-space contour multipolygon into a bezier path in viewBox
 // coordinates (the raster is BW×BH, the viewBox VB_W×VB_H)
 function contourToScreenPath(multi, BW, BH, iters) {
@@ -839,7 +844,7 @@ function rasterizeSurface(S, fit, gN, BW) {
   }
   const zb = new Float64Array(NP).fill(Infinity);
   const GI = new Float32Array(NP), GJ = new Float32Array(NP);
-  const cov = new Uint8Array(NP);
+  const cov = new Uint8Array(NP), occ = new Uint8Array(NP);
   const tri = (a, b, c) => {
     const q0 = QW[a], q1 = QW[b], q2 = QW[c];
     if (!q0 || !q1 || !q2) return;                 // vertex at/behind the eye
@@ -862,11 +867,17 @@ function rasterizeSurface(S, fit, gN, BW) {
       const iw = w0 * q0 + w1 * q1 + w2 * q2;
       if (iw <= 0) continue;
       const z = 1 / iw, p = y * BW + x;
-      if (z < zb[p]) {
+      const prev = zb[p];
+      if (z < prev) {
+        // this fragment buries whatever was here: the pixel is in front of
+        // other water, which is what makes it part of an occluding sheet
+        if (prev < Infinity && z < prev * CREST_MARGIN) occ[p] = 1;
         zb[p] = z;
         GI[p] = (w0 * q0 * ia + w1 * q1 * ib + w2 * q2 * ic) / iw;
         GJ[p] = (w0 * q0 * ja + w1 * q1 * jb + w2 * q2 * jc) / iw;
         cov[p] = 1;
+      } else if (z > prev * CREST_MARGIN_INV) {
+        occ[p] = 1;                            // …or it lands behind one
       }
     }
   };
@@ -878,14 +889,70 @@ function rasterizeSurface(S, fit, gN, BW) {
   for (let p = 0; p < NP; p++) { inn[p] = cov[p]; out[p] = 1 - cov[p]; }
   const Din = distTransform(inn, BW, BH), Dout = distTransform(out, BW, BH);
   const sil = new Float64Array(NP);
-  for (let p = 0; p < NP; p++) sil[p] = cov[p] ? Din[p] - 0.5 : -(Dout[p] - 0.5);
+  let occluding = false;
+  for (let p = 0; p < NP; p++) {
+    sil[p] = cov[p] ? Din[p] - 0.5 : -(Dout[p] - 0.5);
+    if (occ[p]) occluding = true;
+  }
   // coverage is point-sampled, so that distance field steps in whole pixels and
   // its zero set is the staircase of pixel edges the mask happens to have. A
   // couple of box passes turn the steps into a ramp, and the crossing then
   // slides sub-pixel along the edge — the silhouette reads as the smooth curve
   // the crest actually is instead of a flight of stairs.
-  blurField(sil, BW, BH, new Float64Array(NP), 2);
-  return { BW, BH, NP, stride, GX, GY, GI, GJ, cov, sil };
+  const tmp = new Float64Array(NP);            // one scratch buffer for both blurs
+  blurField(sil, BW, BH, tmp, 2);
+  // flat water occludes nothing, so skip the seam pass entirely
+  const crest = occluding ? crestField(occ, cov, BW, BH, NP, tmp) : null;
+  return { BW, BH, NP, stride, GX, GY, GI, GJ, cov, sil, crest };
+}
+
+// ---- crest seams ---------------------------------------------------
+// The outer water edge is not the only silhouette in the frame: wherever a
+// near crest cuts across the water behind it, the two sides of that edge are
+// different sheets of the same surface and the scalar jumps from one pixel to
+// the next. Marching squares interpolates the jump anyway, and since the two
+// values are unrelated the crossing lands at an arbitrary point in the pixel
+// gap — the edge comes out as a staircase of whole pixels, and picks up a
+// hairline sliver of a band that exists on neither sheet.
+//
+// The jump itself can't be interpolated, but we do know where the silhouette
+// runs: the same trick the outer edge uses works here. Mark which side of the
+// seam each pixel sits on (+1 near sheet, −1 occluded, 0 away from any seam)
+// and blur it; the zero crossing of that ramp is a sub-pixel, along-the-seam
+// smooth estimate of the crest. contourRegion then re-expresses the field
+// inside the seam band as distance to that curve, keeping each pixel's side of
+// the region boundary but moving the boundary itself onto the crest.
+//
+// Finding the seams costs nothing extra, because the z-buffer already knows:
+// `occ` marks every pixel where the rasterizer saw a second, much deeper
+// fragment. That set is exactly the part of the surface standing in front of
+// other water, so its outline IS the crest silhouette. Reading it off the
+// depth test beats hunting for a threshold on depth gradients, which cannot
+// tell a genuine tear from the far field, where one pixel legitimately spans
+// many grid rows and every neighbour step is large.
+function crestField(occ, cov, BW, BH, NP, scratch) {
+  // ±1 either side of the silhouette, blurred into a ramp whose zero crossing
+  // is a sub-pixel, along-the-edge smooth estimate of where the crest runs
+  const side = new Float64Array(NP);
+  for (let p = 0; p < NP; p++) side[p] = occ[p] ? 1 : -1;
+  // …but only near that crossing: elsewhere the ramp is a plateau with no
+  // boundary to place, and snapping the field to it would drag unrelated color
+  // edges around. The band is where a 3×3 neighbourhood straddles the outline.
+  const band = new Uint8Array(NP);
+  let any = false;
+  for (let y = 1; y < BH - 1; y++) for (let x = 1; x < BW - 1; x++) {
+    const p = y * BW + x;
+    if (!cov[p]) continue;
+    let on = 0, off = 0;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      if (occ[p + dy * BW + dx]) on++; else off++;
+    }
+    if (on && off) { band[p] = 1; any = true; }
+  }
+  if (!any) return null;                       // nothing occludes anything
+  blurField(side, BW, BH, scratch || new Float64Array(NP), 2);
+  for (let p = 0; p < NP; p++) if (!band[p]) side[p] = 0;
+  return side;
 }
 
 // sample a ground-space function at every surface-grid vertex
@@ -922,13 +989,24 @@ function rasterField(R, vals) {
 // {field >= t} intersected with the wave silhouette, as one smooth screen
 // path. Both operands are signed distances to their own boundary, so the min
 // is the intersection and the zero crossing lands on whichever edge is nearer.
+//
+// Inside a crest seam the field is replaced by distance to the crest, carrying
+// the pixel's own sign: which side of the boundary a pixel is on is untouched
+// (so no region gains or loses a pixel, and no new boundary appears where the
+// two sides agree), but a boundary that does run through the seam is now
+// interpolated along the smooth crest curve instead of the pixel staircase.
 function contourRegion(R, field, t, iters, buf) {
-  const { NP, BW, BH, cov, sil } = R;
+  const { NP, BW, BH, cov, sil, crest } = R;
   for (let p = 0; p < NP; p++) {
     const s = sil[p];
     if (!cov[p]) { buf[p] = s; continue; }
     const v = field[p] - t;
-    buf[p] = v < s ? v : s;
+    let b = v < s ? v : s;
+    if (crest) {
+      const c = crest[p];
+      if (c) b = b < 0 ? -Math.abs(c) : Math.abs(c);
+    }
+    buf[p] = b;
   }
   const multi = d3.contours().size([BW, BH]).thresholds([0])(buf)[0];
   return contourToScreenPath(multi, BW, BH, iters);
@@ -961,7 +1039,7 @@ function buildSurface3D(S, fit, opts) {
 function buildSurface3DPanorama(S, fit, opts) {
   const { uvAt, env2d, fresAt, fresThresholds, gN = 140, BW = 420 } = opts;
   const R = rasterizeSurface(S, fit, gN, BW);
-  const { NP, BH, cov, sil } = R;
+  const { NP, BH, cov, sil, crest } = R;
   const iters = S.smooth || 0;
   const stack = panoramaStack(env2d);
   const { EW, EH, colorOf, order, K } = stack;
@@ -992,7 +1070,12 @@ function buildSurface3DPanorama(S, fit, opts) {
       const q = tap[p], fx = tx[p], fy = ty[p];
       const d = (D[q] * (1 - fx) + D[q + 1] * fx) * (1 - fy)
               + (D[q + EW] * (1 - fx) + D[q + EW + 1] * fx) * fy;
-      buf[p] = d < s ? d : s;
+      let b = d < s ? d : s;
+      if (crest) {                            // snap seam crossings to the crest
+        const c = crest[p];
+        if (c) b = b < 0 ? -Math.abs(c) : Math.abs(c);
+      }
+      buf[p] = b;
     }
     const multi = d3.contours().size([BW, BH]).thresholds([0])(buf)[0];
     layers[k] = { d: contourToScreenPath(multi, BW, BH, iters), color: colorOf[order[k]] };
@@ -1065,6 +1148,24 @@ function buildPenConcentric(S, fit, colorAt, opts) {
   }
   return [...byColor.entries()].map(([color, subs]) => ({ color, d: subs.join("") }));
 }
+
+// Resolution of the 3D surface pass, as named steps. `BW` is the width of the
+// screen-space raster the regions are contoured on, `gN` the tessellation of
+// the wave surface fed into it — the two limits on how fine a 3D edge can be,
+// so they move together. "normal" is the long-standing default and "draft" is
+// what low-power mode pins to, both unchanged; the steps above them exist for
+// stills and print, where a slow render is worth a cleaner outline. Cost grows
+// with BW² (every color layer is contoured over the whole raster), so the top
+// steps are export settings, not interactive ones.
+const RASTER_LEVELS = [
+  { name: "draft",  BW: 320,  gN: 110 },
+  { name: "normal", BW: 440,  gN: 150 },
+  { name: "fine",   BW: 640,  gN: 200 },
+  { name: "high",   BW: 900,  gN: 260 },
+  { name: "print",  BW: 1300, gN: 320 },
+  { name: "max",    BW: 1900, gN: 400 },
+];
+const RASTER_DEFAULT = 1;   // "normal"
 
 // ---- color environment --------------------------------------------
 // 2D environment panorama: width = azimuth (looking across the lake),
@@ -1534,7 +1635,7 @@ export {
   buildGeometry, buildSegmentation, envFromRows, stampObjects,
   paletteStops, paletteColorAt, DERIVED_ENV_H, ENV2D_W, DEFAULT_EMITTERS,
   computeFit, cell2ground, heightAt, clampLift, penProject, reflectAt, magFrac,
-  buildSurface3D, buildSurface3DPanorama,
+  buildSurface3D, buildSurface3DPanorama, crestField, RASTER_LEVELS, RASTER_DEFAULT,
 };
 
 // ---- layered-paper stack export -----------------------------------
@@ -2056,6 +2157,7 @@ export default function App() {
   const [speed, setSpeed] = useState(0.5);
   const [manualTime, setManualTime] = useState(0); // scrub the wave phase when not animating
   const [lowPower, setLowPower] = useState(false);  // cap resolution + throttle animation
+  const [rasterQ, setRasterQ] = useState(RASTER_DEFAULT); // 3D surface resolution step
   const [quality, setQuality] = useState(() =>
     (typeof window !== "undefined" && window.innerWidth < 820) ? 100 : 140);
   const [advanced, setAdvanced] = useState(false);
@@ -2155,6 +2257,7 @@ export default function App() {
     waveScale: [waveScale, setWaveScale], edges: [edges, setEdges],
     animate: [animate, setAnimate], speed: [speed, setSpeed], quality: [quality, setQuality],
     manualTime: [manualTime, setManualTime], lowPower: [lowPower, setLowPower],
+    rasterQ: [rasterQ, setRasterQ],
     advanced: [advanced, setAdvanced], emitters: [emitters, setEmitters],
     halfW: [halfW, setHalfW], yNear: [yNear, setYNear], yFar: [yFar, setYFar],
     reflMag: [reflMag, setReflMag], objects: [objects, setObjects],
@@ -2309,6 +2412,9 @@ export default function App() {
   // Low power renders on a coarser grid, so every redraw (each pan, zoom, or
   // animation frame) does far less contour work.
   const effQuality = lowPower ? Math.min(quality, 70) : quality;
+  // low power pins the 3D pass to "draft" — the battery saver has the last word
+  const rasterLevel = RASTER_LEVELS[
+    Math.max(0, Math.min(RASTER_LEVELS.length - 1, lowPower ? 0 : rasterQ))];
 
   const S = useMemo(() => ({
     nx: effQuality, ny: effQuality,
@@ -2455,7 +2561,7 @@ export default function App() {
     const fit = computeFit(S);
     const mag = S.reflMag || 1;
     S._ems = S.emitters.filter((e) => e.on).map((e) => prepEmitter(e, S));
-    const raster = { gN: lowPower ? 110 : 150, BW: lowPower ? 320 : 440 };
+    const raster = { gN: rasterLevel.gN, BW: rasterLevel.BW };
     // occluded Fresnel: the deep-water weight at the front-most surface point,
     // contoured into the same bands the flat path clips with
     const fresAt = fresOn ? (gx, gy) => fresnelDeepW(reflectAt(gx, gy, S)[3]) : null;
@@ -2493,7 +2599,7 @@ export default function App() {
       Math.asin(Math.max(-1, Math.min(1, reflectAt(gx, gy, S)[2]))) * 180 / Math.PI;
     const { layers, fres } = buildSurface3D(S, fit, { scalarAt, thresholds: boundaries, fresAt, fresThresholds, ...raster });
     return { bg: cols[0], layers: layers.map((d, k) => ({ d, color: cols[k + 1] })), fres };
-  }, [solid3d, S, use2d, mode, envEffective, azSpan, colors1d, presetColors, fresOn, fresBands, lowPower]);
+  }, [solid3d, S, use2d, mode, envEffective, azSpan, colors1d, presetColors, fresOn, fresBands, rasterLevel]);
 
   // in 3D-solid mode the occluded surf3d geometry drives every filled-region
   // code path below (live preview, SVG export, Fresnel clips) in place of the
@@ -2830,7 +2936,7 @@ export default function App() {
             <div style={{ position: "absolute", left: 12, bottom: 10, fontSize: 10.5,
               color: "#6d808f", fontFamily: "ui-monospace, monospace", letterSpacing: 0.5 }}>
               {penMode ? `${penStyle === "rings" ? "rings" : penCount + " lines"} · ${penLines.length} pens${S.perspective && penRelief > 0 ? " · 3D" : ""}${penHidden ? " · hidden-line" : ""}`
-                : solid3d ? `${drawLayers.length + 1} regions · ${S.nx}×${S.ny} sample grid · 3D`
+                : solid3d ? `${drawLayers.length + 1} regions · ${S.nx}×${S.ny} sample grid · 3D ${rasterLevel.name} ${rasterLevel.BW}px`
                 : `${regionCount} regions · ${S.nx}×${S.ny} sample grid${surface3d && perspective ? " · 3D" : ""}`}
             </div>
             <button onClick={() => setCamDrag((v) => !v)}
@@ -3319,6 +3425,23 @@ export default function App() {
                   onChange={setYNear} fmt={(v) => v.toFixed(1)} />
                 <Slider label="plane depth (far edge)" value={yFar} min={10} max={90} step={2} onChange={setYFar} />
                 <Slider label="sample grid" value={quality} min={60} max={220} step={10} onChange={setQuality} />
+                <Slider label="3D surface detail" value={rasterQ} min={0} max={RASTER_LEVELS.length - 1}
+                  step={1} onChange={setRasterQ}
+                  fmt={(v) => {
+                    const L = RASTER_LEVELS[v];
+                    return `${L.name} · ${L.BW}px` + (lowPower && v > 0 ? " (capped)" : "");
+                  }} />
+                <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 10, lineHeight: 1.5,
+                  fontFamily: "ui-monospace, monospace" }}>
+                  {solid3d
+                    ? "Resolution of the 3D pass: the regions are contoured on a raster this many"
+                      + " pixels wide, so it sets how fine a wave edge can get — mostly visible"
+                      + " along the crest lines, where a near wave cuts across the water behind"
+                      + " it. Cost grows with the square, and every color layer pays it: print and"
+                      + " max are meant for a still you export, not for panning around."
+                    : "Only applies to the 3D wave surface, which is off."}
+                  {lowPower && rasterQ > 0 && " Low power mode is holding this at draft."}
+                </div>
               </div>
             )}
 
