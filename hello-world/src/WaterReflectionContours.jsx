@@ -799,13 +799,15 @@ function buildDepthBuffer(S, fit, relief, threeD, BW, BH) {
 const CREST_MARGIN = 0.98, CREST_MARGIN_INV = 1 / CREST_MARGIN;
 
 // smooth a raster-space contour multipolygon into a bezier path in viewBox
-// coordinates (the raster is BW×BH, the viewBox VB_W×VB_H)
-function contourToScreenPath(multi, BW, BH, iters) {
+// coordinates (the raster is BW×BH, the viewBox VB_W×VB_H). `off` shifts
+// contour coordinates back from a padded raster (a one-pixel replicated border
+// lets a region's edge cross the frame instead of stopping half a pixel inside).
+function contourToScreenPath(multi, BW, BH, iters, off = 0) {
   const kx = VB_W / BW, ky = VB_H / BH;
   let d = "";
   for (const poly of multi.coordinates) {
     for (const ring0 of poly) {
-      let ring = ring0.map((p) => [p[0] * kx, p[1] * ky]);
+      let ring = ring0.map((p) => [(p[0] + off) * kx, (p[1] + off) * ky]);
       ring = iters ? chaikin(ring, iters) : ring;
       const simp = simplifyRing(ring, 0.6);
       if (simp.length >= 3) { d += ringToBezier(simp); continue; }
@@ -828,14 +830,20 @@ function cr4(a, b, c, d, t) {
 // already occluded. `cov` marks the pixels the water reaches; `sil` is its
 // signed distance field in raster pixels, which lets a region end half a pixel
 // out from the last covered pixel instead of tracing that pixel's square edge.
-function rasterizeSurface(S, fit, gN, BW) {
+//
+// `lift` off leaves the surface on the water plane: same raster, same
+// occlusion test (which then finds nothing to occlude), so the flat modes can
+// share this path purely for what the raster gives them for free — a picture
+// sampled on the FRAME rather than on the ground plane, with everything
+// outside the viewport absent instead of merely clipped later.
+function rasterizeSurface(S, fit, gN, BW, lift = true) {
   const BH = Math.max(2, Math.round(BW * VB_H / VB_W));
   const stride = gN + 1, NV = stride * stride, NP = BW * BH;
   const GX = new Float64Array(NV), GY = new Float64Array(NV);
   const SX = new Float64Array(NV), SY = new Float64Array(NV), QW = new Float64Array(NV);
   for (let j = 0; j <= gN; j++) for (let i = 0; i <= gN; i++) {
     const [gx, gy] = cell2ground((i / gN) * S.nx, (j / gN) * S.ny, S);
-    const gz = clampLift(heightAt(gx, gy, S) * S.waveScale, S, fit);
+    const gz = lift ? clampLift(heightAt(gx, gy, S) * S.waveScale, S, fit) : 0;
     const [sx, sy, dp] = penProject(gx, gy, gz, S, fit);
     const q = j * stride + i;
     GX[q] = gx; GY[q] = gy;
@@ -1664,19 +1672,201 @@ export {
 //     a single region separates them from the blob (the smilie's eyes+mouth,
 //     one region — the face — away from the frontier).
 //
-// A sheet's outline is contoured with the same d3.contours + multiToPath
+// A sheet's outline is contoured with the same d3.contours + Chaikin + bezier
 // pipeline as the union layers, so edges stay smooth and correctly projected.
 // The graph algorithms (region labeling, denoise, and the peel-order
 // planner — greedy + budgeted exact search) live in paperStack.js.
+//
+// What the regions are labeled ON is the other half of the story. The stack
+// used to be planned on the water's GROUND grid, which quietly cost it every
+// property the SVG export had gained: colors were read on the flat plane (so
+// the sheets ignored the 3D relief), each layer was lifted and projected
+// independently (so a wave's hidden far side was cut as a hole overlapping the
+// crest in front of it), and the whole plane was planned and emitted even when
+// the camera was zoomed into a corner of it. It is now labeled on the SCREEN
+// raster instead — buildPaperImage below — which is the same z-buffered
+// surface raster the 3D-solid render contours. All three follow from that.
 
 const PAPER_FRAME_COLOR = "#ff2d78"; // fallback registration color if no background
 
-// full pipeline: color grid (+ palette id->hex) -> ordered sheets with paths.
+// Smallest feature the stack will keep, as a fraction of the frame's area:
+// anything smaller is merged into its biggest neighbour. Scale-free on purpose
+// — the minimum cuttable feature is a property of the picture (and of scissors)
+// rather than of the raster it happens to be sampled on, so raising the
+// resolution buys smoother cut lines, not more speckle to cut out.
+const PAPER_MIN_FEATURE = 2.6e-4;
+
+// Cap on the raster the stack is planned on. The "3D surface detail" slider
+// drives it (same picture as the render), but the top steps exist to sharpen a
+// crest line by a fraction of a pixel — here they would only mean labeling and
+// planning millions of pixels for cut lines nobody can cut that finely.
+const PAPER_MAX_BW = 560;
+
+// How many colors of paper the stack may call for. Screen colors are free and
+// paper colors are not: a smooth gradient — which is what a preset palette
+// becomes the moment a reflected object forces the panorama path, and what any
+// "melted" painted panorama is — hands the planner dozens of near-identical
+// shades, and each one costs at least a sheet (usually several, since a color
+// reappearing at another depth needs its own). Posterizing first is what makes
+// the difference between a buildable stack and a two-hundred-sheet answer to a
+// question nobody asked: on the default scene (a preset palette turned into a
+// panorama by the reflected sailboat, times three Fresnel bands) the same
+// picture costs 191 sheets ungraded, 34 at 16 colors, and 16 at this cap — the
+// knee of that curve, and still above the default band count, so an ordinarily
+// banded palette passes through untouched.
+const PAPER_MAX_COLORS = 12;
+
+// Weighted k-means in Lab over the DISTINCT colors of the image — a few dozen
+// points, so this is trivial next to everything around it. Deterministic
+// throughout: seeded by area, then k-means++ by weighted distance², and each
+// final center snapped to a real color of the picture, because the answer has
+// to be a color you can buy paper in, not a cluster mean.
+// `keep` (the mount's color) always survives as its own representative: the
+// frame sheet is drawn in it whatever happens, and the background regions have
+// to keep matching it or the water edge gets cut a second time.
+function reducePaperPalette(palette, counts, K, keep = -1) {
+  const n = palette.length;
+  if (n <= K) return null;
+  const L = palette.map((c) => { const l = d3.lab(c); return [l.l, l.a, l.b]; });
+  const d2 = (p, q) => (p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 + (p[2] - q[2]) ** 2;
+
+  let seed = keep >= 0 ? keep : 0;
+  if (keep < 0) for (let i = 1; i < n; i++) if (counts[i] > counts[seed]) seed = i;
+  const centers = [L[seed].slice()];
+  const near = L.map((p) => d2(p, centers[0]));
+  while (centers.length < K) {
+    let best = -1, bestScore = -1;
+    for (let i = 0; i < n; i++) {
+      const s = counts[i] * near[i];
+      if (s > bestScore) { bestScore = s; best = i; }
+    }
+    if (best < 0 || bestScore <= 0) break;
+    centers.push(L[best].slice());
+    for (let i = 0; i < n; i++) {
+      const dd = d2(L[i], centers[centers.length - 1]);
+      if (dd < near[i]) near[i] = dd;
+    }
+  }
+
+  const k = centers.length;
+  const owner = new Int32Array(n);
+  for (let it = 0; it < 12; it++) {
+    let moved = false;
+    for (let i = 0; i < n; i++) {
+      let b = 0, bd = Infinity;
+      for (let c = 0; c < k; c++) { const dd = d2(L[i], centers[c]); if (dd < bd) { bd = dd; b = c; } }
+      if (owner[i] !== b) { owner[i] = b; moved = true; }
+    }
+    if (!moved && it) break;
+    const sum = Array.from({ length: k }, () => [0, 0, 0, 0]);
+    for (let i = 0; i < n; i++) {
+      const s = sum[owner[i]], w = counts[i];
+      s[0] += L[i][0] * w; s[1] += L[i][1] * w; s[2] += L[i][2] * w; s[3] += w;
+    }
+    for (let c = 0; c < k; c++) if (sum[c][3]) {
+      centers[c] = [sum[c][0] / sum[c][3], sum[c][1] / sum[c][3], sum[c][2] / sum[c][3]];
+    }
+  }
+
+  // representative = the cluster's own biggest color, so every sheet names a
+  // color that is actually in the picture
+  const rep = new Int32Array(k).fill(-1);
+  for (let i = 0; i < n; i++) {
+    const c = owner[i];
+    if (rep[c] < 0 || counts[i] > counts[rep[c]]) rep[c] = i;
+  }
+  if (keep >= 0) rep[owner[keep]] = keep;
+  return { map: (id) => rep[owner[id]] };
+}
+
+// The picture the sheets are cut from: one flat color per pixel of a
+// screen-space raster of the viewport, sampled at the VISIBLE surface point.
+//
+// This is the 3D render's own raster (rasterizeSurface) read a second way —
+// instead of contouring one band boundary at a time, every pixel is resolved
+// to its final color. Three things come with it:
+//
+//   * 3D surface detail: colors are sampled where the lifted surface actually
+//     is, so a sheet edge falls on the crest the render draws it on.
+//   * Occlusion: the z-buffer keeps the front-most fragment, so water hidden
+//     behind a nearer crest contributes nothing at all.
+//   * Frame cropping: the raster IS the viewport, so off-screen water is never
+//     sampled, never planned into a sheet, and never exported.
+//
+// Fields are reconstructed from the surface grid with the same Catmull-Rom
+// kernel the render uses (rasterField), which is also what keeps the far field
+// — where one pixel spans many wavelengths — from aliasing into a confetti of
+// one-pixel regions.
+function buildPaperImage(S, fit, opts) {
+  const { gN = 150, BW = 440, lift = true, bgColor,
+          maxColors = PAPER_MAX_COLORS,
+          scalarAt, thresholds, cols,      // preset / 1D palettes: one scalar
+          uvAt, env2d,                     // painted panorama: reflected u,v
+          fresAt, fresBands, deepMix } = opts;
+  const R = rasterizeSurface(S, fit, gN, BW, lift);
+  const { NP, cov } = R;
+
+  const idOf = new Map(), palette = [];
+  const idFor = (c) => {
+    let id = idOf.get(c);
+    if (id === undefined) { id = palette.length; idOf.set(c, id); palette.push(c); }
+    return id;
+  };
+  const bgId = idFor(bgColor || PAPER_FRAME_COLOR);
+
+  let colorOf;
+  if (uvAt) {
+    const { w: EW, h: EH, cells } = env2d;
+    const nv = R.GX.length;
+    const su = new Float64Array(nv), sv = new Float64Array(nv);
+    for (let q = 0; q < nv; q++) {
+      const uv = uvAt(R.GX[q], R.GY[q]); su[q] = uv[0]; sv[q] = uv[1];
+    }
+    const fu = rasterField(R, su), fv = rasterField(R, sv);
+    colorOf = (p) => {
+      const u = fu[p] < 0 ? 0 : fu[p] > EW - 1 ? EW - 1 : fu[p] | 0;
+      const v = fv[p] < 0 ? 0 : fv[p] > EH - 1 ? EH - 1 : fv[p] | 0;
+      return cells[v * EW + u];
+    };
+  } else {
+    const fs = rasterField(R, gridSamples(R, scalarAt));
+    colorOf = (p) => {
+      let k = 0;
+      for (const t of thresholds) { if (fs[p] >= t) k++; else break; }
+      return cols[k] || cols[0];
+    };
+  }
+  const fw = fresAt ? rasterField(R, gridSamples(R, fresAt)) : null;
+
+  const grid = new Int32Array(NP);
+  const counts = [];
+  for (let p = 0; p < NP; p++) {
+    if (!cov[p]) { grid[p] = bgId; counts[bgId] = (counts[bgId] || 0) + 1; continue; }
+    let c = colorOf(p);                          // off the water: the mount
+    if (fw) {
+      const b = Math.floor(fw[p] * fresBands);
+      c = deepMix(c, b >= fresBands ? fresBands - 1 : b < 0 ? 0 : b);
+    }
+    const id = idFor(c);
+    grid[p] = id;
+    counts[id] = (counts[id] || 0) + 1;
+  }
+  for (let i = 0; i < palette.length; i++) if (!counts[i]) counts[i] = 0;
+
+  // posterize to a buyable number of papers (see PAPER_MAX_COLORS)
+  const q = maxColors ? reducePaperPalette(palette, counts, maxColors, bgId) : null;
+  if (q) for (let p = 0; p < NP; p++) grid[p] = q.map(grid[p]);
+  return { W: R.BW, H: R.BH, grid, palette };
+}
+
+// full pipeline: color image (+ palette id->hex) -> ordered sheets with paths.
 // bgColor is the scene's background fill: the mount/frame sheet takes this color
 // and absorbs any background-colored regions, so the water edge is cut once.
-function buildPaperStack(S, grid, palette, bgColor, minCells = 5) {
-  const { nx, ny } = S;
-  const fit = computeFit(S);
+function buildPaperStack(image, bgColor, opts = {}) {
+  const { W, H, grid, palette } = image;
+  const N = W * H;
+  const iters = opts.iters || 0;
+  const minCells = opts.minCells ?? Math.max(6, Math.round(N * PAPER_MIN_FEATURE));
 
   // collapse duplicate hexes up front: two grid values with the same paper
   // color must label as ONE color, so its regions can gather onto one sheet
@@ -1684,75 +1874,67 @@ function buildPaperStack(S, grid, palette, bgColor, minCells = 5) {
   // one-color-per-step transitions and lower bound rely on)
   const hexId = new Map();
   const uniq = [];
-  for (let p = 0; p < nx * ny; p++) {
+  for (let p = 0; p < N; p++) {
     const hx = palette[grid[p]];
     let id = hexId.get(hx);
     if (id === undefined) { id = uniq.length; hexId.set(hx, id); uniq.push(hx); }
     grid[p] = id;
   }
 
-  denoiseGrid(grid, nx, ny, minCells);
-  const { label, regions } = labelRegions(grid, nx, ny);
+  denoiseGrid(grid, W, H, minCells);
+  const { label, regions } = labelRegions(grid, W, H);
   for (const r of regions) r.color = uniq[r.value];
-  const adj = buildAdjacency(label, regions.length, nx, ny);
+  const adj = buildAdjacency(label, regions.length, W, H);
 
-  // frame: a virtual node adjacent to every region touching the grid border
+  // frame: a virtual node adjacent to every region touching the frame border.
+  // Zoomed in, that border cuts through the water itself — which is the point:
+  // the sheets are planned for what is in shot, not for the whole plane.
   const frameId = regions.length;
   regions.push({ value: -1, cells: [], size: 0, color: bgColor || PAPER_FRAME_COLOR, frame: true });
   adj.push(new Set());
   const touch = new Set();
-  for (let x = 0; x < nx; x++) { touch.add(label[x]); touch.add(label[(ny - 1) * nx + x]); }
-  for (let y = 0; y < ny; y++) { touch.add(label[y * nx]); touch.add(label[y * nx + nx - 1]); }
+  for (let x = 0; x < W; x++) { touch.add(label[x]); touch.add(label[(H - 1) * W + x]); }
+  for (let y = 0; y < H; y++) { touch.add(label[y * W]); touch.add(label[y * W + W - 1]); }
   for (const r of touch) { adj[frameId].add(r); adj[r].add(frameId); }
 
   const { sheets, method } = planCollapse(regions, adj, frameId);
 
-  // exact projected water outline (clip) + overshoot expansion, as in the
-  // union-layer path, so each sheet's cut edge overshoots the frame instead of
-  // tracing it and the whole stack registers to one trapezoid.
-  const cornerPt = (ix, iy) => {
-    const [gx, gy] = cell2ground(ix, iy, S);
-    const [rx, ry] = rawProject(gx, gy, S);
-    return [fit.ox + fit.scale * rx, fit.oy + (fit.scaleY || fit.scale) * ry];
-  };
-  const cs = [cornerPt(0, 0), cornerPt(nx, 0), cornerPt(nx, ny), cornerPt(0, ny)];
-  const clip = "M" + cs.map((c) => c[0].toFixed(1) + " " + c[1].toFixed(1)).join(" L") + " Z";
-  const ex = { cx: (cs[0][0] + cs[1][0] + cs[2][0] + cs[3][0]) / 4,
-               cy: (cs[0][1] + cs[1][1] + cs[2][1] + cs[3][1]) / 4, s: 1.05 };
-
   // per sheet, contour the HOLE = everything not yet absorbed (the inverse of
   // the cumulative union). The cut line is then the boundary between this
-  // sheet's paper and the sheets below; it only touches the grid rim (the
-  // water<->background edge) on the top sheet, never re-cutting it afterwards.
+  // sheet's paper and the sheets below; it only touches the water's outline
+  // (the water<->background edge) on the top sheet, never re-cutting it
+  // afterwards. Because the image is already the visible picture, that outline
+  // is the wave silhouette itself — crests included — with no water-plane clip
+  // to shear them off.
   //
-  // A raw 0/1 mask contour is a per-cell staircase (marching squares puts
-  // every vertex at a cell-edge midpoint), so — same trick as the union
+  // A raw 0/1 mask contour is a per-pixel staircase (marching squares puts
+  // every vertex at a pixel-edge midpoint), so — same trick as the union
   // layers — contour the zero level set of a lightly blurred SIGNED DISTANCE
-  // field of the mask instead: the crossing interpolates to sub-cell
+  // field of the mask instead: the crossing interpolates to sub-pixel
   // positions and the cut edge comes out as smooth as the normal export.
-  const px = nx + 2, py = ny + 2;
-  const cum = new Uint8Array(nx * ny);
-  const inv = new Uint8Array(nx * ny);
-  const F = new Float64Array(nx * ny);
-  const tmp = new Float64Array(nx * ny);
+  const px = W + 2, py = H + 2;
+  const cum = new Uint8Array(N);
+  const inv = new Uint8Array(N);
+  const F = new Float64Array(N);
+  const tmp = new Float64Array(N);
   const FP = new Float64Array(px * py);
   // physical guard: the sheet is one piece only because every paper component
-  // reaches the grid border (= the mount margin). True for the planner's mask
+  // reaches the frame border (= the mount margin). True for the planner's mask
   // by construction; the blur must not pinch a thin bridge and break it.
   const paperHoldsTogether = () => {
-    const seen = new Uint8Array(nx * ny);
+    const seen = new Uint8Array(N);
     const st = [];
-    for (let s = 0; s < nx * ny; s++) {
+    for (let s = 0; s < N; s++) {
       if (F[s] >= 0 || seen[s]) continue;
       let touchesBorder = false;
       seen[s] = 1; st.push(s);
       while (st.length) {
-        const p = st.pop(), x = p % nx, y = (p / nx) | 0;
-        if (x === 0 || x === nx - 1 || y === 0 || y === ny - 1) touchesBorder = true;
+        const p = st.pop(), x = p % W, y = (p / W) | 0;
+        if (x === 0 || x === W - 1 || y === 0 || y === H - 1) touchesBorder = true;
         if (x > 0 && F[p - 1] < 0 && !seen[p - 1]) { seen[p - 1] = 1; st.push(p - 1); }
-        if (x < nx - 1 && F[p + 1] < 0 && !seen[p + 1]) { seen[p + 1] = 1; st.push(p + 1); }
-        if (y > 0 && F[p - nx] < 0 && !seen[p - nx]) { seen[p - nx] = 1; st.push(p - nx); }
-        if (y < ny - 1 && F[p + nx] < 0 && !seen[p + nx]) { seen[p + nx] = 1; st.push(p + nx); }
+        if (x < W - 1 && F[p + 1] < 0 && !seen[p + 1]) { seen[p + 1] = 1; st.push(p + 1); }
+        if (y > 0 && F[p - W] < 0 && !seen[p - W]) { seen[p - W] = 1; st.push(p - W); }
+        if (y < H - 1 && F[p + W] < 0 && !seen[p + W]) { seen[p + W] = 1; st.push(p + W); }
       }
       if (!touchesBorder) return false;
     }
@@ -1766,38 +1948,41 @@ function buildPaperStack(S, grid, palette, bgColor, minCells = 5) {
       const r = regions[id];
       for (const p of r.cells) if (!cum[p]) { cum[p] = 1; cumCount++; }
     }
+    // nothing of this sheet survives the cut — zoomed in past the shore, the
+    // mount is a sheet with no background left on it. Don't ask for it.
+    if (cumCount === 0) continue;
     let d = "";
-    const solid = cumCount >= nx * ny;
+    const solid = cumCount >= N;
     if (!solid) {                          // an open hole remains to cut
-      for (let p = 0; p < nx * ny; p++) inv[p] = 1 - cum[p];
-      const Din = distTransform(inv, nx, ny);   // depth into the hole
-      const Dout = distTransform(cum, nx, ny);  // depth into the paper
+      for (let p = 0; p < N; p++) inv[p] = 1 - cum[p];
+      const Din = distTransform(inv, W, H);   // depth into the hole
+      const Dout = distTransform(cum, W, H);  // depth into the paper
       let thick = 0;
-      for (let p = 0; p < nx * ny; p++) {
+      for (let p = 0; p < N; p++) {
         F[p] = Din[p] - Dout[p];                // >0 hole, <0 paper
         if (F[p] > thick) thick = F[p];
       }
       // skip the blur on hairline holes (it would erase them), and undo it if
-      // it disconnected the paper — sub-cell interpolation still smooths
+      // it disconnected the paper — sub-pixel interpolation still smooths
       if (thick >= 2) {
-        blurField(F, nx, ny, tmp, 1);
+        blurField(F, W, H, tmp, 1);
         if (!paperHoldsTogether()) {
-          for (let p = 0; p < nx * ny; p++) F[p] = Din[p] - Dout[p];
+          for (let p = 0; p < N; p++) F[p] = Din[p] - Dout[p];
         }
       }
       for (let j = 0; j < py; j++) {
-        const jj = Math.min(ny - 1, Math.max(0, j - 1));
+        const jj = Math.min(H - 1, Math.max(0, j - 1));
         for (let i = 0; i < px; i++) {
-          const ii = Math.min(nx - 1, Math.max(0, i - 1));
-          FP[j * px + i] = F[jj * nx + ii];
+          const ii = Math.min(W - 1, Math.max(0, i - 1));
+          FP[j * px + i] = F[jj * W + ii];
         }
       }
       const cont = d3.contours().size([px, py]).thresholds([0])(FP)[0];
-      if (cont) d = multiToPath(cont, S, fit, -1, ex);
+      if (cont) d = contourToScreenPath(cont, W, H, iters, -1);
     }
     out.push({ color: sh.color, d, frame: !!sh.frame, solid });
   }
-  return { sheets: out, clip, nSheets: out.length, method };
+  return { sheets: out, nSheets: out.length, method };
 }
 
 // tile the sheets into one printable SVG: each is the full viewport in its
@@ -1819,20 +2004,20 @@ function buildPaperStackSvg(stack, rollTf) {
     const cx = pad + (i % cols) * (tileW + gap);
     const cy = top + Math.floor(i / cols) * (tileH + labelH + gap);
     const tf = `translate(${cx} ${cy}) scale(${sx.toFixed(4)})` + (rollTf ? " " + rollTf : "");
-    // clip the tile to its viewport so a zoomed-in scene crops instead of
-    // spilling into neighbours; the hole is further clipped to the water plane
-    // (so its 5% overshoot never bleeds into the mount margin).
+    // clip the tile to its viewport — the roll transform rotates the picture
+    // past the frame edge, and neighbouring tiles are right there. The holes
+    // need no further clip: they are contoured on the frame raster, so they
+    // already stop at the visible wave silhouette (crests above the water
+    // plane included) and never reach past the sheet.
     body += `<clipPath id="ptile${i}"><rect x="${cx}" y="${cy}" width="${tileW}" height="${tileH}"/></clipPath>`;
-    body += `<clipPath id="ptrap${i}"><path transform="${tf}" d="${stack.clip}"/></clipPath>`;
     body += `<g clip-path="url(#ptile${i})">`;
     // full-sheet paper — this is the whole physical sheet, mount margin and all,
     // in one color; the water<->background edge is NOT drawn here
     body += `<rect x="${cx}" y="${cy}" width="${tileW}" height="${tileH}" fill="${sh.color}"/>`;
     // holes: paper removed to reveal the sheets below (hatched + dashed cut line)
-    if (sh.d) body += `<g clip-path="url(#ptrap${i})">`
-      + `<path transform="${tf}" d="${sh.d}" fill="url(#cuthatch)" fill-rule="evenodd"/>`
+    if (sh.d) body += `<path transform="${tf}" d="${sh.d}" fill="url(#cuthatch)" fill-rule="evenodd"/>`
       + `<path transform="${tf}" d="${sh.d}" fill="none" fill-rule="evenodd" stroke="#0b0f14"`
-      + ` stroke-width="1" stroke-dasharray="4 2"/></g>`;
+      + ` stroke-width="1" stroke-dasharray="4 2"/>`;
     body += `</g>`;
     body += `<rect x="${cx}" y="${cy}" width="${tileW}" height="${tileH}" fill="none"`
       + ` stroke="#000" stroke-opacity="0.35" stroke-width="1"/>`;
@@ -1846,6 +2031,11 @@ function buildPaperStackSvg(stack, rollTf) {
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}">`
     + `<rect width="${W}" height="${H}" fill="#0b0f14"/>${defs}${body}</svg>`;
 }
+
+// exported for tests: the two halves of the layered-paper export
+export {
+  buildPaperImage, buildPaperStack, buildPaperStackSvg, PAPER_MAX_BW, PAPER_MAX_COLORS,
+};
 
 // ---- UI bits -------------------------------------------------------
 function Slider({ label, value, min, max, step, onChange, fmt }) {
@@ -2551,28 +2741,22 @@ export default function App() {
   }, [penMode, penStyle, penCount, penSpacing, penRelief, penHidden, penEven, S, use2d, mode,
       envEffective, azSpan, colors1d, presetColors, fresOn, fresBands, mixDeep]);
 
-  // 3D solid surface: hidden-surface removal on a z-buffered raster, then the
-  // usual smooth contouring on top — so the lifted water keeps the flat modes'
-  // smooth region outlines but a near crest correctly hides the wave's far
-  // side. Produces occluded { layers, fres } that slot straight into the same
-  // render path the flat layers use (Fresnel, edges and all).
-  const surf3d = useMemo(() => {
-    if (!solid3d) return null;
-    const fit = computeFit(S);
+  // The fields any surface-raster pass contours: one continuous scalar for
+  // preset/1D palettes (the reflected elevation, banded at the palette's
+  // boundaries — the same banding buildGeometry uses), the reflected panorama
+  // coordinate for painted ones, plus the Fresnel deep-water weight. The live
+  // 3D render and the layered-paper export both build their picture from
+  // these, so a cut line lands where the rendered color edge does.
+  const fieldSpec = useMemo(() => {
     const mag = S.reflMag || 1;
-    S._ems = S.emitters.filter((e) => e.on).map((e) => prepEmitter(e, S));
-    const raster = { gN: rasterLevel.gN, BW: rasterLevel.BW };
     // occluded Fresnel: the deep-water weight at the front-most surface point,
     // contoured into the same bands the flat path clips with
     const fresAt = fresOn ? (gx, gy) => fresnelDeepW(reflectAt(gx, gy, S)[3]) : null;
     const fresThresholds = fresOn ? d3.range(1, fresBands).map((k) => k / fresBands) : null;
-
     if (use2d) {
-      // arbitrary panorama colors have no single scalar to contour, so run the
-      // flat path's construction on the occluded raster: the reflected
-      // panorama coordinate at each visible surface point, composed with the
-      // per-color signed distance fields. Same outlines as the flat 2D render,
-      // now stopping at the wave crests in front of them.
+      // arbitrary panorama colors have no single scalar to contour, so the
+      // reflected panorama coordinate is the field: the flat path's per-color
+      // signed distance fields get composed through it.
       const { w: EW, h: EH } = envEffective, az = azSpan;
       const uvAt = (gx, gy) => {
         const R = reflectAt(gx, gy, S);
@@ -2582,24 +2766,36 @@ export default function App() {
         let u = magFrac((psi + az) / (2 * az), mag); u = u < 0 ? 0 : u > 1 ? 1 : u;
         return [u * EW, v * EH];
       };
-      return buildSurface3DPanorama(S, fit, {
-        uvAt, env2d: envEffective, fresAt, fresThresholds, ...raster,
-      });
+      return { uvAt, env2d: envEffective, fresAt, fresThresholds };
     }
-
-    // preset / paint1d: contour the continuous reflected elevation at the
-    // palette's band boundaries — same banding as the flat path (buildGeometry),
-    // now with the wave silhouette doing the occlusion. Lowest band shows the
-    // background, exactly like the flat render, so no base layer is drawn.
     const cols = mode === "paint1d" ? colors1d : presetColors, NB = cols.length;
     const mid = (S.eLo + S.eHi) / 2, magSpan = (S.eHi - S.eLo) / mag;
     const bnd = (f) => mid + (f - 0.5) * magSpan;
-    const boundaries = S.bandFractions ? S.bandFractions.map(bnd) : d3.range(1, NB).map((k) => bnd(k / NB));
+    const thresholds = S.bandFractions ? S.bandFractions.map(bnd) : d3.range(1, NB).map((k) => bnd(k / NB));
     const scalarAt = (gx, gy) =>
       Math.asin(Math.max(-1, Math.min(1, reflectAt(gx, gy, S)[2]))) * 180 / Math.PI;
-    const { layers, fres } = buildSurface3D(S, fit, { scalarAt, thresholds: boundaries, fresAt, fresThresholds, ...raster });
+    return { scalarAt, thresholds, cols, fresAt, fresThresholds };
+  }, [S, use2d, mode, envEffective, azSpan, colors1d, presetColors, fresOn, fresBands]);
+
+  // 3D solid surface: hidden-surface removal on a z-buffered raster, then the
+  // usual smooth contouring on top — so the lifted water keeps the flat modes'
+  // smooth region outlines but a near crest correctly hides the wave's far
+  // side. Produces occluded { layers, fres } that slot straight into the same
+  // render path the flat layers use (Fresnel, edges and all).
+  const surf3d = useMemo(() => {
+    if (!solid3d) return null;
+    const fit = computeFit(S);
+    S._ems = S.emitters.filter((e) => e.on).map((e) => prepEmitter(e, S));
+    const raster = { gN: rasterLevel.gN, BW: rasterLevel.BW };
+    const { uvAt, env2d, scalarAt, thresholds, cols, fresAt, fresThresholds } = fieldSpec;
+    // painted panorama: same outlines as the flat 2D render, now stopping at
+    // the wave crests in front of them
+    if (uvAt) return buildSurface3DPanorama(S, fit, { uvAt, env2d, fresAt, fresThresholds, ...raster });
+    // preset / paint1d: the wave silhouette does the occlusion. Lowest band
+    // shows the background, exactly like the flat render, so no base layer.
+    const { layers, fres } = buildSurface3D(S, fit, { scalarAt, thresholds, fresAt, fresThresholds, ...raster });
     return { bg: cols[0], layers: layers.map((d, k) => ({ d, color: cols[k + 1] })), fres };
-  }, [solid3d, S, use2d, mode, envEffective, azSpan, colors1d, presetColors, fresOn, fresBands, rasterLevel]);
+  }, [solid3d, S, fieldSpec, rasterLevel]);
 
   // in 3D-solid mode the occluded surf3d geometry drives every filled-region
   // code path below (live preview, SVG export, Fresnel clips) in place of the
@@ -2706,63 +2902,20 @@ export default function App() {
     setSvgOut(svg); // always show a reliable copy fallback
   };
 
-  // build the sample-grid color used by the layered-paper decomposition — the
-  // same field the renderer bands/segments, one value per cell.
-  const paperColorGrid = () => {
-    S._ems = S.emitters.filter((e) => e.on).map((e) => prepEmitter(e, S));
-    const { nx, ny } = S;
-    const mag = S.reflMag || 1;
-    const grid = new Int32Array(nx * ny);
-    const deepMix = (c, cosI) => {
-      if (!fresOn) return c;
-      const b = Math.min(fresBands - 1, Math.floor(fresnelDeepW(cosI) * fresBands));
-      return mixDeep(c, b);
-    };
-    const idOf = new Map(), palette = [];
-    const idFor = (c) => {
-      let id = idOf.get(c);
-      if (id === undefined) { id = palette.length; idOf.set(c, id); palette.push(c); }
-      return id;
-    };
-    if (use2d) {
-      const { w: EW, h: EH, cells } = envEffective, az = azSpan;
-      for (let j = 0; j < ny; j++) {
-        for (let i = 0; i < nx; i++) {
-          const [gx, gy] = cell2ground(i + 0.5, j + 0.5, S);
-          const R = reflectAt(gx, gy, S);
-          const phi = Math.asin(Math.max(-1, Math.min(1, R[2]))) * 180 / Math.PI;
-          let psi = Math.atan2(R[0], R[1]) * 180 / Math.PI; psi = psi < -az ? -az : psi > az ? az : psi;
-          let v = magFrac((phi - S.eLo) / ((S.eHi - S.eLo) || 1), mag); v = v < 0 ? 0 : v > 1 ? 1 : v;
-          let u = magFrac((psi + az) / (2 * az), mag); u = u < 0 ? 0 : u > 1 ? 1 : u;
-          const c = cells[Math.min(EH - 1, Math.floor(v * EH)) * EW + Math.min(EW - 1, Math.floor(u * EW))];
-          grid[j * nx + i] = idFor(deepMix(c, R[3]));
-        }
-      }
-      return { grid, palette };
-    }
-    const cols = mode === "paint1d" ? colors1d : presetColors, NB = cols.length;
-    const fr = S.bandFractions;
-    for (let j = 0; j < ny; j++) {
-      for (let i = 0; i < nx; i++) {
-        const [gx, gy] = cell2ground(i + 0.5, j + 0.5, S);
-        const R = reflectAt(gx, gy, S);
-        const phi = Math.asin(Math.max(-1, Math.min(1, R[2]))) * 180 / Math.PI;
-        let v = magFrac((phi - S.eLo) / ((S.eHi - S.eLo) || 1), mag); v = v < 0 ? 0 : v >= 1 ? 0.999999 : v;
-        let c;
-        if (fr) {
-          let idx = 0;
-          for (const f of fr) { if (v >= f) idx++; else break; }
-          c = cols[idx] || cols[0];
-        } else c = cols[Math.floor(v * NB)] || cols[0];
-        grid[j * nx + i] = idFor(deepMix(c, R[3]));
-      }
-    }
-    return { grid, palette };
-  };
-
+  // Layered paper: cut the same picture the SVG export draws. Both resolve the
+  // scene on the visible-surface raster, so the sheets ride the 3D relief, stop
+  // where a nearer crest hides the water behind it, and cover exactly what is
+  // in frame — no plan, and no path, for water the camera cannot see.
   const exportPaperStack = () => {
-    const { grid, palette } = paperColorGrid();
-    const stack = buildPaperStack(S, grid, palette, bgFill);
+    const fit = computeFit(S);
+    S._ems = S.emitters.filter((e) => e.on).map((e) => prepEmitter(e, S));
+    const image = buildPaperImage(S, fit, {
+      gN: rasterLevel.gN, BW: Math.min(rasterLevel.BW, PAPER_MAX_BW),
+      lift: surface3d && perspective,      // the render's own 3D-solid rule
+      bgColor: bgFill, fresBands, deepMix: mixDeep,
+      ...fieldSpec,
+    });
+    const stack = buildPaperStack(image, bgFill, { iters: S.smooth || 0 });
     const svg = buildPaperStackSvg(stack, rollTf);
     saveSvg(svg, "reflection-paper-stack.svg");
     setSvgName("reflection-paper-stack.svg");
@@ -3439,7 +3592,10 @@ export default function App() {
                       + " along the crest lines, where a near wave cuts across the water behind"
                       + " it. Cost grows with the square, and every color layer pays it: print and"
                       + " max are meant for a still you export, not for panning around."
-                    : "Only applies to the 3D wave surface, which is off."}
+                    : "The 3D wave surface is off, so this only sets the resolution of the"
+                      + " layered-paper export, which is cut from the same kind of raster."}
+                  {` The paper stack caps it at ${PAPER_MAX_BW}px — past that the`
+                    + " cut lines get finer than paper and scissors care about."}
                   {lowPower && rasterQ > 0 && " Low power mode is holding this at draft."}
                 </div>
               </div>
@@ -3529,7 +3685,9 @@ export default function App() {
             <div style={{ fontSize: 10, color: "#6d808f", marginTop: 5, lineHeight: 1.5,
               fontFamily: "ui-monospace, monospace" }}>
               A stack of same-size sheets, each one contiguous piece with holes cut, that
-              rebuilds the scene when stacked in order.
+              rebuilds the scene when stacked in order. Cut from the picture on screen —
+              the 3D surface, what the crests hide, and the current framing included —
+              posterized to at most {PAPER_MAX_COLORS} colors, since paper is not a gradient.
             </div>
 
             {svgOut && (
