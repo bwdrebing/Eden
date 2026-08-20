@@ -1,7 +1,7 @@
 import {
-  buildSurface3D, buildSurface3DPanorama, buildSegmentation, computeFit, penProject,
+  buildSurface3D, buildSurface3DPanorama, buildSolid3D, buildSegmentation, computeFit, penProject,
   reflectAt, magFrac, envFromRows, paletteColorAt, ENV2D_W, DEFAULT_EMITTERS,
-  crestField, RASTER_LEVELS, RASTER_DEFAULT,
+  crestField, RASTER_LEVELS, RASTER_DEFAULT, EXPORT_MULTS, EXPORT_MAX_BW, exportRaster,
 } from "./WaterReflectionContours";
 
 /* ------------------------------------------------------------------ *
@@ -304,4 +304,59 @@ test("a crest field crosses zero sub-pixel along a staircase edge", () => {
   // away from the edge there is no band, so nothing gets snapped
   expect(cr[2 * BW + 30]).toBe(0);
   expect(cr[(BH - 3) * BW + 30]).toBe(0);
+});
+
+/* ------------------------------------------------------------------ *
+ * Export detail: the same picture, traced on a wider raster
+ *
+ * An exported outline is a curve through one marching-squares crossing per
+ * raster pixel, so the preview's raster is the finest — and smoothest — thing
+ * the file can carry. Blown up (full screen, or printed) that pixel grid is
+ * what reads as a stair along a distant crest. Retracing wider on the way out
+ * is the fix, and it has to stay a retrace: the same regions in the same
+ * places, only resolved finer.
+ * ------------------------------------------------------------------ */
+
+test("the export raster scales the width, holds the mesh, and caps", () => {
+  const level = { name: "normal", BW: 440, gN: 150 };
+  expect(exportRaster(level, 1)).toEqual({ BW: 440, gN: 150 });
+  expect(exportRaster(level, 2)).toEqual({ BW: 880, gN: 150 });
+  // the mesh deliberately does not follow: more surface rows per raster pixel
+  // makes the far field noisier, not smoother
+  for (const m of EXPORT_MULTS) expect(exportRaster(level, m).gN).toBe(level.gN);
+  // and no multiplier can push past what a browser tab can allocate
+  const top = RASTER_LEVELS[RASTER_LEVELS.length - 1];
+  for (const m of EXPORT_MULTS) expect(exportRaster(top, m).BW).toBeLessThanOrEqual(EXPORT_MAX_BW);
+  expect(exportRaster(top, 3).BW).toBe(EXPORT_MAX_BW);
+});
+
+test("a wider export raster redraws the preview's regions, resolved finer", () => {
+  const S = { ...grazingS(), eLo: -5, eHi: 33, waveScale: 8, surface3d: true,
+    k: (2 * Math.PI) / 2.8, amp: 0.78 * 0.06, sharp: 0.3, decay: 0.18 - 0.5 * 0.16 };
+  const cols = ["#0b0f14", "#28405e", "#4f6294", "#8fa5cd"];
+  const scalarAt = (gx, gy) =>
+    (Math.asin(Math.max(-1, Math.min(1, reflectAt(gx, gy, S)[2]))) * 180) / Math.PI;
+  const fieldSpec = { scalarAt, thresholds: [2, 10, 18], cols };
+  const level = { name: "normal", BW: 440, gN: 150 };
+
+  const preview = buildSolid3D(S, fieldSpec, exportRaster(level, 1));
+  const wide = buildSolid3D(S, fieldSpec, exportRaster(level, 2));
+
+  expect(preview.layers.map((l) => l.color)).toEqual(wide.layers.map((l) => l.color));
+  for (let i = 0; i < preview.layers.length; i++) {
+    const near = pathPoints(preview.layers[i].d), far = pathPoints(wide.layers[i].d);
+    // finer raster, finer trace: more vertices along the same outlines
+    expect(far.length).toBeGreaterThan(near.length);
+    // …and they are the same outlines — every preview vertex has a wide-raster
+    // vertex sitting on top of it
+    const bucket = bucketize(far);
+    let sum = 0, n = 0;
+    for (let k = 0; k < near.length; k += 4) {
+      const [x, y] = near[k];
+      if (x < 40 || x > 720 || y < 40 || y > 460) continue;   // skip the frame edges
+      sum += nearestB(bucket, x, y); n++;
+    }
+    expect(n).toBeGreaterThan(50);
+    expect(sum / n).toBeLessThan(3);
+  }
 });
