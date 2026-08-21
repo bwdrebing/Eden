@@ -994,6 +994,54 @@ function rasterField(R, vals) {
   return dst;
 }
 
+// ---- edge polish ---------------------------------------------------
+// Smooth a reconstructed raster field before it is contoured.
+//
+// What is left on a distant edge once the raster is as wide as it can go is
+// the field's own detail beating against the pixel grid: out there the
+// reflection varies on a scale finer than a pixel, so the traced boundary
+// zigzags at pixel scale. Chaikin cannot help — it converges to the spline of
+// that same polyline — and neither can smoothing the path afterwards: a filter
+// narrow enough to keep features cannot see wobble this wide, and a wide one is
+// deleting geometry. Acting on the FIELD instead gets at it before the topology
+// is decided, so a pinched-off island disappears cleanly instead of leaving a
+// degenerate ring, and every threshold of the same field moves together — the
+// bands stay parallel rather than drifting apart one by one.
+//
+// The blur has to be normalized. Running it through the uncovered pixels would
+// drag every value near the water's edge toward whatever those pixels hold and
+// bend the boundary there, so the coverage mask goes through the same kernel
+// and divides back out.
+//
+// It is still a smoothing operator: at a few passes it takes the aliasing and
+// little else, and by ~8 it starts fattening thin ribbons and pinching them
+// into dotted chains. That is why it is an export step with a light default,
+// and why the passes are counted in raster pixels — at a wider export raster
+// the same feature spans more of them, so the same count erodes less.
+function smoothField(field, cov, BW, BH, passes, scratch) {
+  if (!passes) return;
+  const NP = BW * BH;
+  const num = scratch ? scratch.num : new Float32Array(NP);
+  const den = scratch ? scratch.den : new Float32Array(NP);
+  const tmp = scratch ? scratch.tmp : new Float32Array(NP);
+  for (let p = 0; p < NP; p++) {
+    const on = cov[p];
+    num[p] = on ? field[p] : 0;
+    den[p] = on ? 1 : 0;
+  }
+  blurField(num, BW, BH, tmp, passes);
+  blurField(den, BW, BH, tmp, passes);
+  for (let p = 0; p < NP; p++) if (cov[p] && den[p] > 1e-6) field[p] = num[p] / den[p];
+}
+
+// scratch for smoothField, allocated once per build and reused by every layer —
+// at export size these are tens of megabytes apiece
+function polishScratch(NP, passes) {
+  return passes
+    ? { num: new Float32Array(NP), den: new Float32Array(NP), tmp: new Float32Array(NP) }
+    : null;
+}
+
 // {field >= t} intersected with the wave silhouette, as one smooth screen
 // path. Both operands are signed distances to their own boundary, so the min
 // is the intersection and the zero crossing lands on whichever edge is nearer.
@@ -1024,15 +1072,20 @@ function contourRegion(R, field, t, iters, buf) {
 // at the palette's band boundaries into nested upper sets, plus the occluded
 // Fresnel bands. `scalarAt`/`fresAt` are sampled at ground points.
 function buildSurface3D(S, fit, opts) {
-  const { scalarAt, thresholds, fresAt, fresThresholds, gN = 140, BW = 420 } = opts;
+  const { scalarAt, thresholds, fresAt, fresThresholds, gN = 140, BW = 420, polish = 0 } = opts;
   const R = rasterizeSurface(S, fit, gN, BW);
   const iters = S.smooth || 0;
   const buf = new Float64Array(R.NP);
+  const scratch = polishScratch(R.NP, polish);
   const fs = rasterField(R, gridSamples(R, scalarAt));
+  // one scalar carries every band here, so polishing it once moves all of them
+  // together and the bands stay parallel
+  smoothField(fs, R.cov, R.BW, R.BH, polish, scratch);
   const layers = thresholds.map((t) => contourRegion(R, fs, t, iters, buf));
   let fres = null;
   if (fresAt) {
     const ff = rasterField(R, gridSamples(R, fresAt));
+    smoothField(ff, R.cov, R.BW, R.BH, polish, scratch);
     fres = fresThresholds.map((t) => contourRegion(R, ff, t, iters, buf));
   }
   return { layers, fres };
@@ -1045,7 +1098,7 @@ function buildSurface3D(S, fit, opts) {
 // instead of the flat water grid. `uvAt` returns the reflected panorama
 // coordinate in cells, matching buildSegmentation's fG/fF.
 function buildSurface3DPanorama(S, fit, opts) {
-  const { uvAt, env2d, fresAt, fresThresholds, gN = 140, BW = 420 } = opts;
+  const { uvAt, env2d, fresAt, fresThresholds, gN = 140, BW = 420, polish = 0 } = opts;
   const R = rasterizeSurface(S, fit, gN, BW);
   const { NP, BH, cov, sil, crest } = R;
   const iters = S.smooth || 0;
@@ -1071,13 +1124,33 @@ function buildSurface3DPanorama(S, fit, opts) {
 
   const buf = new Float64Array(NP);
   const layers = new Array(K);
+  // Polishing here works per layer, because a painted panorama has no single
+  // scalar to polish — each color carries its own distance field. Adjacent
+  // bands still hold together: where two of them share a boundary their fields
+  // are each other's negation across it, and the blur is linear, so the two
+  // smoothed fields keep crossing zero in the same place.
+  const scratch = polishScratch(NP, polish);
+  const fld = polish ? new Float32Array(NP) : null;
   eachPanoramaLayer(stack, (k, D) => {
+    if (polish) {
+      for (let p = 0; p < NP; p++) {
+        if (!cov[p]) { fld[p] = 0; continue; }
+        const q = tap[p], fx = tx[p], fy = ty[p];
+        fld[p] = (D[q] * (1 - fx) + D[q + 1] * fx) * (1 - fy)
+               + (D[q + EW] * (1 - fx) + D[q + EW + 1] * fx) * fy;
+      }
+      smoothField(fld, cov, BW, BH, polish, scratch);
+    }
     for (let p = 0; p < NP; p++) {
       const s = sil[p];
       if (!cov[p]) { buf[p] = s; continue; }
-      const q = tap[p], fx = tx[p], fy = ty[p];
-      const d = (D[q] * (1 - fx) + D[q + 1] * fx) * (1 - fy)
-              + (D[q + EW] * (1 - fx) + D[q + EW + 1] * fx) * fy;
+      let d;
+      if (polish) d = fld[p];
+      else {
+        const q = tap[p], fx = tx[p], fy = ty[p];
+        d = (D[q] * (1 - fx) + D[q + 1] * fx) * (1 - fy)
+          + (D[q + EW] * (1 - fx) + D[q + EW + 1] * fx) * fy;
+      }
       let b = d < s ? d : s;
       if (crest) {                            // snap seam crossings to the crest
         const c = crest[p];
@@ -1092,6 +1165,7 @@ function buildSurface3DPanorama(S, fit, opts) {
   let fres = null;
   if (fresAt) {
     const ff = rasterField(R, gridSamples(R, fresAt));
+    smoothField(ff, cov, BW, BH, polish, scratch);
     fres = fresThresholds.map((t) => contourRegion(R, ff, t, iters, buf));
   }
   return { bg: colorOf[order[0]], layers: layers.filter((l) => l.d), fres };
@@ -1103,6 +1177,8 @@ function buildSurface3DPanorama(S, fit, opts) {
 // path the flat layers use. The live preview and the SVG export both come
 // through here, so an export traced at a wider raster is the same picture, only
 // resolved finer.
+// `raster` is { gN, BW } plus an optional `polish` pass count, and rides through
+// to whichever builder the mode picks.
 function buildSolid3D(S, fieldSpec, raster) {
   const fit = computeFit(S);
   S._ems = S.emitters.filter((e) => e.on).map((e) => prepEmitter(e, S));
@@ -1238,6 +1314,20 @@ const EXPORT_MESHES = [
 ];
 const EXPORT_MESH_DEFAULT = 0;   // as previewed
 const EXPORT_MESH_FLOOR = 110;   // "draft"'s mesh: the coarsest that still holds a wave
+
+// Export edge polish: box-blur passes over the reconstructed field before it is
+// contoured (see smoothField). This is the lever that still bites once the
+// raster is at its cap — the wobble left there is pixel-scale, and this is the
+// only step that acts at that scale without deleting the feature under it.
+// Light is the default because at export width it takes the aliasing and little
+// else; strong is for a still that has to hold up very large, at the price of
+// the thinnest ribbons.
+const EXPORT_POLISH = [
+  { name: "off",    passes: 0 },
+  { name: "light",  passes: 3 },
+  { name: "strong", passes: 8 },
+];
+const EXPORT_POLISH_DEFAULT = 1;   // light
 function exportRaster(level, mult, meshF = 1) {
   return {
     gN: Math.max(Math.min(level.gN, EXPORT_MESH_FLOOR), Math.round(level.gN * meshF)),
@@ -1716,6 +1806,7 @@ export {
   buildSurface3D, buildSurface3DPanorama, buildSolid3D, crestField,
   RASTER_LEVELS, RASTER_DEFAULT, EXPORT_MULTS, EXPORT_DEFAULT, EXPORT_MAX_BW,
   EXPORT_MESHES, EXPORT_MESH_DEFAULT, EXPORT_MESH_FLOOR, exportRaster,
+  EXPORT_POLISH, EXPORT_POLISH_DEFAULT, smoothField,
 };
 
 // ---- layered-paper stack export -----------------------------------
@@ -2422,6 +2513,7 @@ export default function App() {
   const [rasterQ, setRasterQ] = useState(RASTER_DEFAULT); // 3D surface resolution step
   const [exportQ, setExportQ] = useState(EXPORT_DEFAULT);  // export raster, x preview
   const [exportMeshQ, setExportMeshQ] = useState(EXPORT_MESH_DEFAULT); // export mesh step
+  const [exportPolishQ, setExportPolishQ] = useState(EXPORT_POLISH_DEFAULT); // export edge polish
   const [exporting, setExporting] = useState(false);       // the big retrace is synchronous
   const [quality, setQuality] = useState(() =>
     (typeof window !== "undefined" && window.innerWidth < 820) ? 100 : 140);
@@ -2524,6 +2616,7 @@ export default function App() {
     manualTime: [manualTime, setManualTime], lowPower: [lowPower, setLowPower],
     rasterQ: [rasterQ, setRasterQ], exportQ: [exportQ, setExportQ],
     exportMeshQ: [exportMeshQ, setExportMeshQ],
+    exportPolishQ: [exportPolishQ, setExportPolishQ],
     advanced: [advanced, setAdvanced], emitters: [emitters, setEmitters],
     halfW: [halfW, setHalfW], yNear: [yNear, setYNear], yFar: [yFar, setYFar],
     reflMag: [reflMag, setReflMag], objects: [objects, setObjects],
@@ -2981,11 +3074,15 @@ export default function App() {
   };
   const exportMult = EXPORT_MULTS[Math.max(0, Math.min(EXPORT_MULTS.length - 1, exportQ))];
   const exportMesh = EXPORT_MESHES[Math.max(0, Math.min(EXPORT_MESHES.length - 1, exportMeshQ))];
-  const exportAt = solid3d ? exportRaster(rasterLevel, exportMult, exportMesh.f) : null;
+  const exportPolish = EXPORT_POLISH[Math.max(0, Math.min(EXPORT_POLISH.length - 1, exportPolishQ))];
+  const exportAt = solid3d
+    ? { ...exportRaster(rasterLevel, exportMult, exportMesh.f), polish: exportPolish.passes }
+    : null;
   // a retrace is only worth its seconds when it would actually differ from what
-  // is already on screen — a wider raster, a stood-down mesh, or both
+  // is already on screen — a wider raster, a stood-down mesh, a polish pass the
+  // preview never runs, or any combination
   const exportRetrace = !!exportAt
-    && (exportAt.BW > rasterLevel.BW || exportAt.gN < rasterLevel.gN);
+    && (exportAt.BW > rasterLevel.BW || exportAt.gN < rasterLevel.gN || exportAt.polish > 0);
   const downloadSVG = () => {
     if (exporting) return;
     if (!exportRetrace) { emitSvg(null); return; }
@@ -3802,6 +3899,23 @@ export default function App() {
                   crests round off a little and the smallest far-field wavelets stop showing
                   at all. Leave it as previewed for a faithful file; reach for it when a
                   distant edge still crawls at {EXPORT_MAX_BW}px.
+                </div>
+                <Slider label="edge polish" value={exportPolishQ} min={0} max={EXPORT_POLISH.length - 1}
+                  step={1} onChange={setExportPolishQ}
+                  fmt={(v) => {
+                    const q = EXPORT_POLISH[v];
+                    return q.passes ? `${q.name} · ${q.passes} passes` : q.name;
+                  }} />
+                <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5,
+                  fontFamily: "ui-monospace, monospace" }}>
+                  Smooths the field the regions are cut from, just before they are cut. What is
+                  left on a far edge once the raster is as wide as it goes is the reflection
+                  varying faster than one pixel, and this is the step that reaches it — before
+                  the shapes are decided, so the bands stay parallel and a pinched-off speck
+                  leaves cleanly rather than as a stray ring. Light takes the crawl and little
+                  else. Strong goes further and starts to cost you the thinnest ribbons, which
+                  fatten or break into dots — worth it for a still that has to hold up very
+                  large, not much else.
                 </div>
               </div>
             )}
