@@ -1208,17 +1208,41 @@ const RASTER_DEFAULT = 1;   // "normal"
 //
 // Retracing the 3D pass wider on the way out fixes it in proportion — the
 // preview stays interactive, and one slow pass buys an edge that holds up
-// magnified. The mesh (`gN`) deliberately does NOT scale with it: a finer mesh
-// packs more surface rows into each raster pixel, and the far field, where a
-// pixel already straddles many rows, comes out noisier rather than smoother.
-// Only the raster width helps.
+// magnified. The mesh (`gN`) deliberately does NOT follow the width: a finer
+// mesh packs more surface rows into each raster pixel, and the far field, where
+// a pixel already straddles many rows, comes out noisier rather than smoother.
+// Only the raster width helps, so only it scales.
 const EXPORT_MULTS = [1, 2, 3];
 const EXPORT_DEFAULT = 1;      // 2x
 // ~9.5M pixels at 16:10. Every layer allocates a full-frame Float64 buffer, so
 // this is about as far as a browser tab goes before it starts swapping.
 const EXPORT_MAX_BW = 3800;
-function exportRaster(level, mult) {
-  return { gN: level.gN, BW: Math.min(EXPORT_MAX_BW, Math.round(level.BW * mult)) };
+
+// Export mesh: the other half of the same trade, and the one that costs
+// something. The raster decides how finely an outline is DRAWN; `gN` decides
+// how much surface detail there is to draw, and the levels raise it faster than
+// any raster can resolve — at a fixed width, a coarser mesh traces visibly
+// cleaner edges than a fine one. Standing the mesh down on export is therefore
+// a second, independent lever on the same jagged edge.
+//
+// It is off by default because it is NOT the same picture: unlike the width,
+// which resolves the preview's outlines more exactly, a coarser mesh smooths
+// the surface itself — crests round off a little and the smallest far-field
+// wavelets stop being resolved at all. That is a look, not a fidelity setting,
+// so it stays something you ask for. Below MESH_FLOOR the water stops reading
+// as water, so the scale never goes there however coarse the step.
+const EXPORT_MESHES = [
+  { name: "as previewed", f: 1 },
+  { name: "softened",     f: 0.7 },
+  { name: "smoothed",     f: 0.5 },
+];
+const EXPORT_MESH_DEFAULT = 0;   // as previewed
+const EXPORT_MESH_FLOOR = 110;   // "draft"'s mesh: the coarsest that still holds a wave
+function exportRaster(level, mult, meshF = 1) {
+  return {
+    gN: Math.max(Math.min(level.gN, EXPORT_MESH_FLOOR), Math.round(level.gN * meshF)),
+    BW: Math.min(EXPORT_MAX_BW, Math.round(level.BW * mult)),
+  };
 }
 
 // ---- color environment --------------------------------------------
@@ -1690,7 +1714,8 @@ export {
   paletteStops, paletteColorAt, DERIVED_ENV_H, ENV2D_W, DEFAULT_EMITTERS,
   computeFit, cell2ground, heightAt, clampLift, penProject, reflectAt, magFrac,
   buildSurface3D, buildSurface3DPanorama, buildSolid3D, crestField,
-  RASTER_LEVELS, RASTER_DEFAULT, EXPORT_MULTS, EXPORT_DEFAULT, EXPORT_MAX_BW, exportRaster,
+  RASTER_LEVELS, RASTER_DEFAULT, EXPORT_MULTS, EXPORT_DEFAULT, EXPORT_MAX_BW,
+  EXPORT_MESHES, EXPORT_MESH_DEFAULT, EXPORT_MESH_FLOOR, exportRaster,
 };
 
 // ---- layered-paper stack export -----------------------------------
@@ -2396,6 +2421,7 @@ export default function App() {
   const [lowPower, setLowPower] = useState(false);  // cap resolution + throttle animation
   const [rasterQ, setRasterQ] = useState(RASTER_DEFAULT); // 3D surface resolution step
   const [exportQ, setExportQ] = useState(EXPORT_DEFAULT);  // export raster, x preview
+  const [exportMeshQ, setExportMeshQ] = useState(EXPORT_MESH_DEFAULT); // export mesh step
   const [exporting, setExporting] = useState(false);       // the big retrace is synchronous
   const [quality, setQuality] = useState(() =>
     (typeof window !== "undefined" && window.innerWidth < 820) ? 100 : 140);
@@ -2497,6 +2523,7 @@ export default function App() {
     animate: [animate, setAnimate], speed: [speed, setSpeed], quality: [quality, setQuality],
     manualTime: [manualTime, setManualTime], lowPower: [lowPower, setLowPower],
     rasterQ: [rasterQ, setRasterQ], exportQ: [exportQ, setExportQ],
+    exportMeshQ: [exportMeshQ, setExportMeshQ],
     advanced: [advanced, setAdvanced], emitters: [emitters, setEmitters],
     halfW: [halfW, setHalfW], yNear: [yNear, setYNear], yFar: [yFar, setYFar],
     reflMag: [reflMag, setReflMag], objects: [objects, setObjects],
@@ -2953,15 +2980,20 @@ export default function App() {
     setSvgOut(svg); // always show a reliable copy fallback
   };
   const exportMult = EXPORT_MULTS[Math.max(0, Math.min(EXPORT_MULTS.length - 1, exportQ))];
-  const exportBW = solid3d ? exportRaster(rasterLevel, exportMult).BW : 0;
+  const exportMesh = EXPORT_MESHES[Math.max(0, Math.min(EXPORT_MESHES.length - 1, exportMeshQ))];
+  const exportAt = solid3d ? exportRaster(rasterLevel, exportMult, exportMesh.f) : null;
+  // a retrace is only worth its seconds when it would actually differ from what
+  // is already on screen — a wider raster, a stood-down mesh, or both
+  const exportRetrace = !!exportAt
+    && (exportAt.BW > rasterLevel.BW || exportAt.gN < rasterLevel.gN);
   const downloadSVG = () => {
     if (exporting) return;
-    if (!solid3d || exportBW <= rasterLevel.BW) { emitSvg(null); return; }
+    if (!exportRetrace) { emitSvg(null); return; }
     setExporting(true);
     setTimeout(() => {
       let over = null;
       try {
-        over = buildSolid3D(S, fieldSpec, exportRaster(rasterLevel, exportMult));
+        over = buildSolid3D(S, fieldSpec, exportAt);
       } catch (e) {
         over = null;   // out of memory: the preview geometry still exports fine
       }
@@ -3753,6 +3785,24 @@ export default function App() {
                   what smooths the distant crests. It runs once per export and the page holds
                   still while it does — seconds at {RASTER_LEVELS[RASTER_LEVELS.length - 1].name}.
                 </div>
+                <Slider label="export mesh" value={exportMeshQ} min={0} max={EXPORT_MESHES.length - 1}
+                  step={1} onChange={setExportMeshQ}
+                  fmt={(v) => {
+                    const m = EXPORT_MESHES[v], gn = exportRaster(rasterLevel, 1, m.f).gN;
+                    return `${m.name} · ${gn}`
+                      + (m.f < 1 && gn === EXPORT_MESH_FLOOR ? " (floor)" : "");
+                  }} />
+                <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5,
+                  fontFamily: "ui-monospace, monospace" }}>
+                  The other half of the same trade. The raster sets how finely an edge is drawn;
+                  this sets how much surface there is to draw, and the detail steps raise it
+                  faster than any raster can resolve — so standing it down for the export is a
+                  second way at the same jagged edge, and it works where a wider raster has
+                  run out. Unlike detail, it changes the picture rather than resolving it:
+                  crests round off a little and the smallest far-field wavelets stop showing
+                  at all. Leave it as previewed for a faithful file; reach for it when a
+                  distant edge still crawls at {EXPORT_MAX_BW}px.
+                </div>
               </div>
             )}
 
@@ -3761,7 +3811,7 @@ export default function App() {
                 color: exporting ? "#9fc4cd" : "#f1fbff",
                 padding: "12px", borderRadius: 10, cursor: exporting ? "wait" : "pointer",
                 fontSize: 13.5, fontWeight: 600, letterSpacing: 0.3 }}>
-              {exporting ? `Tracing at ${exportBW}px\u2026` : "Export SVG"}
+              {exporting ? `Tracing at ${exportAt.BW}px\u2026` : "Export SVG"}
             </button>
 
             <button onClick={exportPaperStack} disabled={penMode}
