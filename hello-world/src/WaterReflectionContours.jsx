@@ -410,13 +410,27 @@ function chaikin(ring, iters) {
 }
 
 // drop near-duplicate screen points (keeps the bezier fit stable and the
-// files small); also un-closes the ring if last == first
+// files small); also un-closes the ring if last == first.
+//
+// Each surviving point is the CENTROID of the run it absorbed, not the run's
+// first point. The bezier fit downstream interpolates every point handed to
+// it, so any per-vertex tracing noise — the raster beating against the field
+// at sub-pixel amplitude — would otherwise come back as a scallop per kept
+// vertex, at exactly this eps as its wavelength. Averaging the run removes
+// that noise at the only scale it exists at; a run is shorter than eps by
+// construction, so nothing the output could have resolved is lost.
 function simplifyRing(pts, eps) {
   const out = [];
+  let ax = 0, ay = 0, sx = 0, sy = 0, n = 0;   // cluster anchor and running sum
   for (const p of pts) {
-    const q = out[out.length - 1];
-    if (!q || Math.hypot(p[0] - q[0], p[1] - q[1]) >= eps) out.push(p);
+    if (n && Math.hypot(p[0] - ax, p[1] - ay) >= eps) {
+      out.push([sx / n, sy / n]);
+      sx = 0; sy = 0; n = 0;
+    }
+    if (!n) { ax = p[0]; ay = p[1]; }
+    sx += p[0]; sy += p[1]; n++;
   }
+  if (n) out.push([sx / n, sy / n]);
   if (out.length > 1) {
     const a = out[0], b = out[out.length - 1];
     if (Math.hypot(a[0] - b[0], a[1] - b[1]) < eps) out.pop();
@@ -427,16 +441,19 @@ function simplifyRing(pts, eps) {
 // closed Catmull-Rom spline through the points, emitted as cubic beziers —
 // the exported edge is a genuinely smooth curve (an elliptical region becomes
 // an actual smooth closed curve, not a polygonal approximation)
+// Two decimals, not one: a tenth of a viewBox unit is half a raster pixel at
+// export width, so rounding there would re-quantize the sub-pixel crossings
+// the whole pipeline works to keep, as visible steps under zoom.
 function ringToBezier(p) {
   const n = p.length;
-  let d = "M" + p[0][0].toFixed(1) + " " + p[0][1].toFixed(1) + " ";
+  let d = "M" + p[0][0].toFixed(2) + " " + p[0][1].toFixed(2) + " ";
   for (let i = 0; i < n; i++) {
     const p0 = p[(i - 1 + n) % n], p1 = p[i], p2 = p[(i + 1) % n], p3 = p[(i + 2) % n];
     const c1x = p1[0] + (p2[0] - p0[0]) / 6, c1y = p1[1] + (p2[1] - p0[1]) / 6;
     const c2x = p2[0] - (p3[0] - p1[0]) / 6, c2y = p2[1] - (p3[1] - p1[1]) / 6;
-    d += "C" + c1x.toFixed(1) + " " + c1y.toFixed(1) + " "
-       + c2x.toFixed(1) + " " + c2y.toFixed(1) + " "
-       + p2[0].toFixed(1) + " " + p2[1].toFixed(1) + " ";
+    d += "C" + c1x.toFixed(2) + " " + c1y.toFixed(2) + " "
+       + c2x.toFixed(2) + " " + c2y.toFixed(2) + " "
+       + p2[0].toFixed(2) + " " + p2[1].toFixed(2) + " ";
   }
   return d + "Z ";
 }
