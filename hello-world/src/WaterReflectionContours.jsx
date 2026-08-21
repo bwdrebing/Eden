@@ -1097,6 +1097,25 @@ function buildSurface3DPanorama(S, fit, opts) {
   return { bg: colorOf[order[0]], layers: layers.filter((l) => l.d), fres };
 }
 
+// One 3D-solid pass at a given raster: hidden-surface removal, then the usual
+// smooth contouring on top. Whichever field the mode carries picks the builder,
+// and the result — { bg, layers, fres } — slots straight into the same render
+// path the flat layers use. The live preview and the SVG export both come
+// through here, so an export traced at a wider raster is the same picture, only
+// resolved finer.
+function buildSolid3D(S, fieldSpec, raster) {
+  const fit = computeFit(S);
+  S._ems = S.emitters.filter((e) => e.on).map((e) => prepEmitter(e, S));
+  const { uvAt, env2d, scalarAt, thresholds, cols, fresAt, fresThresholds } = fieldSpec;
+  // painted panorama: same outlines as the flat 2D render, now stopping at
+  // the wave crests in front of them
+  if (uvAt) return buildSurface3DPanorama(S, fit, { uvAt, env2d, fresAt, fresThresholds, ...raster });
+  // preset / paint1d: the wave silhouette does the occlusion. Lowest band
+  // shows the background, exactly like the flat render, so no base layer.
+  const { layers, fres } = buildSurface3D(S, fit, { scalarAt, thresholds, fresAt, fresThresholds, ...raster });
+  return { bg: cols[0], layers: layers.map((d, k) => ({ d, color: cols[k + 1] })), fres };
+}
+
 // each color region is filled with nested rings that follow its edge shape
 // (distance-transform iso-lines): ellipse -> concentric ellipses, band -> band-
 // following lines. Rings ride the wave surface and are z-buffer occluded.
@@ -1174,6 +1193,33 @@ const RASTER_LEVELS = [
   { name: "max",    BW: 1900, gN: 400 },
 ];
 const RASTER_DEFAULT = 1;   // "normal"
+
+// Export detail: the raster the *exported* SVG is traced on, as a multiple of
+// the preview's.
+//
+// An exported region outline is a curve fitted to a marching-squares crossing
+// per raster pixel, so one raster pixel is the finest — and the smoothest —
+// thing the file can say. On screen that is invisible: the preview panel is
+// about as wide as the raster. The SVG is not; it gets opened full-screen,
+// zoomed into and printed, and at 4× the panel's width every pixel-scale
+// decision is 4 pixels tall. That is the wobble along a distant crest: not a
+// coarser surface out there (nothing downsamples with range), just the raster
+// grid seen from close up.
+//
+// Retracing the 3D pass wider on the way out fixes it in proportion — the
+// preview stays interactive, and one slow pass buys an edge that holds up
+// magnified. The mesh (`gN`) deliberately does NOT scale with it: a finer mesh
+// packs more surface rows into each raster pixel, and the far field, where a
+// pixel already straddles many rows, comes out noisier rather than smoother.
+// Only the raster width helps.
+const EXPORT_MULTS = [1, 2, 3];
+const EXPORT_DEFAULT = 1;      // 2x
+// ~9.5M pixels at 16:10. Every layer allocates a full-frame Float64 buffer, so
+// this is about as far as a browser tab goes before it starts swapping.
+const EXPORT_MAX_BW = 3800;
+function exportRaster(level, mult) {
+  return { gN: level.gN, BW: Math.min(EXPORT_MAX_BW, Math.round(level.BW * mult)) };
+}
 
 // ---- color environment --------------------------------------------
 // 2D environment panorama: width = azimuth (looking across the lake),
@@ -1643,7 +1689,8 @@ export {
   buildGeometry, buildSegmentation, envFromRows, stampObjects,
   paletteStops, paletteColorAt, DERIVED_ENV_H, ENV2D_W, DEFAULT_EMITTERS,
   computeFit, cell2ground, heightAt, clampLift, penProject, reflectAt, magFrac,
-  buildSurface3D, buildSurface3DPanorama, crestField, RASTER_LEVELS, RASTER_DEFAULT,
+  buildSurface3D, buildSurface3DPanorama, buildSolid3D, crestField,
+  RASTER_LEVELS, RASTER_DEFAULT, EXPORT_MULTS, EXPORT_DEFAULT, EXPORT_MAX_BW, exportRaster,
 };
 
 // ---- layered-paper stack export -----------------------------------
@@ -2348,6 +2395,8 @@ export default function App() {
   const [manualTime, setManualTime] = useState(0); // scrub the wave phase when not animating
   const [lowPower, setLowPower] = useState(false);  // cap resolution + throttle animation
   const [rasterQ, setRasterQ] = useState(RASTER_DEFAULT); // 3D surface resolution step
+  const [exportQ, setExportQ] = useState(EXPORT_DEFAULT);  // export raster, x preview
+  const [exporting, setExporting] = useState(false);       // the big retrace is synchronous
   const [quality, setQuality] = useState(() =>
     (typeof window !== "undefined" && window.innerWidth < 820) ? 100 : 140);
   const [advanced, setAdvanced] = useState(false);
@@ -2447,7 +2496,7 @@ export default function App() {
     waveScale: [waveScale, setWaveScale], edges: [edges, setEdges],
     animate: [animate, setAnimate], speed: [speed, setSpeed], quality: [quality, setQuality],
     manualTime: [manualTime, setManualTime], lowPower: [lowPower, setLowPower],
-    rasterQ: [rasterQ, setRasterQ],
+    rasterQ: [rasterQ, setRasterQ], exportQ: [exportQ, setExportQ],
     advanced: [advanced, setAdvanced], emitters: [emitters, setEmitters],
     halfW: [halfW, setHalfW], yNear: [yNear, setYNear], yFar: [yFar, setYFar],
     reflMag: [reflMag, setReflMag], objects: [objects, setObjects],
@@ -2782,20 +2831,9 @@ export default function App() {
   // smooth region outlines but a near crest correctly hides the wave's far
   // side. Produces occluded { layers, fres } that slot straight into the same
   // render path the flat layers use (Fresnel, edges and all).
-  const surf3d = useMemo(() => {
-    if (!solid3d) return null;
-    const fit = computeFit(S);
-    S._ems = S.emitters.filter((e) => e.on).map((e) => prepEmitter(e, S));
-    const raster = { gN: rasterLevel.gN, BW: rasterLevel.BW };
-    const { uvAt, env2d, scalarAt, thresholds, cols, fresAt, fresThresholds } = fieldSpec;
-    // painted panorama: same outlines as the flat 2D render, now stopping at
-    // the wave crests in front of them
-    if (uvAt) return buildSurface3DPanorama(S, fit, { uvAt, env2d, fresAt, fresThresholds, ...raster });
-    // preset / paint1d: the wave silhouette does the occlusion. Lowest band
-    // shows the background, exactly like the flat render, so no base layer.
-    const { layers, fres } = buildSurface3D(S, fit, { scalarAt, thresholds, fresAt, fresThresholds, ...raster });
-    return { bg: cols[0], layers: layers.map((d, k) => ({ d, color: cols[k + 1] })), fres };
-  }, [solid3d, S, fieldSpec, rasterLevel]);
+  const surf3d = useMemo(
+    () => (solid3d ? buildSolid3D(S, fieldSpec, { gN: rasterLevel.gN, BW: rasterLevel.BW }) : null),
+    [solid3d, S, fieldSpec, rasterLevel]);
 
   // in 3D-solid mode the occluded surf3d geometry drives every filled-region
   // code path below (live preview, SVG export, Fresnel clips) in place of the
@@ -2824,7 +2862,14 @@ export default function App() {
     if (hi !== eHi) setEHi(hi);
   }, [autoFit, rng.lo, rng.hi, eLo, eHi]);
 
-  const buildSvg = () => {
+  // `over` is an alternate { bg, layers, fres } for the filled regions — the
+  // export retrace at a wider raster. Everything else about the picture (roll,
+  // Fresnel banding, buoy, background) is unchanged, so the file matches what
+  // is on screen; only the outlines are resolved finer.
+  const buildSvg = (over) => {
+    const svgLayers = over ? over.layers : drawLayers;
+    const svgFres = over ? over.fres : drawFres;
+    const svgBg = over ? over.bg : drawBg;
     const buoyStr = buoy ? buoySvg(buoy, buoyShade) : "";
     const rollOpen = rollTf ? `<g transform="${rollTf}">` : `<g>`;
     if (penMode) {
@@ -2838,7 +2883,7 @@ export default function App() {
     let body = `<rect width="${VB_W}" height="${VB_H}" fill="${bgFill}"/>` + rollOpen;
     const stroke = edges ? ` stroke="#000" stroke-opacity="0.25" stroke-width="0.6"` : "";
     let defs = "";
-    if (fresOn && drawFres) drawFres.forEach((d, i) => {
+    if (fresOn && svgFres) svgFres.forEach((d, i) => {
       if (d) defs += `<clipPath id="fres${i + 1}"><path d="${d}"/></clipPath>`;
     });
     const bandOpen = (b) => (b > 0 ? `<g clip-path="url(#fres${b})">` : `<g>`);
@@ -2865,17 +2910,17 @@ export default function App() {
     // layered paths, preset & 2D alike. With Fresnel on, the geometry is
     // shared via <use> so each depth band re-colors the same paths.
     if (use2d && !solid3d) defs += `<clipPath id="watertrap"><path d="${seg.clip}"/></clipPath>`;
-    if (fresOn) drawLayers.forEach((l, i) => { defs += `<path id="lyr${i}" d="${l.d}"/>`; });
+    if (fresOn) svgLayers.forEach((l, i) => { defs += `<path id="lyr${i}" d="${l.d}"/>`; });
     // in 3D the waves rise above the flat water trapezoid, so skip the clip
     // (the padded regions already overshoot the frame) — otherwise crests
     // near the edges would be sheared off flat
     body += use2d && !surface3d
       ? `<g clip-path="url(#watertrap)" opacity="0.999">` : `<g opacity="0.999">`;
     fresIdx.forEach((b) => {
-      if (b > 0 && !drawFres[b - 1]) return;
+      if (b > 0 && !svgFres[b - 1]) return;
       body += bandOpen(b);
-      if (b > 0) body += `<rect width="${VB_W}" height="${VB_H}" fill="${mixDeep(drawBg, b)}"/>`;
-      drawLayers.forEach((l, i) => {
+      if (b > 0) body += `<rect width="${VB_W}" height="${VB_H}" fill="${mixDeep(svgBg, b)}"/>`;
+      svgLayers.forEach((l, i) => {
         body += fresOn
           ? `<use href="#lyr${i}" fill="${mixDeep(l.color, b)}" fill-rule="evenodd"${stroke}/>`
           : `<path d="${l.d}" fill="${l.color}" fill-rule="evenodd"${stroke}/>`;
@@ -2894,12 +2939,35 @@ export default function App() {
       setTimeout(() => URL.revokeObjectURL(url), 4000);
     } catch (e) { /* sandbox may block downloads */ }
   };
-  const downloadSVG = () => {
-    const svg = buildSvg();
+  // Export at `exportQ`: in 3D-solid mode the regions are retraced on a raster
+  // that many times wider than the preview's before the file is written, which
+  // is the whole reason a distant crest comes out as a curve rather than a
+  // stair. It is one slow synchronous pass, so hand the browser a frame to
+  // paint the "tracing" label first, and fall back to the preview geometry if
+  // the big raster cannot be allocated.
+  const emitSvg = (over) => {
+    const svg = buildSvg(over);
     saveSvg(svg, "reflection-regions.svg");
     setSvgName("reflection-regions.svg");
     setStackInfo(null);
     setSvgOut(svg); // always show a reliable copy fallback
+  };
+  const exportMult = EXPORT_MULTS[Math.max(0, Math.min(EXPORT_MULTS.length - 1, exportQ))];
+  const exportBW = solid3d ? exportRaster(rasterLevel, exportMult).BW : 0;
+  const downloadSVG = () => {
+    if (exporting) return;
+    if (!solid3d || exportBW <= rasterLevel.BW) { emitSvg(null); return; }
+    setExporting(true);
+    setTimeout(() => {
+      let over = null;
+      try {
+        over = buildSolid3D(S, fieldSpec, exportRaster(rasterLevel, exportMult));
+      } catch (e) {
+        over = null;   // out of memory: the preview geometry still exports fine
+      }
+      emitSvg(over);
+      setExporting(false);
+    }, 30);
   };
 
   // Layered paper: cut the same picture the SVG export draws. Both resolve the
@@ -3591,7 +3659,9 @@ export default function App() {
                       + " pixels wide, so it sets how fine a wave edge can get — mostly visible"
                       + " along the crest lines, where a near wave cuts across the water behind"
                       + " it. Cost grows with the square, and every color layer pays it: print and"
-                      + " max are meant for a still you export, not for panning around."
+                      + " max are meant for a still you export, not for panning around — and for"
+                      + " an export you can leave this where you like to work and let export"
+                      + " detail (next to the button) do the fine trace instead."
                     : "The 3D wave surface is off, so this only sets the resolution of the"
                       + " layered-paper export, which is cut from the same kind of raster."}
                   {` The paper stack caps it at ${PAPER_MAX_BW}px — past that the`
@@ -3665,11 +3735,33 @@ export default function App() {
               )}
             </div>
 
-            <button onClick={downloadSVG}
-              style={{ width: "100%", background: "#2f6b78", border: "none", color: "#f1fbff",
-                padding: "12px", borderRadius: 10, cursor: "pointer", fontSize: 13.5,
-                fontWeight: 600, letterSpacing: 0.3 }}>
-              Export SVG
+            {solid3d && (
+              <div style={{ marginBottom: 10 }}>
+                <Slider label="export detail" value={exportQ} min={0} max={EXPORT_MULTS.length - 1}
+                  step={1} onChange={setExportQ}
+                  fmt={(v) => {
+                    const m = EXPORT_MULTS[v], bw = exportRaster(rasterLevel, m).BW;
+                    return (m === 1 ? "as previewed" : `${m}\u00d7 preview`) + ` \u00b7 ${bw}px`
+                      + (bw === EXPORT_MAX_BW && rasterLevel.BW * m > EXPORT_MAX_BW ? " (capped)" : "");
+                  }} />
+                <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5,
+                  fontFamily: "ui-monospace, monospace" }}>
+                  The file is a curve fitted to one crossing per raster pixel, so the preview's
+                  raster is also the smallest wobble an edge can have — invisible at panel size,
+                  a visible stair once the SVG is opened full-screen or printed. This retraces
+                  the regions wider on the way out (the same picture, resolved finer), which is
+                  what smooths the distant crests. It runs once per export and the page holds
+                  still while it does — seconds at {RASTER_LEVELS[RASTER_LEVELS.length - 1].name}.
+                </div>
+              </div>
+            )}
+
+            <button onClick={downloadSVG} disabled={exporting}
+              style={{ width: "100%", background: exporting ? "#1f4650" : "#2f6b78", border: "none",
+                color: exporting ? "#9fc4cd" : "#f1fbff",
+                padding: "12px", borderRadius: 10, cursor: exporting ? "wait" : "pointer",
+                fontSize: 13.5, fontWeight: 600, letterSpacing: 0.3 }}>
+              {exporting ? `Tracing at ${exportBW}px\u2026` : "Export SVG"}
             </button>
 
             <button onClick={exportPaperStack} disabled={penMode}
