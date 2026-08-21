@@ -1,7 +1,8 @@
 import {
   buildSurface3D, buildSurface3DPanorama, buildSolid3D, buildSegmentation, computeFit, penProject,
   reflectAt, magFrac, envFromRows, paletteColorAt, ENV2D_W, DEFAULT_EMITTERS,
-  crestField, RASTER_LEVELS, RASTER_DEFAULT, EXPORT_MULTS, EXPORT_MAX_BW, exportRaster,
+  crestField, RASTER_LEVELS, RASTER_DEFAULT, EXPORT_MULTS, EXPORT_MAX_BW,
+  EXPORT_MESHES, EXPORT_MESH_DEFAULT, EXPORT_MESH_FLOOR, exportRaster,
 } from "./WaterReflectionContours";
 
 /* ------------------------------------------------------------------ *
@@ -328,6 +329,29 @@ test("the export raster scales the width, holds the mesh, and caps", () => {
   const top = RASTER_LEVELS[RASTER_LEVELS.length - 1];
   for (const m of EXPORT_MULTS) expect(exportRaster(top, m).BW).toBeLessThanOrEqual(EXPORT_MAX_BW);
   expect(exportRaster(top, 3).BW).toBe(EXPORT_MAX_BW);
+});
+
+test("the export mesh stands gN down on request, and never past the floor", () => {
+  const top = { name: "max", BW: 1900, gN: 400 };
+  // faithful by default: asking for nothing changes nothing
+  expect(EXPORT_MESHES[EXPORT_MESH_DEFAULT].f).toBe(1);
+  expect(exportRaster(top, 2, 1)).toEqual(exportRaster(top, 2));
+
+  expect(exportRaster(top, 1, 0.7).gN).toBe(280);
+  expect(exportRaster(top, 1, 0.5).gN).toBe(200);
+  // the width is the other lever — a mesh step must not move it
+  expect(exportRaster(top, 2, 0.5).BW).toBe(exportRaster(top, 2, 1).BW);
+
+  // below the floor the water stops reading as water, and a level already at
+  // or under it has nothing to stand down
+  const draft = RASTER_LEVELS[0];
+  expect(draft.gN).toBeLessThanOrEqual(EXPORT_MESH_FLOOR);
+  for (const m of EXPORT_MESHES) expect(exportRaster(draft, 1, m.f).gN).toBe(draft.gN);
+  for (const L of RASTER_LEVELS) for (const m of EXPORT_MESHES) {
+    const gN = exportRaster(L, 1, m.f).gN;
+    expect(gN).toBeGreaterThanOrEqual(Math.min(L.gN, EXPORT_MESH_FLOOR));
+    expect(gN).toBeLessThanOrEqual(L.gN);
+  }
 });
 
 test("a wider export raster redraws the preview's regions, resolved finer", () => {
