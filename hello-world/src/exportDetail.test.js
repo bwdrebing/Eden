@@ -19,6 +19,8 @@ test("Export SVG retraces at the export raster, then hands back a file", async (
   // the preview's own mesh — a faithful file unless asked otherwise
   expect(screen.getByText(/2× preview · 880px/)).toBeInTheDocument();
   expect(screen.getByText(/as previewed · 150/)).toBeInTheDocument();
+  // …and polish on light, the one export step that is on out of the box
+  expect(screen.getByText(/light · 3 passes/)).toBeInTheDocument();
 
   fireEvent.click(screen.getByRole("button", { name: /^Export SVG$/ }));
   // the retrace is synchronous, so the page announces it before it starts

@@ -3,6 +3,7 @@ import {
   reflectAt, magFrac, envFromRows, paletteColorAt, ENV2D_W, DEFAULT_EMITTERS,
   crestField, RASTER_LEVELS, RASTER_DEFAULT, EXPORT_MULTS, EXPORT_MAX_BW,
   EXPORT_MESHES, EXPORT_MESH_DEFAULT, EXPORT_MESH_FLOOR, exportRaster,
+  EXPORT_POLISH, EXPORT_POLISH_DEFAULT, smoothField,
 } from "./WaterReflectionContours";
 
 /* ------------------------------------------------------------------ *
@@ -383,4 +384,121 @@ test("a wider export raster redraws the preview's regions, resolved finer", () =
     expect(n).toBeGreaterThan(50);
     expect(sum / n).toBeLessThan(3);
   }
+});
+
+/* ------------------------------------------------------------------ *
+ * Edge polish: smoothing the field before the regions are cut from it
+ *
+ * The step that still bites once the raster is at its cap. It has to smooth
+ * without moving the water's edge — a blur that reaches through the uncovered
+ * pixels would drag values near that edge toward whatever is out there — and it
+ * has to reach both builders, since a painted panorama has no single scalar and
+ * carries a distance field per color instead.
+ * ------------------------------------------------------------------ */
+
+test("the polish steps run from off, and default to light", () => {
+  expect(EXPORT_POLISH[0].passes).toBe(0);
+  expect(EXPORT_POLISH[EXPORT_POLISH_DEFAULT].passes).toBeGreaterThan(0);
+  for (let i = 1; i < EXPORT_POLISH.length; i++)
+    expect(EXPORT_POLISH[i].passes).toBeGreaterThan(EXPORT_POLISH[i - 1].passes);
+});
+
+test("the field smoother leaves the water's edge where it was", () => {
+  // half-covered raster holding one constant value: a normalized blur must
+  // return it untouched, right up to the coverage boundary. An un-normalized
+  // one sags toward zero there — which is a boundary that has moved.
+  const BW = 40, BH = 30, NP = BW * BH;
+  const cov = new Uint8Array(NP), field = new Float32Array(NP);
+  for (let y = 0; y < BH; y++) for (let x = 0; x < BW; x++) {
+    if (x < 20) { cov[y * BW + x] = 1; field[y * BW + x] = 7; }
+  }
+  smoothField(field, cov, BW, BH, 8);
+  for (let y = 0; y < BH; y++) for (let x = 0; x < 20; x++)
+    expect(field[y * BW + x]).toBeCloseTo(7, 4);
+
+  // zero passes is a no-op, whatever the field holds
+  const before = new Float32Array(NP).map((_, p) => (p % 13) - 6);
+  const after = before.slice();
+  smoothField(after, new Uint8Array(NP).fill(1), BW, BH, 0);
+  expect(Array.from(after)).toEqual(Array.from(before));
+});
+
+test("the field smoother knocks down pixel-scale detail, keeps the broad shape", () => {
+  const BW = 64, BH = 64, NP = BW * BH;
+  const cov = new Uint8Array(NP).fill(1);
+  const ramp = (x) => x / BW;                       // the shape that must survive
+  const wobble = (x, y) => 0.25 * (((x + y) % 2) ? 1 : -1);   // one-pixel noise
+  const field = new Float32Array(NP);
+  for (let y = 0; y < BH; y++) for (let x = 0; x < BW; x++)
+    field[y * BW + x] = ramp(x) + wobble(x, y);
+  smoothField(field, cov, BW, BH, 3);
+
+  let noise = 0, n = 0;
+  for (let y = 8; y < BH - 8; y++) for (let x = 8; x < BW - 8; x++) {
+    noise = Math.max(noise, Math.abs(field[y * BW + x] - ramp(x))); n++;
+  }
+  expect(n).toBeGreaterThan(100);
+  expect(noise).toBeLessThan(0.02);              // 0.25 of wobble, all but gone
+});
+
+test("polish reaches both builders and keeps the picture intact", () => {
+  const S = { ...grazingS(), eLo: -5, eHi: 33, waveScale: 8, surface3d: true,
+    k: (2 * Math.PI) / 2.8, amp: 0.78 * 0.06, sharp: 0.3, decay: 0.18 - 0.5 * 0.16 };
+  const raster = { gN: 150, BW: 1100 };
+  const passes = EXPORT_POLISH[EXPORT_POLISH.length - 1].passes;
+
+  // 1D / preset: one scalar, every band cut from it
+  const cols = ["#0b0f14", "#28405e", "#4f6294", "#8fa5cd"];
+  const scalarAt = (gx, gy) =>
+    (Math.asin(Math.max(-1, Math.min(1, reflectAt(gx, gy, S)[2]))) * 180) / Math.PI;
+  const spec1d = { scalarAt, thresholds: [2, 10, 18], cols };
+  const plain = buildSolid3D(S, spec1d, raster);
+  const polished = buildSolid3D(S, spec1d, { ...raster, polish: passes });
+  const light = buildSolid3D(S, spec1d, { ...raster, polish: EXPORT_POLISH[1].passes });
+  expect(polished.layers.map((l) => l.color)).toEqual(plain.layers.map((l) => l.color));
+  for (let i = 0; i < plain.layers.length; i++) {
+    // smoothing removes wobble, so the trace gets shorter, never longer
+    expect(pathPoints(polished.layers[i].d).length)
+      .toBeLessThan(pathPoints(plain.layers[i].d).length);
+    // …and at the default dose the bulk of each band is where it was. Only the
+    // bulk: the tail of this distribution is the thin filigree the polish
+    // closes up, which is its documented cost, not a bug. The raster here is
+    // export-width on purpose — the same pass count at preview width erodes
+    // several times as much, which is why this is an export step.
+    const bucket = bucketize(pathPoints(light.layers[i].d));
+    const drift = [];
+    for (const [x, y] of pathPoints(plain.layers[i].d)) {
+      if (x < 40 || x > 720 || y < 40 || y > 460) continue;
+      drift.push(nearestB(bucket, x, y));
+    }
+    drift.sort((a, b) => a - b);
+    expect(drift.length).toBeGreaterThan(100);
+    expect(drift[Math.floor(drift.length * 0.5)]).toBeLessThan(3);
+  }
+
+  // 2D panorama: no single scalar — a distance field per color, polished one
+  // by one, and adjacent bands must still meet
+  const AZ = 45, EW = ENV2D_W, EH = 52;
+  const env2d = envFromRows((f) => paletteColorAt("Black Water", f), EW, EH);
+  buildSegmentation(S, env2d, AZ);
+  const uvAt = (gx, gy) => {
+    const R = reflectAt(gx, gy, S);
+    const phi = (Math.asin(Math.max(-1, Math.min(1, R[2]))) * 180) / Math.PI;
+    let psi = (Math.atan2(R[0], R[1]) * 180) / Math.PI;
+    psi = psi < -AZ ? -AZ : psi > AZ ? AZ : psi;
+    let v = magFrac((phi - S.eLo) / (S.eHi - S.eLo), 1); v = v < 0 ? 0 : v > 1 ? 1 : v;
+    let u = magFrac((psi + AZ) / (2 * AZ), 1); u = u < 0 ? 0 : u > 1 ? 1 : u;
+    return [u * EW, v * EH];
+  };
+  const specPano = { uvAt, env2d };
+  const pPlain = buildSolid3D(S, specPano, raster);
+  const pPolished = buildSolid3D(S, specPano, { ...raster, polish: passes });
+  expect(pPolished.layers.length).toBe(pPlain.layers.length);
+  expect(pPolished.layers.map((l) => l.color)).toEqual(pPlain.layers.map((l) => l.color));
+  expect(pPolished.bg).toBe(pPlain.bg);
+  // measured over the stack, not layer by layer: polish can hand a single layer
+  // more vertices than it had — closing a pinch merges two rings into one
+  // longer outline — while the picture as a whole carries less wobble
+  const verts = (r) => r.layers.reduce((n, l) => n + pathPoints(l.d).length, 0);
+  expect(verts(pPolished)).toBeLessThan(verts(pPlain));
 });
