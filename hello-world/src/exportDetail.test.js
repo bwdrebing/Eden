@@ -15,8 +15,10 @@ import App from "./App";
 test("Export SVG retraces at the export raster, then hands back a file", async () => {
   render(<App />);
 
-  // the control defaults to 2x the preview's raster ("normal" -> 880px)
+  // the controls default to 2x the preview's raster ("normal" -> 880px) and to
+  // the preview's own mesh — a faithful file unless asked otherwise
   expect(screen.getByText(/2× preview · 880px/)).toBeInTheDocument();
+  expect(screen.getByText(/as previewed · 150/)).toBeInTheDocument();
 
   fireEvent.click(screen.getByRole("button", { name: /^Export SVG$/ }));
   // the retrace is synchronous, so the page announces it before it starts
