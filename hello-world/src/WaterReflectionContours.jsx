@@ -1352,6 +1352,75 @@ function exportRaster(level, mult, meshF = 1) {
   };
 }
 
+// ---- PNG export ---------------------------------------------------
+// The same picture as the preview, rasterized instead of traced.
+//
+// Every export step above this one exists to keep a *vector* edge from crawling
+// when the file is magnified. An outline in the SVG is a curve through one
+// crossing per raster pixel, so the raster's own grid is visible in the file,
+// and polish — a blur of the field before the regions are cut — is what takes
+// the last of it. A glint, a few raster pixels of a lighter band caught on one
+// crest, is exactly what that blur cannot tell from aliasing: it goes, and the
+// file is quietly less than what was on screen.
+//
+// A raster output has no such problem. There is no outline to wobble, only
+// pixels, and the ones along an edge get averaged by the rasterizer rather than
+// decided by it. So this path runs no polish and no mesh stand-down: it is the
+// preview's own geometry at print size. The one export step it does keep is the
+// width multiplier, which resolves the same picture finer rather than smoothing
+// it — and which the larger scales need, since a preview-raster stair is as
+// many output pixels tall as the scale makes it.
+const PNG_SCALES = [2, 3, 4, 6];
+const PNG_DEFAULT = 2;     // 4x — 3040 x 2000
+// Safari, on iOS especially, hands back a blank canvas past ~16.7M pixels
+// rather than refusing, so the scale is clamped to fit instead of trusted. The
+// top step above sits just under the cap at the current frame; the clamp is
+// what keeps that true if the frame ever changes shape.
+const PNG_MAX_PIXELS = 16.5e6;
+function pngSize(scale) {
+  const s = Math.min(scale, Math.sqrt(PNG_MAX_PIXELS / (VB_W * VB_H)));
+  // floor, not round: rounding a clamped scale can land a pixel over the cap
+  return { w: Math.floor(VB_W * s), h: Math.floor(VB_H * s), capped: s < scale - 1e-9 };
+}
+
+// An <img> needs the markup to state its own pixel size: a viewBox alone leaves
+// the intrinsic size to the browser, which is where a 300x150 default comes
+// from. Same string, same picture — only sized.
+function sizedSvg(svg, w, h) {
+  return svg.replace(/^<svg /, `<svg width="${w}" height="${h}" `);
+}
+
+// SVG string -> PNG blob at w x h.
+//
+// The picture goes through an <img> rather than being redrawn onto the canvas
+// by hand, so the browser's own SVG rasterizer resolves it — the same one that
+// composites the preview, with the same antialiasing, fill rules and clips. The
+// PNG is therefore the preview with more pixels, not a second renderer's
+// opinion of it. The markup references nothing external, so the data URL counts
+// as same-origin and the canvas stays untainted (toBlob throws otherwise).
+function svgToPngBlob(svg, w, h) {
+  return new Promise((resolve, reject) => {
+    let canvas = null, ctx = null;
+    try {
+      canvas = document.createElement("canvas");
+      canvas.width = w; canvas.height = h;
+      ctx = canvas.getContext("2d");
+    } catch (e) { ctx = null; }
+    // no 2D context (jsdom, a locked-down sandbox) means no rasterizer at all —
+    // fail here rather than waiting on an onload that is never coming
+    if (!ctx || !canvas.toBlob) { reject(new Error("no canvas")); return; }
+    const img = new Image();
+    img.onload = () => {
+      try {
+        ctx.drawImage(img, 0, 0, w, h);
+        canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("png encode failed"))), "image/png");
+      } catch (e) { reject(e); }
+    };
+    img.onerror = () => reject(new Error("svg decode failed"));
+    img.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(sizedSvg(svg, w, h));
+  });
+}
+
 // ---- color environment --------------------------------------------
 // 2D environment panorama: width = azimuth (looking across the lake),
 // height = elevation (waterline at the bottom, sky at the top).
@@ -1824,6 +1893,7 @@ export {
   RASTER_LEVELS, RASTER_DEFAULT, EXPORT_MULTS, EXPORT_DEFAULT, EXPORT_MAX_BW,
   EXPORT_MESHES, EXPORT_MESH_DEFAULT, EXPORT_MESH_FLOOR, exportRaster,
   EXPORT_POLISH, EXPORT_POLISH_DEFAULT, smoothField,
+  PNG_SCALES, PNG_DEFAULT, PNG_MAX_PIXELS, pngSize, sizedSvg, svgToPngBlob,
 };
 
 // ---- layered-paper stack export -----------------------------------
@@ -2532,6 +2602,8 @@ export default function App() {
   const [exportMeshQ, setExportMeshQ] = useState(EXPORT_MESH_DEFAULT); // export mesh step
   const [exportPolishQ, setExportPolishQ] = useState(EXPORT_POLISH_DEFAULT); // export edge polish
   const [exporting, setExporting] = useState(false);       // the big retrace is synchronous
+  const [pngQ, setPngQ] = useState(PNG_DEFAULT);           // PNG size, x the SVG frame
+  const [pngBusy, setPngBusy] = useState(false);           // retrace + rasterize, same pause
   const [quality, setQuality] = useState(() =>
     (typeof window !== "undefined" && window.innerWidth < 820) ? 100 : 140);
   const [advanced, setAdvanced] = useState(false);
@@ -2615,6 +2687,12 @@ export default function App() {
   const [svgName, setSvgName] = useState("reflection-regions.svg");
   const [stackInfo, setStackInfo] = useState(null); // { nSheets } when a paper stack is exported
   const [copied, setCopied] = useState(false);
+  // the finished PNG, held as an object URL so the panel can show and re-offer
+  // it; the ref is what actually owns the URL, so each new render frees the last
+  const [pngOut, setPngOut] = useState(null);   // { url, w, h, bytes, name }
+  const [pngErr, setPngErr] = useState(null);
+  const pngUrlRef = useRef(null);
+  useEffect(() => () => { if (pngUrlRef.current) URL.revokeObjectURL(pngUrlRef.current); }, []);
 
   // Serialize every studio setting into the URL hash (the painted 1D/2D
   // environment buffers are excluded — they are freehand pixel data, not
@@ -2633,7 +2711,7 @@ export default function App() {
     manualTime: [manualTime, setManualTime], lowPower: [lowPower, setLowPower],
     rasterQ: [rasterQ, setRasterQ], exportQ: [exportQ, setExportQ],
     exportMeshQ: [exportMeshQ, setExportMeshQ],
-    exportPolishQ: [exportPolishQ, setExportPolishQ],
+    exportPolishQ: [exportPolishQ, setExportPolishQ], pngQ: [pngQ, setPngQ],
     advanced: [advanced, setAdvanced], emitters: [emitters, setEmitters],
     halfW: [halfW, setHalfW], yNear: [yNear, setYNear], yFar: [yFar, setYFar],
     reflMag: [reflMag, setReflMag], objects: [objects, setObjects],
@@ -3067,15 +3145,16 @@ export default function App() {
     body += `</g>` + buoyStr + `</g>`;
     return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${VB_W} ${VB_H}">${defs ? `<defs>${defs}</defs>` : ""}${body}</svg>`;
   };
-  const saveSvg = (svg, name) => {
+  const saveBlob = (blob, name) => {
     try {
-      const url = URL.createObjectURL(new Blob([svg], { type: "image/svg+xml" }));
+      const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url; a.download = name;
       document.body.appendChild(a); a.click(); a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 4000);
     } catch (e) { /* sandbox may block downloads */ }
   };
+  const saveSvg = (svg, name) => saveBlob(new Blob([svg], { type: "image/svg+xml" }), name);
   // Export at `exportQ`: in 3D-solid mode the regions are retraced on a raster
   // that many times wider than the preview's before the file is written, which
   // is the whole reason a distant crest comes out as a curve rather than a
@@ -3101,7 +3180,7 @@ export default function App() {
   const exportRetrace = !!exportAt
     && (exportAt.BW > rasterLevel.BW || exportAt.gN < rasterLevel.gN || exportAt.polish > 0);
   const downloadSVG = () => {
-    if (exporting) return;
+    if (exporting || pngBusy) return;
     if (!exportRetrace) { emitSvg(null); return; }
     setExporting(true);
     setTimeout(() => {
@@ -3113,6 +3192,47 @@ export default function App() {
       }
       emitSvg(over);
       setExporting(false);
+    }, 30);
+  };
+
+  // PNG at `pngQ`: the preview's geometry, drawn by the browser at several
+  // times the frame. It keeps the export's width multiplier — that step
+  // resolves the same picture finer, and the bigger the output the more it is
+  // needed — and deliberately skips the mesh and polish steps, which change the
+  // picture to protect a vector edge this file does not have. Same pause as the
+  // SVG export when a retrace is involved, then one async rasterize.
+  const pngAt = pngSize(PNG_SCALES[Math.max(0, Math.min(PNG_SCALES.length - 1, pngQ))]);
+  const pngRetrace = solid3d && exportMult > 1;
+  const pngGeom = pngRetrace ? { ...exportRaster(rasterLevel, exportMult), polish: 0 } : null;
+  const showPng = (blob, name) => {
+    let url = null;
+    try {
+      if (pngUrlRef.current) URL.revokeObjectURL(pngUrlRef.current);
+      url = URL.createObjectURL(blob);
+      pngUrlRef.current = url;
+    } catch (e) { url = null; }
+    setPngOut({ url, w: pngAt.w, h: pngAt.h, bytes: blob.size, name });
+  };
+  const downloadPNG = () => {
+    if (pngBusy || exporting) return;
+    setPngBusy(true);
+    setPngErr(null);
+    setTimeout(() => {
+      let over = null;
+      if (pngGeom) {
+        try {
+          over = buildSolid3D(S, fieldSpec, pngGeom);
+        } catch (e) {
+          over = null;  // out of memory: the preview geometry still rasterizes
+        }
+      }
+      svgToPngBlob(buildSvg(over), pngAt.w, pngAt.h).then((blob) => {
+        saveBlob(blob, "reflection-regions.png");
+        showPng(blob, "reflection-regions.png");
+      }).catch(() => {
+        setPngErr("This browser would not rasterize the picture. The SVG export still works,"
+          + " and opening that file in any image editor gets you the same PNG.");
+      }).then(() => setPngBusy(false), () => setPngBusy(false));
     }, 30);
   };
 
@@ -3937,13 +4057,86 @@ export default function App() {
               </div>
             )}
 
-            <button onClick={downloadSVG} disabled={exporting}
+            <button onClick={downloadSVG} disabled={exporting || pngBusy}
               style={{ width: "100%", background: exporting ? "#1f4650" : "#2f6b78", border: "none",
                 color: exporting ? "#9fc4cd" : "#f1fbff",
                 padding: "12px", borderRadius: 10, cursor: exporting ? "wait" : "pointer",
                 fontSize: 13.5, fontWeight: 600, letterSpacing: 0.3 }}>
               {exporting ? `Tracing at ${exportAt.BW}px\u2026` : "Export SVG"}
             </button>
+
+            <div style={{ marginTop: 12, marginBottom: 8 }}>
+              <Slider label="PNG size" value={pngQ} min={0} max={PNG_SCALES.length - 1}
+                step={1} onChange={setPngQ}
+                fmt={(v) => {
+                  const sz = pngSize(PNG_SCALES[v]);
+                  return `${sz.w} \u00d7 ${sz.h}` + (sz.capped ? " (capped)" : "");
+                }} />
+            </div>
+            <button onClick={downloadPNG} disabled={pngBusy || exporting}
+              title="A pixel image of exactly what is on screen, at print size"
+              style={{ width: "100%", background: pngBusy ? "#1f4650" : "#2f6b78", border: "none",
+                color: pngBusy ? "#9fc4cd" : "#f1fbff",
+                padding: "12px", borderRadius: 10, cursor: pngBusy ? "wait" : "pointer",
+                fontSize: 13.5, fontWeight: 600, letterSpacing: 0.3 }}>
+              {pngBusy ? `Rendering ${pngAt.w}\u00d7${pngAt.h}\u2026` : "Export PNG"}
+            </button>
+            <div style={{ fontSize: 10, color: "#6d808f", marginTop: 5, lineHeight: 1.5,
+              fontFamily: "ui-monospace, monospace" }}>
+              {solid3d ? (
+                <>
+                  Pixels instead of paths, and the closest thing to the preview this page
+                  can hand you. The steps above smooth the vector outline so it survives
+                  being magnified — edge polish especially, which blurs the field before
+                  the regions are cut and takes the smallest glints and highlights with
+                  it. A raster has no outline to smooth, so the PNG runs neither polish
+                  nor the mesh stand-down: it draws the preview's own geometry{pngRetrace
+                    ? `, retraced at ${exportRaster(rasterLevel, exportMult).BW}px so the edges are resolved for a file this wide.`
+                    : "."} Reach for it when the SVG loses something you can see on screen.
+                </>
+              ) : (
+                <>
+                  Pixels instead of paths: the same picture the SVG carries, drawn at print
+                  size, for anywhere a vector file is not what you want.
+                </>
+              )}
+            </div>
+
+            {pngErr && (
+              <div style={{ fontSize: 10.5, color: "#e0a37a", marginTop: 6, lineHeight: 1.5,
+                fontFamily: "ui-monospace, monospace" }}>{pngErr}</div>
+            )}
+
+            {pngOut && (
+              <div style={{ ...panel, marginTop: 12, marginBottom: 0 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+                  <span style={{ ...heading, margin: 0, flex: 1 }}>PNG</span>
+                  <button onClick={() => {
+                    try { if (pngUrlRef.current) URL.revokeObjectURL(pngUrlRef.current); } catch (e) {}
+                    pngUrlRef.current = null; setPngOut(null);
+                  }} style={{ ...miniBtn, flex: "none", padding: "4px 10px" }}>close</button>
+                </div>
+                {pngOut.url && (
+                  <img src={pngOut.url} alt="exported PNG"
+                    style={{ width: "100%", display: "block", borderRadius: 8,
+                      border: "1px solid #26313c", marginBottom: 10 }} />
+                )}
+                <div style={{ fontSize: 10.5, color: "#8a9bab", marginBottom: 10, lineHeight: 1.5 }}>
+                  {pngOut.w} × {pngOut.h} px · {(pngOut.bytes / 1024 / 1024).toFixed(1)} MB.
+                  A download may have started. If not (some sandboxes block it), use the
+                  button below.
+                </div>
+                {pngOut.url && (
+                  <a href={pngOut.url} download={pngOut.name}
+                    target="_blank" rel="noopener noreferrer"
+                    style={{ display: "block", background: "#1a232c", color: "#cfe6ec",
+                      textAlign: "center", padding: "11px", borderRadius: 9, fontSize: 13,
+                      fontWeight: 600, textDecoration: "none", border: "1px solid #2f6b78" }}>
+                    Open / save PNG
+                  </a>
+                )}
+              </div>
+            )}
 
             <button onClick={exportPaperStack} disabled={penMode}
               title={penMode ? "Turn off pen-plot mode — the paper stack needs filled color regions"
