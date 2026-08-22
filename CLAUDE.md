@@ -56,6 +56,13 @@ scaled inside a fixed-size `<div>` gives a zoomed crop to screenshot.
   picture. Keep it that way: a file that does not match what was on screen is a
   bug, unless the user asked for it (the mesh and polish export steps do, and
   say so in their help text).
+- **PNG export is the escape hatch from the SVG's smoothing steps.** The SVG's
+  edge polish blurs the field before the regions are cut, which is what takes
+  the last of the raster grid off a distant outline — and, with it, any glint
+  only a few raster pixels across. The PNG path rasterizes the preview's own
+  geometry instead (no polish, no mesh stand-down; it keeps only the width
+  multiplier, which resolves rather than smooths), so it is where fidelity to
+  the preview lives. Keep it that way.
 - **Two different limits control how fine an edge can be.** `BW` is the raster
   the regions are contoured on — how finely an outline is *drawn*. `gN` is the
   wave mesh — how much surface there is *to* draw. They are not
