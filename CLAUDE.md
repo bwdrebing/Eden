@@ -60,9 +60,12 @@ scaled inside a fixed-size `<div>` gives a zoomed crop to screenshot.
   edge polish blurs the field before the regions are cut, which is what takes
   the last of the raster grid off a distant outline — and, with it, any glint
   only a few raster pixels across. The PNG path rasterizes the preview's own
-  geometry instead (no polish, no mesh stand-down; it keeps only the width
-  multiplier, which resolves rather than smooths), so it is where fidelity to
-  the preview lives. Keep it that way.
+  geometry instead (no polish, no mesh stand-down), so it is where fidelity to
+  the preview lives. Keep it that way. Its edges stay smooth without any
+  smoothing because the regions are retraced on the output's own pixel grid
+  (`pngTraceBW`) — one raster step per output pixel, absorbed by the
+  rasterizer's antialiasing. If a PNG comes back jagged, the trace raster has
+  fallen behind the file's width; that is the thing to fix, not the field.
 - **Two different limits control how fine an edge can be.** `BW` is the raster
   the regions are contoured on — how finely an outline is *drawn*. `gN` is the
   wave mesh — how much surface there is *to* draw. They are not

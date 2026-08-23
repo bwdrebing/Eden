@@ -1377,6 +1377,33 @@ const PNG_DEFAULT = 2;     // 4x — 3040 x 2000
 // top step above sits just under the cap at the current frame; the clamp is
 // what keeps that true if the frame ever changes shape.
 const PNG_MAX_PIXELS = 16.5e6;
+// The raster the PNG's regions are contoured on: its own output width.
+//
+// This is the lever the SVG does not have. An outline is a curve through one
+// marching-squares crossing per raster pixel, so a raster pixel is the finest
+// step it can take — and how big that step LOOKS depends entirely on what it is
+// being drawn into. The SVG has no answer to that (it is opened at any zoom,
+// so any fixed raster is coarse somewhere, which is what polish is for), but a
+// PNG does: it has a pixel size, known before anything is traced. Match the two
+// and a step is one output pixel, which lands under the rasterizer's
+// antialiasing instead of on top of it — and unlike every smoothing step, a
+// finer trace resolves MORE of the small features, not fewer.
+//
+// Below the preview's own raster it must never go: that would be a coarser
+// picture than the screen, not a bigger one. Above EXPORT_MAX_BW it must not go
+// either — that is what a tab can allocate. At the largest scale the cap wins
+// and a step is a shade over one pixel, which is still not something an eye
+// finds on an antialiased edge.
+//
+// Matching is the floor, not the ceiling: tracing finer than the output still
+// buys a little, because a ribbon thinner than a pixel comes out as a faint
+// line rather than as nothing. So export detail — alone of the three export
+// sliders, and only because it resolves rather than smooths — can push this
+// higher, and someone who has already turned it up keeps what it was giving
+// them.
+function pngTraceBW(level, w, mult = 1) {
+  return Math.min(EXPORT_MAX_BW, Math.max(level.BW, w, Math.round(level.BW * mult)));
+}
 function pngSize(scale) {
   const s = Math.min(scale, Math.sqrt(PNG_MAX_PIXELS / (VB_W * VB_H)));
   // floor, not round: rounding a clamped scale can land a pixel over the cap
@@ -1893,7 +1920,7 @@ export {
   RASTER_LEVELS, RASTER_DEFAULT, EXPORT_MULTS, EXPORT_DEFAULT, EXPORT_MAX_BW,
   EXPORT_MESHES, EXPORT_MESH_DEFAULT, EXPORT_MESH_FLOOR, exportRaster,
   EXPORT_POLISH, EXPORT_POLISH_DEFAULT, smoothField,
-  PNG_SCALES, PNG_DEFAULT, PNG_MAX_PIXELS, pngSize, sizedSvg, svgToPngBlob,
+  PNG_SCALES, PNG_DEFAULT, PNG_MAX_PIXELS, pngSize, pngTraceBW, sizedSvg, svgToPngBlob,
 };
 
 // ---- layered-paper stack export -----------------------------------
@@ -3195,15 +3222,16 @@ export default function App() {
     }, 30);
   };
 
-  // PNG at `pngQ`: the preview's geometry, drawn by the browser at several
-  // times the frame. It keeps the export's width multiplier — that step
-  // resolves the same picture finer, and the bigger the output the more it is
-  // needed — and deliberately skips the mesh and polish steps, which change the
-  // picture to protect a vector edge this file does not have. Same pause as the
-  // SVG export when a retrace is involved, then one async rasterize.
+  // PNG at `pngQ`: the preview's picture, retraced onto the output's own pixel
+  // grid and drawn by the browser at that size. The raster follows the file's
+  // width, with export detail able to push it further (see pngTraceBW); the
+  // mesh and polish sliders do not apply at all, since both exist to protect a
+  // vector edge this file does not have. Same pause as the SVG export while it
+  // traces, then one async rasterize.
   const pngAt = pngSize(PNG_SCALES[Math.max(0, Math.min(PNG_SCALES.length - 1, pngQ))]);
-  const pngRetrace = solid3d && exportMult > 1;
-  const pngGeom = pngRetrace ? { ...exportRaster(rasterLevel, exportMult), polish: 0 } : null;
+  const pngBW = pngTraceBW(rasterLevel, pngAt.w, exportMult);
+  const pngRetrace = solid3d && pngBW > rasterLevel.BW;
+  const pngGeom = pngRetrace ? { gN: rasterLevel.gN, BW: pngBW, polish: 0 } : null;
   const showPng = (blob, name) => {
     let url = null;
     try {
@@ -4079,20 +4107,24 @@ export default function App() {
                 color: pngBusy ? "#9fc4cd" : "#f1fbff",
                 padding: "12px", borderRadius: 10, cursor: pngBusy ? "wait" : "pointer",
                 fontSize: 13.5, fontWeight: 600, letterSpacing: 0.3 }}>
-              {pngBusy ? `Rendering ${pngAt.w}\u00d7${pngAt.h}\u2026` : "Export PNG"}
+              {pngBusy
+                ? (pngRetrace ? `Tracing at ${pngBW}px\u2026` : `Rendering ${pngAt.w}\u00d7${pngAt.h}\u2026`)
+                : "Export PNG"}
             </button>
             <div style={{ fontSize: 10, color: "#6d808f", marginTop: 5, lineHeight: 1.5,
               fontFamily: "ui-monospace, monospace" }}>
               {solid3d ? (
                 <>
-                  Pixels instead of paths, and the closest thing to the preview this page
-                  can hand you. The steps above smooth the vector outline so it survives
-                  being magnified — edge polish especially, which blurs the field before
-                  the regions are cut and takes the smallest glints and highlights with
-                  it. A raster has no outline to smooth, so the PNG runs neither polish
-                  nor the mesh stand-down: it draws the preview's own geometry{pngRetrace
-                    ? `, retraced at ${exportRaster(rasterLevel, exportMult).BW}px so the edges are resolved for a file this wide.`
-                    : "."} Reach for it when the SVG loses something you can see on screen.
+                  Pixels instead of paths, and it needs no tuning. Mesh and polish above
+                  smooth the vector outline so it survives being magnified — polish blurs
+                  the field before the regions are cut, which is what takes the smallest
+                  glints with it — and neither runs here. A file with a known pixel size
+                  does not need them: the regions are retraced on the output's own grid
+                  {pngRetrace ? ` (${pngBW}px for this one)` : ""}, so a raster step is a
+                  single pixel and disappears into the antialiasing, and resolving finer
+                  finds more of the small stuff rather than less. Export detail is the one
+                  slider that still reaches this file, and only to push that raster past
+                  the output's own width.
                 </>
               ) : (
                 <>
