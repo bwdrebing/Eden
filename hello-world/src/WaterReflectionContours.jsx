@@ -1042,7 +1042,9 @@ function cr4(a, b, c, d, t) {
 // share this path purely for what the raster gives them for free — a picture
 // sampled on the FRAME rather than on the ground plane, with everything
 // outside the viewport absent instead of merely clipped later.
-function rasterizeSurface(S, fit, gN, BW, lift = true) {
+// `gapVB` > 0 also traces the crest gaps (see crestGapField), as a width in
+// viewBox units.
+function rasterizeSurface(S, fit, gN, BW, lift = true, gapVB = 0) {
   const BH = Math.max(2, Math.round(BW * VB_H / VB_W));
   const stride = gN + 1, NV = stride * stride, NP = BW * BH;
   const GX = new Float64Array(NV), GY = new Float64Array(NV);
@@ -1113,11 +1115,17 @@ function rasterizeSurface(S, fit, gN, BW, lift = true) {
   // couple of box passes turn the steps into a ramp, and the crossing then
   // slides sub-pixel along the edge — the silhouette reads as the smooth curve
   // the crest actually is instead of a flight of stairs.
-  const tmp = new Float64Array(NP);            // one scratch buffer for both blurs
+  const tmp = new Float64Array(NP);            // one scratch buffer for every blur
   blurField(sil, BW, BH, tmp, 2);
-  // flat water occludes nothing, so skip the seam pass entirely
+  // flat water occludes nothing, so skip the seam and gap passes entirely
   const crest = occluding ? crestField(occ, cov, BW, BH, NP, tmp) : null;
-  return { BW, BH, NP, stride, GX, GY, GI, GJ, cov, sil, crest };
+  // The gap width is asked for in viewBox units and used in raster pixels, so
+  // the same setting draws the same gap whatever raster the picture is traced
+  // on — the export retrace stays the picture the preview showed.
+  const gap = occluding && gapVB > 0
+    ? crestGapField(SX, SY, QW, gN, stride, zb, BW, BH, (gapVB * BW) / VB_W, tmp)
+    : null;
+  return { BW, BH, NP, stride, GX, GY, GI, GJ, cov, sil, crest, gap };
 }
 
 // ---- crest seams ---------------------------------------------------
@@ -1167,6 +1175,170 @@ function crestField(occ, cov, BW, BH, NP, scratch) {
   blurField(side, BW, BH, scratch || new Float64Array(NP), 2);
   for (let p = 0; p < NP; p++) if (!band[p]) side[p] = 0;
   return side;
+}
+
+// ---- crest gaps -----------------------------------------------------
+// An outline that says which wave is in front of which. Where a near crest
+// cuts across the water behind it the two sheets usually carry the same color
+// — the crest dissolves into the band it overlaps and the relief goes flat.
+// The remedy is the one the eye already expects from a paper cut-out: let the
+// surface occlude a little PAST its own silhouette, so a thin strip of
+// background opens along the far side of every crest and the near sheet reads
+// as standing in front.
+//
+// Where the crests are is a question about the MESH, not about the raster. A
+// fold is where the surface's projection turns back on itself: the two
+// triangles either side of a mesh edge wind opposite ways on screen, and that
+// edge is exactly the curve where the visible sheet ends and whatever is
+// behind it takes over. (`occ` cannot answer this. It marks every pixel with
+// water behind it, which under a grazing camera is one solid mass — its
+// outline is the outermost crest only, and says nothing about the dozens of
+// folds inside it. That is enough to snap a seam onto, not to draw along.)
+//
+// From those edges the gap is a distance field. Rasterize the fold edges
+// carrying their depth, drop the ones a nearer wave hides, then take the
+// chamfer distance to the nearest surviving crest pixel and carry that
+// pixel's depth along with it: comparing that depth with the depth actually
+// visible at a pixel says which side of the crest the pixel is on — nearer
+// than the crest is the sheet in front, farther is the water behind. Signed
+// that way, the gap is the band 0 < s < w, whose own signed distance is
+// min(s, w − s), and every threshold of it is a smooth curve the usual
+// marching-squares + Chaikin pass can trace like any other region.
+//
+// Taking the NEAREST crest is also what keeps the far field from turning to
+// mush. Toward the horizon the strip of water visible between two crests
+// becomes thinner than the gap itself; each pixel of that strip belongs to
+// whichever crest is closer, so the band can never eat more than half of a
+// strip however narrow it gets. The effect thins out with distance instead of
+// flooding the top of the frame.
+function crestGapField(SX, SY, QW, gN, stride, zb, BW, BH, wPx, scratch) {
+  const NP = BW * BH;
+  // which way each projected triangle winds; 0 = degenerate, or a vertex at
+  // or behind the eye, where the projection says nothing about facing
+  const facing = (a, b, c) => {
+    if (!QW[a] || !QW[b] || !QW[c]) return 0;
+    const d = (SY[b] - SY[c]) * (SX[a] - SX[c]) + (SX[c] - SX[b]) * (SY[a] - SY[c]);
+    return d > 1e-9 ? 1 : d < -1e-9 ? -1 : 0;
+  };
+  const F = new Int8Array(2 * gN * gN);
+  for (let j = 0; j < gN; j++) for (let i = 0; i < gN; i++) {
+    const a = j * stride + i, b = a + 1, c = a + stride, e = c + 1, t = 2 * (j * gN + i);
+    F[t] = facing(a, b, c); F[t + 1] = facing(b, e, c);
+  }
+  const cmask = new Uint8Array(NP);
+  const zc = new Float32Array(NP).fill(Infinity);
+  let any = false;
+  // a fold edge, walked pixel by pixel. Screen position interpolates linearly
+  // along a projected segment; depth does not, but 1/depth does — the same
+  // perspective divide the surface raster interpolates in.
+  const edge = (v0, v1) => {
+    const q0 = QW[v0], q1 = QW[v1];
+    if (!q0 || !q1) return;
+    const x0 = SX[v0], y0 = SY[v0], dx = SX[v1] - x0, dy = SY[v1] - y0;
+    const n = Math.ceil(Math.max(Math.abs(dx), Math.abs(dy)));
+    if (n > BW + BH) return;             // a cell smeared across the whole frame
+    for (let s = 0; s <= n; s++) {
+      const t = n ? s / n : 0;
+      const x = Math.round(x0 + dx * t), y = Math.round(y0 + dy * t);
+      if (x < 0 || y < 0 || x >= BW || y >= BH) continue;
+      const iw = q0 + (q1 - q0) * t;
+      if (iw <= 0) continue;
+      const z = 1 / iw, p = y * BW + x;
+      if (z < zc[p]) zc[p] = z;
+      cmask[p] = 1; any = true;
+    }
+  };
+  // Each interior mesh edge belongs to exactly one quad this way: the diagonal
+  // between the quad's own two triangles, and the two edges its second
+  // triangle shares with the quad to its right and the quad below.
+  for (let j = 0; j < gN; j++) for (let i = 0; i < gN; i++) {
+    const a = j * stride + i, b = a + 1, c = a + stride, e = c + 1;
+    const t = 2 * (j * gN + i), f0 = F[t], f1 = F[t + 1];
+    if (f0 && f1 && f0 !== f1) edge(b, c);
+    if (i + 1 < gN) { const g = F[2 * (j * gN + i + 1)]; if (f1 && g && f1 !== g) edge(b, e); }
+    if (j + 1 < gN) { const g = F[2 * ((j + 1) * gN + i)]; if (f1 && g && f1 !== g) edge(c, e); }
+  }
+  if (!any) return null;
+  // Two ways a fold is not a crest to draw along, both settled by the depths
+  // the raster already holds: a fold with nearer water standing in front of it
+  // is not visible at all, and a fold with nothing behind it any deeper than
+  // itself has not started hiding anything yet — the surface has only just
+  // turned away and the sliver it hides is thinner than a pixel. The second
+  // matters as much as the first: at an incipient fold both sides sit at the
+  // same depth, so which side a neighbouring pixel falls on comes out of the
+  // rounding, and the gap breaks up into a dotted line of coin flips.
+  any = false;
+  for (let p = 0; p < NP; p++) {
+    if (!cmask[p]) continue;
+    const z = zc[p], x = p % BW, y = (p - x) / BW;
+    let deepest = 0;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const nx = x + dx, ny = y + dy;
+      if (nx < 0 || ny < 0 || nx >= BW || ny >= BH) continue;
+      const d = zb[ny * BW + nx];
+      if (d > deepest) deepest = d;
+    }
+    if (zb[p] < z * CREST_MARGIN || deepest < z * CREST_MARGIN_INV) cmask[p] = 0;
+    else any = true;
+  }
+  if (!any) return null;
+  // chamfer distance to the nearest visible crest pixel, carrying that pixel's
+  // depth along the same relaxations
+  const INF = 1e9, s2 = Math.SQRT2;
+  const D = new Float32Array(NP), Z = new Float32Array(NP);
+  for (let p = 0; p < NP; p++) { D[p] = cmask[p] ? 0 : INF; Z[p] = cmask[p] ? zc[p] : 0; }
+  for (let j = 0; j < BH; j++) for (let i = 0; i < BW; i++) {
+    const p = j * BW + i; if (!D[p]) continue;
+    let d = D[p], z = Z[p], q;
+    if (i > 0 && D[q = p - 1] + 1 < d) { d = D[q] + 1; z = Z[q]; }
+    if (j > 0 && D[q = p - BW] + 1 < d) { d = D[q] + 1; z = Z[q]; }
+    if (i > 0 && j > 0 && D[q = p - BW - 1] + s2 < d) { d = D[q] + s2; z = Z[q]; }
+    if (i < BW - 1 && j > 0 && D[q = p - BW + 1] + s2 < d) { d = D[q] + s2; z = Z[q]; }
+    D[p] = d; Z[p] = z;
+  }
+  for (let j = BH - 1; j >= 0; j--) for (let i = BW - 1; i >= 0; i--) {
+    const p = j * BW + i; if (!D[p]) continue;
+    let d = D[p], z = Z[p], q;
+    if (i < BW - 1 && D[q = p + 1] + 1 < d) { d = D[q] + 1; z = Z[q]; }
+    if (j < BH - 1 && D[q = p + BW] + 1 < d) { d = D[q] + 1; z = Z[q]; }
+    if (i < BW - 1 && j < BH - 1 && D[q = p + BW + 1] + s2 < d) { d = D[q] + s2; z = Z[q]; }
+    if (i > 0 && j < BH - 1 && D[q = p + BW - 1] + s2 < d) { d = D[q] + s2; z = Z[q]; }
+    D[p] = d; Z[p] = z;
+  }
+  // Sign the distance by side. The far side of a crest is where the visible
+  // surface is deeper than the crest itself — no tolerance needed: at a fold
+  // the near sheet is tangent to the view ray, so it comes up to the crest's
+  // own depth from in front and the water behind starts beyond it.
+  //
+  // Both halves of the band are carried separately, and it matters which does
+  // what. The inner edge is the crest, and it comes from the SIGN: crest
+  // pixels are whole pixels, so the sign flips in whole steps and its zero set
+  // is a staircase, which the same couple of box passes the outer silhouette
+  // gets turns into a ramp that crosses sub-pixel along the crest. The outer
+  // edge is a distance, and it has to come from the DISTANCE — because the
+  // side test only means anything near a crest. Far out in the middle of a
+  // sheet the nearest crest is dozens of pixels away and whether the surface
+  // happens to be deeper than that crest flips along whole contours of the
+  // depth; reading the band off the signed field alone paints a hairline along
+  // every one of them. Clamped past the band's own reach, the distance says
+  // "outside" there and the flip has nothing to open.
+  // Float32 throughout: at export size each of these is tens of megabytes,
+  // and a distance in pixels needs nothing like double precision.
+  const cap = wPx + 4;
+  const band = new Float32Array(NP), dist = new Float32Array(NP);
+  for (let p = 0; p < NP; p++) {
+    const d = D[p] > cap ? cap : D[p];
+    dist[p] = d;
+    band[p] = zb[p] > Z[p] ? d : -d;
+  }
+  const tmp = scratch || new Float64Array(NP);
+  blurField(band, BW, BH, tmp, 2);
+  blurField(dist, BW, BH, tmp, 2);
+  for (let p = 0; p < NP; p++) {
+    const inner = band[p], outer = wPx - dist[p];
+    band[p] = inner < outer ? inner : outer;
+  }
+  return band;
 }
 
 // sample a ground-space function at every surface-grid vertex
@@ -1274,12 +1446,26 @@ function contourRegion(R, field, t, iters, buf) {
   return contourToScreenPath(multi, BW, BH, iters);
 }
 
+// The crest gaps as one path: the band on the far side of every visible crest,
+// clipped to the water by the same silhouette field the color regions use.
+// Painted over the layers in the background color it is precisely the hole
+// they would leave if the surface occluded that little bit further, and it
+// costs one path rather than a re-cut of every layer.
+function gapRegion(R, iters, buf) {
+  if (!R.gap) return null;
+  const { NP, BW, BH, sil, gap } = R;
+  for (let p = 0; p < NP; p++) { const s = sil[p], g = gap[p]; buf[p] = g < s ? g : s; }
+  const multi = d3.contours().size([BW, BH]).thresholds([0])(buf)[0];
+  return contourToScreenPath(multi, BW, BH, iters);
+}
+
 // Preset / 1D path: one continuous scalar (the reflected elevation), contoured
 // at the palette's band boundaries into nested upper sets, plus the occluded
 // Fresnel bands. `scalarAt`/`fresAt` are sampled at ground points.
 function buildSurface3D(S, fit, opts) {
-  const { scalarAt, thresholds, fresAt, fresThresholds, gN = 140, BW = 420, polish = 0 } = opts;
-  const R = rasterizeSurface(S, fit, gN, BW);
+  const { scalarAt, thresholds, fresAt, fresThresholds,
+          gN = 140, BW = 420, polish = 0, gap = 0 } = opts;
+  const R = rasterizeSurface(S, fit, gN, BW, true, gap);
   const iters = S.smooth || 0;
   const buf = new Float64Array(R.NP);
   const scratch = polishScratch(R.NP, polish);
@@ -1294,7 +1480,7 @@ function buildSurface3D(S, fit, opts) {
     smoothField(ff, R.cov, R.BW, R.BH, polish, scratch);
     fres = fresThresholds.map((t) => contourRegion(R, ff, t, iters, buf));
   }
-  return { layers, fres };
+  return { layers, fres, gap: gapRegion(R, iters, buf) };
 }
 
 // 2D panorama path: no single scalar exists, so take the flat path's stack of
@@ -1304,8 +1490,9 @@ function buildSurface3D(S, fit, opts) {
 // instead of the flat water grid. `uvAt` returns the reflected panorama
 // coordinate in cells, matching buildSegmentation's fG/fF.
 function buildSurface3DPanorama(S, fit, opts) {
-  const { uvAt, env2d, fresAt, fresThresholds, gN = 140, BW = 420, polish = 0 } = opts;
-  const R = rasterizeSurface(S, fit, gN, BW);
+  const { uvAt, env2d, fresAt, fresThresholds,
+          gN = 140, BW = 420, polish = 0, gap = 0 } = opts;
+  const R = rasterizeSurface(S, fit, gN, BW, true, gap);
   const { NP, BH, cov, sil, crest } = R;
   const iters = S.smooth || 0;
   const stack = panoramaStack(env2d);
@@ -1374,7 +1561,8 @@ function buildSurface3DPanorama(S, fit, opts) {
     smoothField(ff, cov, BW, BH, polish, scratch);
     fres = fresThresholds.map((t) => contourRegion(R, ff, t, iters, buf));
   }
-  return { bg: colorOf[order[0]], layers: layers.filter((l) => l.d), fres };
+  return { bg: colorOf[order[0]], layers: layers.filter((l) => l.d), fres,
+           gap: gapRegion(R, iters, buf) };
 }
 
 // One 3D-solid pass at a given raster: hidden-surface removal, then the usual
@@ -1383,8 +1571,8 @@ function buildSurface3DPanorama(S, fit, opts) {
 // path the flat layers use. The live preview and the SVG export both come
 // through here, so an export traced at a wider raster is the same picture, only
 // resolved finer.
-// `raster` is { gN, BW } plus an optional `polish` pass count, and rides through
-// to whichever builder the mode picks.
+// `raster` is { gN, BW } plus an optional `polish` pass count and `gap` width,
+// and rides through to whichever builder the mode picks.
 function buildSolid3D(S, fieldSpec, raster) {
   const fit = computeFit(S);
   prepField(S);
@@ -1394,8 +1582,8 @@ function buildSolid3D(S, fieldSpec, raster) {
   if (uvAt) return buildSurface3DPanorama(S, fit, { uvAt, env2d, fresAt, fresThresholds, ...raster });
   // preset / paint1d: the wave silhouette does the occlusion. Lowest band
   // shows the background, exactly like the flat render, so no base layer.
-  const { layers, fres } = buildSurface3D(S, fit, { scalarAt, thresholds, fresAt, fresThresholds, ...raster });
-  return { bg: cols[0], layers: layers.map((d, k) => ({ d, color: cols[k + 1] })), fres };
+  const { layers, fres, gap } = buildSurface3D(S, fit, { scalarAt, thresholds, fresAt, fresThresholds, ...raster });
+  return { bg: cols[0], layers: layers.map((d, k) => ({ d, color: cols[k + 1] })), fres, gap };
 }
 
 // each color region is filled with nested rings that follow its edge shape
@@ -2242,8 +2430,9 @@ function buildPaperImage(S, fit, opts) {
           maxColors = PAPER_MAX_COLORS,
           scalarAt, thresholds, cols,      // preset / 1D palettes: one scalar
           uvAt, env2d,                     // painted panorama: reflected u,v
+          gap = 0, gapColor,               // crest gaps, as in the SVG
           fresAt, fresBands, deepMix } = opts;
-  const R = rasterizeSurface(S, fit, gN, BW, lift);
+  const R = rasterizeSurface(S, fit, gN, BW, lift, gap);
   const { NP, cov } = R;
 
   const idOf = new Map(), palette = [];
@@ -2253,6 +2442,10 @@ function buildPaperImage(S, fit, opts) {
     return id;
   };
   const bgId = idFor(bgColor || PAPER_FRAME_COLOR);
+  // a crest gap is a hole in the picture, so on paper it is the sheet behind
+  // it showing through — the mount, unless a gap color asks for its own sheet
+  const gapF = R.gap;
+  const gapId = gapF && gapColor ? idFor(gapColor) : bgId;
 
   let colorOf;
   if (uvAt) {
@@ -2281,13 +2474,17 @@ function buildPaperImage(S, fit, opts) {
   const grid = new Int32Array(NP);
   const counts = [];
   for (let p = 0; p < NP; p++) {
-    if (!cov[p]) { grid[p] = bgId; counts[bgId] = (counts[bgId] || 0) + 1; continue; }
-    let c = colorOf(p);                          // off the water: the mount
-    if (fw) {
-      const b = Math.floor(fw[p] * fresBands);
-      c = deepMix(c, b >= fresBands ? fresBands - 1 : b < 0 ? 0 : b);
+    let id;
+    if (!cov[p]) id = bgId;                      // off the water: the mount
+    else if (gapF && gapF[p] > 0) id = gapId;    // inside a crest gap: cut through
+    else {
+      let c = colorOf(p);
+      if (fw) {
+        const b = Math.floor(fw[p] * fresBands);
+        c = deepMix(c, b >= fresBands ? fresBands - 1 : b < 0 ? 0 : b);
+      }
+      id = idFor(c);
     }
-    const id = idFor(c);
     grid[p] = id;
     counts[id] = (counts[id] || 0) + 1;
   }
@@ -2824,6 +3021,8 @@ export default function App() {
   const [rectOutput, setRectOutput] = useState(false);
   const [surface3d, setSurface3d] = useState(true); // lift color regions onto the waves
   const [waveScale, setWaveScale] = useState(8);     // 3D wave-height exaggeration
+  const [crestGap, setCrestGap] = useState(0);      // crest outline width, frame units (0 = off)
+  const [crestGapColor, setCrestGapColor] = useState(""); // "" = the background
   const [edges, setEdges] = useState(false);
   const [animate, setAnimate] = useState(false);
   const [speed, setSpeed] = useState(0.5);
@@ -2949,6 +3148,7 @@ export default function App() {
     palette: [palette, setPalette], perspective: [perspective, setPerspective],
     rectOutput: [rectOutput, setRectOutput], surface3d: [surface3d, setSurface3d],
     waveScale: [waveScale, setWaveScale], edges: [edges, setEdges],
+    crestGap: [crestGap, setCrestGap], crestGapColor: [crestGapColor, setCrestGapColor],
     animate: [animate, setAnimate], speed: [speed, setSpeed], quality: [quality, setQuality],
     manualTime: [manualTime, setManualTime], lowPower: [lowPower, setLowPower],
     rasterQ: [rasterQ, setRasterQ], exportQ: [exportQ, setExportQ],
@@ -3172,6 +3372,7 @@ export default function App() {
   const bg = use2d ? seg.bg : isobandColors[0];
   const autoBg = penMode ? "#0a0d12" : bg;
   const bgFill = bgColor || autoBg;
+  const gapFill = crestGapColor || bgFill;
   const layers = use2d ? (seg.layers || null)
     : geom.ds.map((d, k) => ({ d, color: isobandColors[k + 1] }));
   const rng = use2d ? seg : geom;
@@ -3290,8 +3491,10 @@ export default function App() {
   // side. Produces occluded { layers, fres } that slot straight into the same
   // render path the flat layers use (Fresnel, edges and all).
   const surf3d = useMemo(
-    () => (solid3d ? buildSolid3D(S, fieldSpec, { gN: rasterLevel.gN, BW: rasterLevel.BW }) : null),
-    [solid3d, S, fieldSpec, rasterLevel]);
+    () => (solid3d
+      ? buildSolid3D(S, fieldSpec, { gN: rasterLevel.gN, BW: rasterLevel.BW, gap: crestGap })
+      : null),
+    [solid3d, S, fieldSpec, rasterLevel, crestGap]);
 
   // in 3D-solid mode the occluded surf3d geometry drives every filled-region
   // code path below (live preview, SVG export, Fresnel clips) in place of the
@@ -3299,6 +3502,9 @@ export default function App() {
   const drawLayers = solid3d ? surf3d.layers : layers;
   const drawFres = solid3d ? surf3d.fres : fresPaths;
   const drawBg = solid3d ? surf3d.bg : bg;
+  // the crest gaps ride on top of every layer, in whatever shows through a
+  // hole in the picture — the page background, unless asked for another color
+  const drawGap = solid3d ? surf3d.gap : null;
 
   // floating buoy: projected cap + waterline clip + mirrored reflection
   const buoy = useMemo(() => {
@@ -3328,6 +3534,7 @@ export default function App() {
     const svgLayers = over ? over.layers : drawLayers;
     const svgFres = over ? over.fres : drawFres;
     const svgBg = over ? over.bg : drawBg;
+    const svgGap = over ? over.gap : drawGap;
     const buoyStr = buoy ? buoySvg(buoy, buoyShade) : "";
     const rollOpen = rollTf ? `<g transform="${rollTf}">` : `<g>`;
     if (penMode) {
@@ -3385,6 +3592,7 @@ export default function App() {
       });
       body += `</g>`;
     });
+    if (svgGap) body += `<path d="${svgGap}" fill="${gapFill}" fill-rule="evenodd"/>`;
     body += `</g>` + buoyStr + `</g>`;
     return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${VB_W} ${VB_H}">${defs ? `<defs>${defs}</defs>` : ""}${body}</svg>`;
   };
@@ -3415,7 +3623,8 @@ export default function App() {
   const exportMesh = EXPORT_MESHES[Math.max(0, Math.min(EXPORT_MESHES.length - 1, exportMeshQ))];
   const exportPolish = EXPORT_POLISH[Math.max(0, Math.min(EXPORT_POLISH.length - 1, exportPolishQ))];
   const exportAt = solid3d
-    ? { ...exportRaster(rasterLevel, exportMult, exportMesh.f), polish: exportPolish.passes }
+    ? { ...exportRaster(rasterLevel, exportMult, exportMesh.f), polish: exportPolish.passes,
+        gap: crestGap }
     : null;
   // a retrace is only worth its seconds when it would actually differ from what
   // is already on screen — a wider raster, a stood-down mesh, a polish pass the
@@ -3446,7 +3655,8 @@ export default function App() {
   // SVG export when a retrace is involved, then one async rasterize.
   const pngAt = pngSize(PNG_SCALES[Math.max(0, Math.min(PNG_SCALES.length - 1, pngQ))]);
   const pngRetrace = solid3d && exportMult > 1;
-  const pngGeom = pngRetrace ? { ...exportRaster(rasterLevel, exportMult), polish: 0 } : null;
+  const pngGeom = pngRetrace
+    ? { ...exportRaster(rasterLevel, exportMult), polish: 0, gap: crestGap } : null;
   const showPng = (blob, name) => {
     let url = null;
     try {
@@ -3489,6 +3699,7 @@ export default function App() {
     const image = buildPaperImage(S, fit, {
       gN: rasterLevel.gN, BW: Math.min(rasterLevel.BW, PAPER_MAX_BW),
       lift: surface3d && perspective,      // the render's own 3D-solid rule
+      gap: solid3d ? crestGap : 0, gapColor: crestGapColor,
       bgColor: bgFill, fresBands, deepMix: mixDeep,
       ...fieldSpec,
     });
@@ -3629,6 +3840,7 @@ export default function App() {
                         ))}
                       </g>
                     ))}
+                    {drawGap && <path d={drawGap} fill={gapFill} fillRule="evenodd" />}
                   </g>
                 </>
               )}
@@ -4108,6 +4320,34 @@ export default function App() {
                     in relief. Tune the wave <em>scale</em> with Ripple scale (λ) &amp; strength above,
                     and the vertical exaggeration here.
                   </div>
+                  <Slider label="Crest gap" value={crestGap} min={0} max={8} step={0.25}
+                    onChange={setCrestGap} fmt={(v) => (v === 0 ? "off" : v.toFixed(2))} />
+                  <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 8, lineHeight: 1.5,
+                    fontFamily: "ui-monospace, monospace" }}>
+                    Lets the water occlude a little past its own silhouette, opening a strip of
+                    background along the far side of every crest. Where a wave crosses water its
+                    own color it otherwise blends straight into it — this is what says which one
+                    is in front. Measured on the frame, so an export comes out with the same gap.
+                  </div>
+                  {crestGap > 0 && (
+                    <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
+                      <label style={{ width: 26, height: 26, borderRadius: 6, cursor: "pointer",
+                        border: "1px solid #44525e", position: "relative", overflow: "hidden",
+                        background: gapFill, display: "inline-block", flex: "none" }}>
+                        <input type="color"
+                          value={/^#[0-9a-fA-F]{6}$/.test(gapFill) ? gapFill : "#ffffff"}
+                          onChange={(e) => setCrestGapColor(e.target.value)}
+                          style={{ position: "absolute", inset: -4, opacity: 0, cursor: "pointer" }} />
+                      </label>
+                      <span style={{ fontSize: 11, color: "#9fb0c0", flex: 1,
+                        fontFamily: "ui-monospace, monospace" }}>
+                        {crestGapColor ? crestGapColor : "gap color: background"}
+                      </span>
+                      <button onClick={() => setCrestGapColor("")}
+                        style={{ ...miniBtn, flex: "none", padding: "6px 12px",
+                          opacity: crestGapColor ? 1 : 0.5 }}>Auto</button>
+                    </div>
+                  )}
                 </>
               )}
               <Toggle label="Show region edges" value={edges} onChange={setEdges} />
