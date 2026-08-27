@@ -16,7 +16,7 @@
 //  if the component starts deriving S differently this needs the same edit —
 //  the fixture test will keep rendering, just not the scene you meant.
 // ------------------------------------------------------------------ //
-import { reflectAt, buildGeometry, computeFit } from "./WaterReflectionContours";
+import { reflectAt, buildGeometry, computeFit, withWakes } from "./WaterReflectionContours";
 
 export const GRAZING_RIPPLES = {
     "steep": 0.81,
@@ -225,7 +225,7 @@ export function buildScene(settings) {
     surface3d: g.surface3d, waveScale: g.waveScale,
     bandFractions: runs.fracs,
     fresOn: g.fresOn, fresBands: g.fresBands, reflMag: g.reflMag,
-    emitters: g.emitters,
+    emitters: withWakes(g.emitters, g.wakes),
   };
   const fit = computeFit(S);
   buildGeometry(S);                         // prepares S._ems from the emitters
