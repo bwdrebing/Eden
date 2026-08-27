@@ -154,6 +154,7 @@ const WAKE_EDGE_V = (2 * Math.SQRT2) / 3;
 const WAKE_CUSP = 0.5;      // extra amplitude in the bright band along that edge
 const WAKE_RHO_MIN = 0.08;  // below this the divergent arm is shorter than anything draws
 const WAKE_DIV_L = 2 / 3;   // the divergent arm's wavelength at the wedge edge, in λ₀
+const WAKE_DETAIL_DEFAULT = 0.3;  // finest divergent wave kept, in λ₀
 // amp 1 = a wake as steep as the open water at strength 1: that path is
 // A = 0.06·strength at a wavelength of 1.8, and what reads is steepness A/λ
 const WAKE_STEEP = 0.06 / 1.8;
@@ -217,7 +218,7 @@ function wakeAt(e, gx, gy, slope) {
   // and in perspective what the range can. Same shape as the swell and
   // spectrum range filters, and like them the depth term varies over the
   // whole scene, so it weights the derivative without contributing one.
-  const flr = e.lamMin * e.lamMin
+  const flr0 = e.lamAA2
     + (e.aaC ? (e.aaC * 2 * Math.PI * gy) * (e.aaC * 2 * Math.PI * gy) : 0);
   // Each branch's own wavelength is λ₀cos²θ, taken below as a straight line
   // in m = 1 − β² — exact at the track and at the wedge edge, loose between,
@@ -237,6 +238,10 @@ function wakeAt(e, gx, gy, slope) {
     // one that fades out there; both meet at 2λ₀/3 on the edge and so merge
     const lamL = b ? WAKE_DIV_L * e.lam * m : e.lam * (1 - m / 3);
     const dl = b ? WAKE_DIV_L * e.lam : -e.lam / 3;
+    // the coarsest of the two floors wins; summing them would let the grid's
+    // floor, which is the grid's property and not the wake's, break the wake's
+    // scaling — the same wake at twice the size would carry different arms
+    const flr = b && e.lamDet2 > e.lamAA2 ? flr0 - e.lamAA2 + e.lamDet2 : flr0;
     const q = lamL * lamL + flr;
     const g = (lamL * lamL) / q;
     const ph = e.k0 * sec * (u + v * T);
@@ -278,7 +283,8 @@ function newWake(id, halfW, yFar, strength) {
   return { id, on: true, x: 0, y: Math.round(yFar * 0.35),
     dir: 15, scale: Math.max(1.5, Math.round(halfW * 0.14 * 2) / 2),
     amp: Math.max(0.1, Math.min(1.5, Math.round((strength || 0) * 20) / 20)),
-    len: 8, angle: Math.round(WAKE_ANGLE_DEG * 10) / 10 };
+    len: 8, detail: WAKE_DETAIL_DEFAULT,
+    angle: Math.round(WAKE_ANGLE_DEG * 10) / 10 };
 }
 
 // Pre-bake an emitter into per-frame constants so the per-sample loop is cheap.
@@ -308,14 +314,19 @@ function prepEmitter(em, S) {
     const ex = Math.cos(a), ey = Math.sin(a);          // heading (way on)
     const half = Math.max(6, Math.min(45, em.angle == null ? WAKE_ANGLE_DEG : em.angle));
     const lat = WAKE_MU / Math.tan((half * Math.PI) / 180);  // squeeze v to widen/narrow the V
-    // coarsest wave the sample grid can carry, in ground units; the fraction
-    // of λ₀ is a stylistic floor so the arms stay readable on a fine grid too
+    // Two floors on how short a wave the wake may carry, and they are not the
+    // same thing. lamAA is the coarsest the sample grid can hold — never
+    // negotiable, or the arms alias into speckle. lamDet is the chosen one:
+    // how much of the divergent feathering to keep at all. It is the divergent
+    // arms that run down to nothing toward the track, so the choice only binds
+    // them; the transverse crests and the V's own edge are never cut by it.
     const cell = Math.max((S.xMax - S.xMin) / S.nx, (S.yMax - S.yMin) / S.ny);
+    const det = em.detail == null ? WAKE_DETAIL_DEFAULT : em.detail;
     return { type: "wake", x: em.x, y: em.y, ex, ey, lx: -ey * lat, ly: ex * lat,
       lam, k0: (2 * Math.PI) / lam, A: WAKE_STEEP * lam * em.amp,
       L: Math.max(1, em.len) * lam,
       w: 0.45 * lam, w1: 0.9 * lam, wb: 0.45 * lam, e2: 0.04 * lam * lam,
-      lamMin: Math.max(0.26 * lam, 2.2 * cell),
+      lamAA2: Math.pow(2.2 * cell, 2), lamDet2: Math.pow(det * lam, 2),
       aaC: S.perspective ? 0.22 / S.ny : 0 };
   }
   if (em.type === "rings") {
@@ -2704,6 +2715,10 @@ function WakeCard({ wk, idx, halfW, yFar, onChange, onRemove }) {
         onChange={(v) => onChange({ amp: v })} fmt={(v) => (v === 0 ? "off" : v.toFixed(2))} />
       <Slider label="length (astern)" value={wk.len} min={2} max={30} step={1}
         onChange={(v) => onChange({ len: v })} fmt={(v) => v + "× vessel"} />
+      <Slider label="arm detail (finest ripple)" value={wk.detail} min={0.1} max={1.5} step={0.05}
+        onChange={(v) => onChange({ detail: v })}
+        fmt={(v) => (v <= 0.2 ? "all the feathering" : v <= 0.35 ? "fine"
+          : v <= 0.6 ? "medium" : v <= 0.95 ? "coarse" : "broad strokes only")} />
       <Slider label="spread of the V" value={wk.angle} min={8} max={40} step={0.5}
         onChange={(v) => onChange({ angle: v })}
         fmt={(v) => "±" + v.toFixed(1) + "°"
@@ -4057,8 +4072,10 @@ export default function App() {
                 the apex in post. Scale and strength are the wake&#39;s own, read in scene units
                 rather than off the sliders above, so it holds its size and its height when you
                 retune the open water — a new wake only starts at the strength the water has.
-                The pattern stands still in the vessel&#39;s frame, so it does not drift when the
-                waves animate.
+                Arm detail sets how short a wave the feathering off the arms may carry: turn it
+                down for a big scene where those wavelets land a pixel wide and break up under
+                the 3D lift, up for a close one where they are the point. The pattern stands
+                still in the vessel&#39;s frame, so it does not drift when the waves animate.
               </div>
               {wakes.map((wk, i) => (
                 <WakeCard key={wk.id} wk={wk} idx={i} halfW={halfW} yFar={yFar}

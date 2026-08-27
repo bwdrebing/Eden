@@ -120,9 +120,19 @@ describe("wake independence", () => {
   test("scale takes the whole wake with it", () => {
     const one = wakeField({ scale: 4 });
     const two = wakeField({ scale: 8 });
-    for (let u = 2; u <= 30; u += 2)
-      for (let v = -7; v <= 7; v += 1)
-        expect(at(two, 2 * u, 2 * v)).toBeCloseTo(2 * at(one, u, v), 9);
+    // Twice the wake at twice the offsets is twice the wave — to within a few
+    // percent. It is not exact, and should not be: the floor that keeps the
+    // arms above what the sample grid can hold belongs to the grid, not to the
+    // wake, so a wake at half the size really does carry less fine structure.
+    let dev = 0, peak = 0;
+    for (let u = 2; u <= 30; u += 0.25)
+      for (let v = -7; v <= 7; v += 0.25) {
+        const a = 2 * at(one, u, v);
+        dev = Math.max(dev, Math.abs(at(two, 2 * u, 2 * v) - a));
+        peak = Math.max(peak, Math.abs(a));
+      }
+    expect(peak).toBeGreaterThan(0.05);
+    expect(dev / peak).toBeLessThan(0.03);
   });
 
   test("strength scales the wake, and zero takes it out of the field", () => {
@@ -135,6 +145,41 @@ describe("wake independence", () => {
         expect(at(half, u, v)).toBeCloseTo(at(one, u, v) / 2, 12);
         expect(at(off, u, v)).toBe(0);
       }
+  });
+});
+
+describe("wake arm detail", () => {
+  // RMS of the second difference along the arm: |z\u2033| weights every wave by
+  // k², so it reads almost entirely off the shortest ones present. Counting
+  // zero crossings does not work here — along the arm the transverse system
+  // swings slowly enough to keep the sum on one side of zero.
+  const MU = 1 / (2 * Math.SQRT2);
+  const fine = (S) => {
+    const h = 0.02;
+    let n = 0, t = 0;
+    for (let u = 6; u <= 34; u += h) {
+      const a = at(S, u - h, 0.95 * MU * (u - h));
+      const b = at(S, u, 0.95 * MU * u);
+      const c = at(S, u + h, 0.95 * MU * (u + h));
+      const d2 = (a - 2 * b + c) / (h * h);
+      t += d2 * d2; n++;
+    }
+    return Math.sqrt(t / n);
+  };
+
+  test("raising it takes waves out of the arms, monotonically", () => {
+    const hf = [0.1, 0.3, 0.6, 1.0, 1.5].map((d) => fine(wakeField({ detail: d })));
+    for (let i = 1; i < hf.length; i++) expect(hf[i]).toBeLessThan(hf[i - 1]);
+    expect(hf[hf.length - 1]).toBeLessThan(hf[0] * 0.65);
+  });
+
+  test("it never touches the transverse crests or the V's own edge", () => {
+    const fine = wakeField({ detail: 0.1 }), broad = wakeField({ detail: 1.5 });
+    // on the track only the transverse system is live, and it is untouched
+    for (let u = 2; u <= 34; u += 0.5) expect(at(broad, u, 0)).toBe(at(fine, u, 0));
+    // and the arms stay on the Kelvin angle rather than migrating inward
+    expect(peakAngle(broad)).toBeWithin(WAKE_ANGLE_DEG, 1.5);
+    expect(ampAt(broad, 36)).toBe(0);
   });
 });
 
@@ -192,6 +237,7 @@ describe("withWakes", () => {
     expect(w.y).toBeLessThan(90);
     expect(w.scale).toBeGreaterThan(1);
     expect(w.angle).toBeCloseTo(WAKE_ANGLE_DEG, 1);
+    expect(w.detail).toBeGreaterThan(0);
   });
 
   test("a new wake starts at the strength the open water has, not above it", () => {
