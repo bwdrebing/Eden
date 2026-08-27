@@ -122,6 +122,165 @@ function aaCoef(k, S) {
   return S.perspective ? (0.22 * k) / S.ny : 0;
 }
 
+// ---- boat & board wakes ---------------------------------------------
+// The V a hull drags behind it — a Kelvin wake. Two wave systems live inside
+// a wedge of half-angle atan(1/(2√2)) = 19.47° about the track: transverse
+// crests running square across it, and divergent crests feathering off each
+// arm. Both are stationary in the vessel's frame, so unlike the emitters
+// above the pattern is a function of position alone — it does not travel.
+//
+// Write u for distance astern and v for offset from the track. Stationary
+// phase over the wave heading θ gives 2v·tan²θ + u·tanθ + v = 0, real only
+// where u² ≥ 8v² — that inequality *is* the wedge. Parametrized by
+// β = √(u² − 8v²)/u (0 on the wedge edge, 1 on the track) both roots and the
+// phase come out in closed form, with ρ = √((1−β)/(1+β)) and σ = sign v:
+//
+//     tanθ_transverse = −σ·ρ/√2       tanθ_divergent = −σ/(√2·ρ)
+//     Φ = k₀ · secθ · (u + v·tanθ)
+//
+// On the track that leaves Φ = k₀u — transverse crests every λ₀ astern. And
+// because θ is stationary the phase gradient needs no derivative of θ at all:
+// ∂Φ/∂u = k₀secθ and ∂Φ/∂v = k₀secθ·tanθ, which is what slopeAt uses.
+//
+// Everything is keyed off one length λ₀ — the wake's own wavelength, taken as
+// the vessel's waterline length, since a hull at hull speed throws a wave
+// about as long as it is. Nothing here reads S.k or S.amp, so a wake scales
+// as one object and holds still while the open water is retuned around it.
+const WAKE_MU = 1 / (2 * Math.SQRT2);                        // tan of the Kelvin half-angle
+const WAKE_ANGLE_DEG = (Math.atan(WAKE_MU) * 180) / Math.PI; // 19.47°
+// perpendicular distance in from the wedge edge is (μu − |v|)/√(1+μ²), which
+// with μ = 1/(2√2) is exactly u/3 − (2√2/3)|v|
+const WAKE_EDGE_V = (2 * Math.SQRT2) / 3;
+const WAKE_CUSP = 0.5;      // extra amplitude in the bright band along that edge
+const WAKE_RHO_MIN = 0.08;  // below this the divergent arm is shorter than anything draws
+const WAKE_DIV_L = 2 / 3;   // the divergent arm's wavelength at the wedge edge, in λ₀
+// amp 1 = a wake as steep as the open water at strength 1: that path is
+// A = 0.06·strength at a wavelength of 1.8, and what reads is steepness A/λ
+const WAKE_STEEP = 0.06 / 1.8;
+
+// Evaluate one prepped wake at a ground point, filling WAKE_OUT with the
+// height and — when `slope` is set — its two ground-space derivatives. One
+// function serves both so heightAt and slopeAt cannot drift apart. Returns
+// false when the point is out of reach and nothing was written.
+const WAKE_OUT = [0, 0, 0];
+function wakeAt(e, gx, gy, slope) {
+  const px = gx - e.x, py = gy - e.y;
+  const u = -(px * e.ex + py * e.ey);           // astern of the vessel
+  if (u <= 0) return false;                     // flat water ahead of the bow
+  const v = px * e.lx + py * e.ly;              // across the track, squeezed to the wedge
+  const sg = v < 0 ? -1 : 1;
+  // |v|, rounded off over a fraction of a wavelength. A true |v| would leave
+  // a crease straight down the middle of the wake: the envelope below is
+  // built on distance from the track, whose derivative flips sign there.
+  const av = Math.sqrt(v * v + e.e2);
+
+  // signed distance in from the wedge edge. The pattern is cut just outside
+  // it rather than at it, which is what gives a wake its hard outer line
+  // without putting a step in the field.
+  const d = u / 3 - WAKE_EDGE_V * av;
+  if (d < -3 * e.w) return false;
+  const r = Math.hypot(u, v);
+  if (r > 6 * e.L) return false;
+
+  // envelope: reach astern (geometric spreading × the chosen length), the
+  // bright band and feather at the wedge edge, and a bow ramp that opens the
+  // wake out of the hull instead of starting it from a point
+  const E = Math.exp(-r / e.L) / Math.sqrt(1 + r / e.lam);
+  const bow = (u * u) / (u * u + e.wb * e.wb);
+  const cut = d >= 0 ? 1 : Math.exp(-(d * d) / (e.w * e.w));
+  const gl = Math.exp(-(d * d) / (e.w1 * e.w1));
+  const bri = 1 + WAKE_CUSP * gl;
+  const env = e.A * E * bow * cut * bri;
+
+  // ∂env/∂u and ∂env/∂v. d is linear in u and v, so the sharp factors — the
+  // ones that vary within a wavelength — cost two constants to differentiate.
+  let du = 0, dv = 0;
+  if (slope) {
+    const P = bow * cut * bri;
+    const dEdr = -E * (1 / e.L + 0.5 / (e.lam + r));
+    const qb = u * u + e.wb * e.wb;
+    const dPdd = bow * ((d >= 0 ? 0 : (-2 * d / (e.w * e.w)) * cut) * bri
+      + cut * WAKE_CUSP * (-2 * d / (e.w1 * e.w1)) * gl);
+    const Pu = ((2 * u * e.wb * e.wb) / (qb * qb)) * cut * bri + dPdd / 3;
+    const Pv = dPdd * (-(v / av) * WAKE_EDGE_V);        // ∂d/∂v
+    du = e.A * (dEdr * (u / r) * P + E * Pu);
+    dv = e.A * (dEdr * (v / r) * P + E * Pv);
+  }
+
+  // Outside the wedge β is held at 0, where the two branches merge, so the
+  // pattern runs on unbroken into the feather instead of ending on a step.
+  const D = u * u - 8 * v * v;
+  const beta = D > 0 ? Math.sqrt(D) / u : 0;
+  const rho = Math.sqrt((1 - beta) / (1 + beta));
+
+  // How short a wave is worth drawing here: what the sample grid can hold,
+  // and in perspective what the range can. Same shape as the swell and
+  // spectrum range filters, and like them the depth term varies over the
+  // whole scene, so it weights the derivative without contributing one.
+  const flr = e.lamMin * e.lamMin
+    + (e.aaC ? (e.aaC * 2 * Math.PI * gy) * (e.aaC * 2 * Math.PI * gy) : 0);
+  // Each branch's own wavelength is λ₀cos²θ, taken below as a straight line
+  // in m = 1 − β² — exact at the track and at the wedge edge, loose between,
+  // which is plenty for a fade threshold. What it buys is that m = 8(v/u)²
+  // carries no square root, so unlike β it has a finite gradient at the edge.
+  const mr = (8 * v * v) / (u * u);
+  const m = mr < 1 ? mr : 1;                      // 0 on the track, 1 at the edge
+  const mu = mr < 1 ? (-2 * m) / u : 0;
+  const mv = mr < 1 ? (16 * v) / (u * u) : 0;
+
+  let z = 0, zu = 0, zv = 0;
+  for (let b = 0; b < 2; b++) {
+    if (b && rho <= WAKE_RHO_MIN) break;          // arm too short for anything to draw
+    const T = b ? -sg / (Math.SQRT2 * rho) : -sg * rho * Math.SQRT1_2;
+    const sec = Math.sqrt(1 + T * T);
+    // the divergent arm shortens without bound toward the track, so it is the
+    // one that fades out there; both meet at 2λ₀/3 on the edge and so merge
+    const lamL = b ? WAKE_DIV_L * e.lam * m : e.lam * (1 - m / 3);
+    const dl = b ? WAKE_DIV_L * e.lam : -e.lam / 3;
+    const q = lamL * lamL + flr;
+    const g = (lamL * lamL) / q;
+    const ph = e.k0 * sec * (u + v * T);
+    z += env * g * Math.sin(ph);
+    if (slope) {
+      const gm = ((2 * lamL * flr) / (q * q)) * dl;             // dg/dm
+      const sn = Math.sin(ph), c = env * g * Math.cos(ph) * e.k0 * sec;
+      zu += (du * g + env * gm * mu) * sn + c;
+      zv += (dv * g + env * gm * mv) * sn + c * T;
+    }
+  }
+
+  WAKE_OUT[0] = z;
+  if (slope) {
+    WAKE_OUT[1] = -e.ex * zu + e.lx * zv;
+    WAKE_OUT[2] = -e.ey * zu + e.ly * zv;
+  }
+  return true;
+}
+
+// Wakes ride into the field as emitters, so the height, the 3D lift, the pen
+// lines and the reflection all pick them up through the one path. Both the
+// studio and the saved-scene fixture assemble S through here — a wake that
+// only one of them added would render in only one of them.
+function withWakes(emitters, wakes) {
+  if (!wakes || !wakes.length) return emitters;
+  const live = wakes.filter((w) => w.on && w.amp > 0)
+    .map((w) => ({ ...w, id: "wake" + w.id, on: true, type: "wake" }));
+  return live.length ? [...emitters, ...live] : emitters;
+}
+
+// A fresh wake, sized to the scene it is being dropped into. Strength is
+// absolute once set — that is the whole point of it — but a wake dropped onto
+// a calm scene at the strength a rough one wants lands on top of the picture,
+// so the *seed* tracks the open water's own strength. It reproduces both
+// settings that read well by hand: about 0.4 over the saved scene's ripples,
+// and the floor over glass, where a wake is the only thing cutting the bands.
+function newWake(id, halfW, yFar, strength) {
+  return { id, on: true, x: 0, y: Math.round(yFar * 0.35),
+    dir: 15, scale: Math.max(1.5, Math.round(halfW * 0.14 * 2) / 2),
+    amp: Math.max(0.1, Math.min(1.5, Math.round((strength || 0) * 20) / 20)),
+    len: 8, angle: Math.round(WAKE_ANGLE_DEG * 10) / 10 };
+}
+
 // Pre-bake an emitter into per-frame constants so the per-sample loop is cheap.
 function prepEmitter(em, S) {
   const baseLambda = (2 * Math.PI / S.k) * em.size; // global λ × size
@@ -140,6 +299,24 @@ function prepEmitter(em, S) {
     const k0 = 2 * Math.PI / baseLambda;
     return { type: "swell", k0, Dx: Math.cos(a), Dy: Math.sin(a), A, ph0: -wt,
       q, aa: aaCoef(k0, S) };
+  }
+  if (em.type === "wake") {
+    // λ₀ is the vessel's length, read straight off the control in scene units
+    // instead of through S.k — that is what keeps the wake's scale its own
+    const lam = Math.max(0.25, em.scale);
+    const a = ((em.dir || 0) * Math.PI) / 180;
+    const ex = Math.cos(a), ey = Math.sin(a);          // heading (way on)
+    const half = Math.max(6, Math.min(45, em.angle == null ? WAKE_ANGLE_DEG : em.angle));
+    const lat = WAKE_MU / Math.tan((half * Math.PI) / 180);  // squeeze v to widen/narrow the V
+    // coarsest wave the sample grid can carry, in ground units; the fraction
+    // of λ₀ is a stylistic floor so the arms stay readable on a fine grid too
+    const cell = Math.max((S.xMax - S.xMin) / S.nx, (S.yMax - S.yMin) / S.ny);
+    return { type: "wake", x: em.x, y: em.y, ex, ey, lx: -ey * lat, ly: ex * lat,
+      lam, k0: (2 * Math.PI) / lam, A: WAKE_STEEP * lam * em.amp,
+      L: Math.max(1, em.len) * lam,
+      w: 0.45 * lam, w1: 0.9 * lam, wb: 0.45 * lam, e2: 0.04 * lam * lam,
+      lamMin: Math.max(0.26 * lam, 2.2 * cell),
+      aaC: S.perspective ? 0.22 / S.ny : 0 };
   }
   if (em.type === "rings") {
     // a scattered field of radial ripple sources -> concentric color rings
@@ -183,6 +360,14 @@ function prepEmitter(em, S) {
   return { type: "spectrum", K, DX, DY, AMP, PH, AA, N, q };
 }
 
+// Bake every live emitter for this frame. The one place S._ems is filled, so
+// the preview, the 3D solid, the pen lines and the exports all sample the
+// same field — and a test can stand a field up without building geometry.
+function prepField(S) {
+  S._ems = S.emitters.filter((e) => e.on).map((e) => prepEmitter(e, S));
+  return S;
+}
+
 // actual surface height (the wave displacement) — mirrors slopeAt but returns
 // the height itself, used to lift pen-plot lines into 3D
 function heightAt(gx, gy, S) {
@@ -204,6 +389,8 @@ function heightAt(gx, gy, S) {
         const r = Math.hypot(dx, dy) + 1e-6;
         z += e.AMP[i] * Math.exp(-e.dec * r) * Math.sin(e.K[i] * r + e.PH[i]);
       }
+    } else if (e.type === "wake") {
+      if (wakeAt(e, gx, gy, false)) z += WAKE_OUT[0];
     } else {
       for (let i = 0; i < e.N; i++) {
         const s1 = Math.sin(e.K[i] * (e.DX[i] * gx + e.DY[i] * gy) + e.PH[i]);
@@ -255,6 +442,8 @@ function slopeAt(gx, gy, S) {
         const f = e.AMP[i] * env * (e.K[i] * Math.cos(arg) - e.dec * Math.sin(arg));
         hx += f * dx / r; hy += f * dy / r;
       }
+    } else if (e.type === "wake") {
+      if (wakeAt(e, gx, gy, true)) { hx += WAKE_OUT[1]; hy += WAKE_OUT[2]; }
     } else {
       for (let i = 0; i < e.N; i++) {
         const th = e.K[i] * (e.DX[i] * gx + e.DY[i] * gy) + e.PH[i];
@@ -1198,7 +1387,7 @@ function buildSurface3DPanorama(S, fit, opts) {
 // to whichever builder the mode picks.
 function buildSolid3D(S, fieldSpec, raster) {
   const fit = computeFit(S);
-  S._ems = S.emitters.filter((e) => e.on).map((e) => prepEmitter(e, S));
+  prepField(S);
   const { uvAt, env2d, scalarAt, thresholds, cols, fresAt, fresThresholds } = fieldSpec;
   // painted panorama: same outlines as the flat 2D render, now stopping at
   // the wave crests in front of them
@@ -1614,7 +1803,7 @@ function bandColors(NB, palette) {
 // ---- geometry build, preset path (elevation isobands) -------------
 function buildGeometry(S) {
   const { nx, ny } = S;
-  S._ems = S.emitters.filter((e) => e.on).map((e) => prepEmitter(e, S));
+  prepField(S);
   const values = new Float64Array(nx * ny);
   const wVals = S.fresOn ? new Float64Array(nx * ny) : null;
   let lo = Infinity, hi = -Infinity;
@@ -1746,7 +1935,7 @@ function eachPanoramaLayer(stack, visit) {
 
 function buildSegmentation(S, env2d, azSpan) {
   const { nx, ny } = S;
-  S._ems = S.emitters.filter((e) => e.on).map((e) => prepEmitter(e, S));
+  prepField(S);
   const { w: EW, h: EH, cells } = env2d;
   const eLo = S.eLo, eHi = S.eHi, az = azSpan;
   const span = (eHi - eLo) || 1;
@@ -1889,6 +2078,7 @@ export {
   buildGeometry, buildSegmentation, envFromRows, stampObjects,
   paletteStops, paletteColorAt, DERIVED_ENV_H, ENV2D_W, DEFAULT_EMITTERS,
   computeFit, cell2ground, heightAt, clampLift, penProject, reflectAt, magFrac,
+  withWakes, newWake, WAKE_ANGLE_DEG, prepField, slopeAt,
   buildSurface3D, buildSurface3DPanorama, buildSolid3D, crestField,
   RASTER_LEVELS, RASTER_DEFAULT, EXPORT_MULTS, EXPORT_DEFAULT, EXPORT_MAX_BW,
   EXPORT_MESHES, EXPORT_MESH_DEFAULT, EXPORT_MESH_FLOOR, exportRaster,
@@ -2480,6 +2670,48 @@ function EmitterCard({ em, idx, halfW, yFar, onChange, onRemove }) {
   );
 }
 
+// one wake: where the vessel is, which way it is going, and how big the
+// wake it drags is. No hull is drawn — the boat or board goes on in post.
+const WAKE_ARROWS = ["→", "↗", "↑", "↖", "←", "↙", "↓", "↘"];
+function WakeCard({ wk, idx, halfW, yFar, onChange, onRemove }) {
+  return (
+    <div style={{ border: "1px solid #26313c", borderRadius: 9, padding: 11,
+      marginBottom: 10, background: "#121922" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 9 }}>
+        <span style={{ fontSize: 10.5, letterSpacing: 1, color: "#6f8294", flex: 1,
+          fontFamily: "ui-monospace, monospace" }}>WAKE {idx + 1}</span>
+        <button onClick={() => onChange({ on: !wk.on })}
+          style={{ fontSize: 10.5, padding: "4px 9px", borderRadius: 6, cursor: "pointer",
+            fontFamily: "ui-monospace, monospace",
+            background: wk.on ? "#27424b" : "#1a232c", color: wk.on ? "#dff1f6" : "#7f93a4",
+            border: "1px solid " + (wk.on ? "#3f7e8f" : "#26313c") }}>
+          {wk.on ? "on" : "off"}
+        </button>
+        <button onClick={onRemove}
+          style={{ fontSize: 12, width: 26, height: 26, borderRadius: 6, cursor: "pointer",
+            background: "#1a232c", color: "#9a6a6a", border: "1px solid #3a2a2a" }}>✕</button>
+      </div>
+      <Slider label="position ← →" value={wk.x} min={-halfW + 1} max={halfW - 1} step={0.5}
+        onChange={(v) => onChange({ x: v })} fmt={(v) => (v === 0 ? "center" : v.toFixed(1))} />
+      <Slider label="distance (near → far)" value={wk.y} min={3} max={yFar - 2} step={0.5}
+        onChange={(v) => onChange({ y: v })} fmt={(v) => v.toFixed(1)} />
+      <Slider label="heading (way on)" value={wk.dir} min={0} max={355} step={5}
+        onChange={(v) => onChange({ dir: v })}
+        fmt={(v) => v + "° " + WAKE_ARROWS[Math.round(v / 45) % 8]} />
+      <Slider label="scale (vessel length)" value={wk.scale} min={0.5} max={16} step={0.1}
+        onChange={(v) => onChange({ scale: v })} fmt={(v) => v.toFixed(1) + " units"} />
+      <Slider label="strength" value={wk.amp} min={0} max={2} step={0.05}
+        onChange={(v) => onChange({ amp: v })} fmt={(v) => (v === 0 ? "off" : v.toFixed(2))} />
+      <Slider label="length (astern)" value={wk.len} min={2} max={30} step={1}
+        onChange={(v) => onChange({ len: v })} fmt={(v) => v + "× vessel"} />
+      <Slider label="spread of the V" value={wk.angle} min={8} max={40} step={0.5}
+        onChange={(v) => onChange({ angle: v })}
+        fmt={(v) => "±" + v.toFixed(1) + "°"
+          + (Math.abs(v - WAKE_ANGLE_DEG) < 0.3 ? " (true)" : "")} />
+    </div>
+  );
+}
+
 // read-only mini render of a panorama (used to show what the water reflects)
 function EnvPreview({ env }) {
   const cvRef = useRef(null);
@@ -2619,6 +2851,16 @@ export default function App() {
   const [halfW, setHalfW] = useState(22); // 44 units across
   const [yNear, setYNear] = useState(3);
   const [yFar, setYFar] = useState(78);
+
+  // boat / board wakes: the water half of a vessel that is added in post
+  const [wakes, setWakes] = useState([]);
+  const updateWake = (id, patch) =>
+    setWakes((ws) => ws.map((w) => (w.id === id ? { ...w, ...patch } : w)));
+  const addWake = () =>
+    setWakes((ws) => ws.length >= 4 ? ws :
+      [...ws, newWake(ws.reduce((m, w) => Math.max(m, w.id), 0) + 1,
+        halfW, yFar, strength)]);
+  const removeWake = (id) => setWakes((ws) => ws.filter((w) => w.id !== id));
   const [reflMag, setReflMag] = useState(1); // reflection detail (angular zoom)
 
   // reflected objects: stamped into the environment panorama across the
@@ -2713,6 +2955,7 @@ export default function App() {
     exportMeshQ: [exportMeshQ, setExportMeshQ],
     exportPolishQ: [exportPolishQ, setExportPolishQ], pngQ: [pngQ, setPngQ],
     advanced: [advanced, setAdvanced], emitters: [emitters, setEmitters],
+    wakes: [wakes, setWakes],
     halfW: [halfW, setHalfW], yNear: [yNear, setYNear], yFar: [yFar, setYFar],
     reflMag: [reflMag, setReflMag], objects: [objects, setObjects],
     objOn: [objOn, setObjOn], objX: [objX, setObjX], objY: [objY, setObjY],
@@ -2885,14 +3128,14 @@ export default function App() {
     surface3d, waveScale, bandFractions, fresOn, fresBands, reflMag,
     // waves scatter off the buoy's hull: a ring source pinned to the object,
     // with a tight decay so the disturbance stays local
-    emitters: objOn && objRipple > 0
+    emitters: withWakes(objOn && objRipple > 0
       ? [...emitters, { id: "buoy", on: true, type: "point", x: objX, y: objY,
           size: Math.max(0.3, objSize * objRippleScale), amp: objRipple * 1.5, decay: 0.28 }]
-      : emitters,
+      : emitters, wakes),
   }), [effQuality, steep, pitchDeg, wavelength, strength, sharp, spread, bands, perspective,
        halfW, yNear, yFar, eLo, eHi, zoom, panX, panY, smooth, coherence, rectOutput, surface3d, waveScale,
        bandFractions, fresOn, fresBands, reflMag,
-       emitters, animate, speed, tRef.current, manualTime,
+       emitters, wakes, animate, speed, tRef.current, manualTime,
        objOn, objX, objY, objSize, objRipple, objRippleScale]);
 
   const is2d = mode === "paint2d";
@@ -2956,7 +3199,7 @@ export default function App() {
     if (!penMode) return null;
     const fit = computeFit(S);
     const mag = S.reflMag || 1;
-    S._ems = S.emitters.filter((e) => e.on).map((e) => prepEmitter(e, S));
+    prepField(S);
     const deepMix = (c, cosI) => {
       if (!fresOn) return c;
       const b = Math.min(fresBands - 1, Math.floor(fresnelDeepW(cosI) * fresBands));
@@ -3061,7 +3304,7 @@ export default function App() {
   const buoy = useMemo(() => {
     if (!objOn) return null;
     const fit = computeFit(S);
-    S._ems = S.emitters.filter((e) => e.on).map((e) => prepEmitter(e, S));
+    prepField(S);
     return buildBuoy(S, fit, { x: objX, y: objY, size: objSize, sub: objSub });
   }, [objOn, objX, objY, objSize, objSub, S]);
   const buoyShade = useMemo(() => makeBuoyBands(objBands, objLight), [objBands, objLight]);
@@ -3242,7 +3485,7 @@ export default function App() {
   // in frame — no plan, and no path, for water the camera cannot see.
   const exportPaperStack = () => {
     const fit = computeFit(S);
-    S._ems = S.emitters.filter((e) => e.on).map((e) => prepEmitter(e, S));
+    prepField(S);
     const image = buildPaperImage(S, fit, {
       gN: rasterLevel.gN, BW: Math.min(rasterLevel.BW, PAPER_MAX_BW),
       lift: surface3d && perspective,      // the render's own 3D-solid rule
@@ -3802,6 +4045,33 @@ export default function App() {
                     color regions around the buoy and animate with the rest of the surface.
                   </div>
                 </div>
+              )}
+            </div>
+
+            <div style={panel}>
+              <div style={heading}>Boat &amp; board wakes</div>
+              <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 10, lineHeight: 1.5,
+                fontFamily: "ui-monospace, monospace" }}>
+                The water a hull leaves behind it — the V of a Kelvin wake, cut into the color
+                regions like any other wave. No vessel is drawn: place the boat or board over
+                the apex in post. Scale and strength are the wake&#39;s own, read in scene units
+                rather than off the sliders above, so it holds its size and its height when you
+                retune the open water — a new wake only starts at the strength the water has.
+                The pattern stands still in the vessel&#39;s frame, so it does not drift when the
+                waves animate.
+              </div>
+              {wakes.map((wk, i) => (
+                <WakeCard key={wk.id} wk={wk} idx={i} halfW={halfW} yFar={yFar}
+                  onChange={(patch) => updateWake(wk.id, patch)}
+                  onRemove={() => removeWake(wk.id)} />
+              ))}
+              {wakes.length < 4 && (
+                <button onClick={addWake}
+                  style={{ width: "100%", padding: "9px", borderRadius: 8, cursor: "pointer",
+                    background: "#1a232c", color: "#9fb0c0", border: "1px dashed #3a4a57",
+                    fontFamily: "ui-monospace, monospace", fontSize: 12 }}>
+                  + add wake
+                </button>
               )}
             </div>
 
