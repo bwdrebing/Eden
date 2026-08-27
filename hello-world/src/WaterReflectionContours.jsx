@@ -268,11 +268,17 @@ function withWakes(emitters, wakes) {
   return live.length ? [...emitters, ...live] : emitters;
 }
 
-// a fresh wake, sized to the scene it is being dropped into
-function newWake(id, halfW, yFar) {
+// A fresh wake, sized to the scene it is being dropped into. Strength is
+// absolute once set — that is the whole point of it — but a wake dropped onto
+// a calm scene at the strength a rough one wants lands on top of the picture,
+// so the *seed* tracks the open water's own strength. It reproduces both
+// settings that read well by hand: about 0.4 over the saved scene's ripples,
+// and the floor over glass, where a wake is the only thing cutting the bands.
+function newWake(id, halfW, yFar, strength) {
   return { id, on: true, x: 0, y: Math.round(yFar * 0.35),
     dir: 15, scale: Math.max(1.5, Math.round(halfW * 0.14 * 2) / 2),
-    amp: 0.6, len: 8, angle: Math.round(WAKE_ANGLE_DEG * 10) / 10 };
+    amp: Math.max(0.1, Math.min(1.5, Math.round((strength || 0) * 20) / 20)),
+    len: 8, angle: Math.round(WAKE_ANGLE_DEG * 10) / 10 };
 }
 
 // Pre-bake an emitter into per-frame constants so the per-sample loop is cheap.
@@ -2852,7 +2858,8 @@ export default function App() {
     setWakes((ws) => ws.map((w) => (w.id === id ? { ...w, ...patch } : w)));
   const addWake = () =>
     setWakes((ws) => ws.length >= 4 ? ws :
-      [...ws, newWake(ws.reduce((m, w) => Math.max(m, w.id), 0) + 1, halfW, yFar)]);
+      [...ws, newWake(ws.reduce((m, w) => Math.max(m, w.id), 0) + 1,
+        halfW, yFar, strength)]);
   const removeWake = (id) => setWakes((ws) => ws.filter((w) => w.id !== id));
   const [reflMag, setReflMag] = useState(1); // reflection detail (angular zoom)
 
@@ -4047,9 +4054,11 @@ export default function App() {
                 fontFamily: "ui-monospace, monospace" }}>
                 The water a hull leaves behind it — the V of a Kelvin wake, cut into the color
                 regions like any other wave. No vessel is drawn: place the boat or board over
-                the apex in post. Scale sets the whole wake at once and is read in scene units,
-                so it holds its size when you retune the open water. The pattern stands still
-                in the vessel&#39;s frame, so it does not drift when the waves animate.
+                the apex in post. Scale and strength are the wake&#39;s own, read in scene units
+                rather than off the sliders above, so it holds its size and its height when you
+                retune the open water — a new wake only starts at the strength the water has.
+                The pattern stands still in the vessel&#39;s frame, so it does not drift when the
+                waves animate.
               </div>
               {wakes.map((wk, i) => (
                 <WakeCard key={wk.id} wk={wk} idx={i} halfW={halfW} yFar={yFar}

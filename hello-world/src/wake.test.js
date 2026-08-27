@@ -186,12 +186,22 @@ describe("withWakes", () => {
   });
 
   test("a new wake is sized to the scene it lands in", () => {
-    const w = newWake(3, 40, 90);
+    const w = newWake(3, 40, 90, 0.38);
     expect(w).toMatchObject({ id: 3, on: true, x: 0 });
     expect(w.y).toBeGreaterThan(0);
     expect(w.y).toBeLessThan(90);
     expect(w.scale).toBeGreaterThan(1);
     expect(w.angle).toBeCloseTo(WAKE_ANGLE_DEG, 1);
+  });
+
+  test("a new wake starts at the strength the open water has, not above it", () => {
+    // absolute once set, but seeded from the scene: dropped onto glass it has
+    // to be a whisper, and onto a rough sea it has to be visible at all
+    expect(newWake(1, 22, 78, 0.38).amp).toBeCloseTo(0.4, 10);
+    expect(newWake(1, 22, 78, 1).amp).toBeCloseTo(1, 10);
+    expect(newWake(1, 22, 78, 0).amp).toBeCloseTo(0.1, 10);     // glass: the floor
+    expect(newWake(1, 22, 78, 9).amp).toBeCloseTo(1.5, 10);     // and a ceiling
+    expect(newWake(1, 22, 78, undefined).amp).toBeCloseTo(0.1, 10);
   });
 });
 
