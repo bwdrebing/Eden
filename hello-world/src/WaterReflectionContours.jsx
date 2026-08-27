@@ -1004,6 +1004,13 @@ function buildDepthBuffer(S, fit, relief, threeD, BW, BH) {
 // pixel at almost equal depth)
 const CREST_MARGIN = 0.98, CREST_MARGIN_INV = 1 / CREST_MARGIN;
 
+// what two 3-tap box passes make of |k| at its crease (see crestGapField)
+const BLUR_CREASE = 8 / 9;
+// how far a crest gap starts INSIDE its crest, in raster pixels (see
+// crestGapField): counted off the saved scenes, slivers stop showing up at
+// about three quarters of a pixel, and this is the round number above that
+const CREST_OVERLAP = 1;
+
 // smooth a raster-space contour multipolygon into a bezier path in viewBox
 // coordinates (the raster is BW×BH, the viewBox VB_W×VB_H). `off` shifts
 // contour coordinates back from a padded raster (a one-pixel replicated border
@@ -1334,12 +1341,31 @@ function crestGapField(SX, SY, QW, gN, stride, zb, BW, BH, wPx, scratch) {
   const tmp = scratch || new Float64Array(NP);
   blurField(band, BW, BH, tmp, 2);
   blurField(dist, BW, BH, tmp, 2);
+  // …and the outer edge has to be told where the blur put the crease. A box
+  // blur is exact on a ramp, which is why the signed field keeps its crossing
+  // where it was; run over |distance| it lifts the fold instead — the two
+  // 3-tap passes weight the pixels 1,2,3,2,1 either side of the crest, so a
+  // distance that reads 0,1,2,… comes back 8/9 at the crest itself. The lift
+  // is the same the whole way along, so taking it back out re-anchors the
+  // outer edge to the crest, and a gap of a pixel or two still comes out a
+  // band instead of a dashed line.
+  // The band starts a pixel INSIDE the crest, not on it. The crest the fold
+  // test finds and the silhouette the color regions are cut along are two
+  // different sub-pixel estimates of the same curve — one from the mesh, one
+  // from the raster's own coverage and seam fields — and they agree only to a
+  // fraction of a pixel. Ending the band exactly on the first leaves a sliver
+  // of the region below it uncovered wherever the second sits a hair further
+  // out: a hairline of surface color inside the gap, which is the one thing
+  // here that reads as dirt rather than as drawing. Overlapping the near
+  // sheet covers it, and a pixel off a crest is under what the raster
+  // resolves in the first place.
   for (let p = 0; p < NP; p++) {
-    const inner = band[p], outer = wPx - dist[p];
+    const inner = band[p] + CREST_OVERLAP, outer = wPx + BLUR_CREASE - dist[p];
     band[p] = inner < outer ? inner : outer;
   }
   return band;
 }
+
 
 // sample a ground-space function at every surface-grid vertex
 function gridSamples(R, fn) {
@@ -4327,7 +4353,9 @@ export default function App() {
                     Lets the water occlude a little past its own silhouette, opening a strip of
                     background along the far side of every crest. Where a wave crosses water its
                     own color it otherwise blends straight into it — this is what says which one
-                    is in front. Measured on the frame, so an export comes out with the same gap.
+                    is in front. Measured on the frame, so the export draws the same gap, only
+                    traced finer — a coarse preview raster holds it a hair wider, since it
+                    cannot place either edge closer than a pixel.
                   </div>
                   {crestGap > 0 && (
                     <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>

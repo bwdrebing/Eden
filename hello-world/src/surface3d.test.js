@@ -530,6 +530,19 @@ const pathArea = (d) => {
   return Math.abs(total);
 };
 
+// mean width of a thin band: its area over half its outline
+const pathWidth = (d) => {
+  let perim = 0;
+  for (const ring of d.split("Z")) {
+    const pts = pathPoints(ring);
+    for (let i = 0; i < pts.length; i++) {
+      const [x0, y0] = pts[i], [x1, y1] = pts[(i + 1) % pts.length];
+      perim += Math.hypot(x1 - x0, y1 - y0);
+    }
+  }
+  return perim ? (2 * pathArea(d)) / perim : 0;
+};
+
 // the grazing scene the polish tests use: a real camera over real ripples, so
 // the surface folds all over the frame rather than at one contrived crest
 const foldingScene = (waveScale = 8) => ({
@@ -570,13 +583,27 @@ test("the crest gap is a smooth band, and moves no color boundary", () => {
     expect([x > -40, x < 800, y > -40, y < 540]).toEqual([true, true, true, true]);
   }
   expect(pathArea(gapped.gap)).toBeLessThan(0.2 * 760 * 500);
+
+  // It also has to be a band the whole way along rather than a dashed line.
+  // The two steps that decide that are easy to lose: the gap starts a raster
+  // pixel inside the crest, and the outer edge takes back the lift that
+  // blurring a distance field puts in its crease. Without them a gap this
+  // wide comes apart into beads at preview raster, which shows up here as a
+  // mean width (area over half the outline) far under what was asked for.
+  const mean = pathWidth(gapped.gap);
+  expect(mean).toBeGreaterThan(4);
+  expect(mean).toBeLessThan(16);          // …and not a flood, either
 });
 
 test("a wider gap opens more of the background", () => {
   const S = foldingScene();
   const spec = elevationSpec(S);
   const at = (gap) => pathArea(buildSolid3D(S, spec, { gN: 150, BW: 440, gap }).gap);
-  expect(at(6)).toBeGreaterThan(at(2) * 1.5);
+  // monotone, but not proportional: where crests crowd, a band stops at the
+  // halfway line to the next one however much wider it is asked to be
+  const [thin, mid, wide] = [at(2), at(4), at(6)];
+  expect(mid).toBeGreaterThan(thin);
+  expect(wide).toBeGreaterThan(mid);
 });
 
 test("the gap is measured on the frame, so a wider raster draws the same one", () => {
