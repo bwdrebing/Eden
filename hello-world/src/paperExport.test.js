@@ -265,3 +265,30 @@ test("the tiled sheet SVG is one clipped tile per sheet, and nothing else", () =
   // every sheet is listed, in stack order, with its paper color on the label
   for (const sh of stack.sheets) expect(svg).toContain(sh.color);
 });
+
+test("a crest gap is cut through the sheets, the hole the SVG paints", () => {
+  // The stack is meant to be the picture the SVG export draws, so a crest gap
+  // has to arrive here too — as the mount showing through, which is exactly
+  // what the SVG's background-colored band is.
+  const S = withSwell(baseS());
+  const fit = computeFit(S);
+  const scalarAt = (gx, gy) => gx + 3 * Math.sin(gy * 0.4);
+  const opts = { ...RASTER, lift: true, bgColor: "#ffffff", scalarAt,
+    thresholds: [-10, -3, 4, 11], cols: greys(5) };
+  const count = (img, color) => {
+    const id = img.palette.indexOf(color);
+    let n = 0;
+    for (const v of img.grid) if (v === id) n++;
+    return n;
+  };
+  const plain = buildPaperImage(S, fit, opts);
+  const gapped = buildPaperImage(S, fit, { ...opts, gap: 4 });
+
+  expect(count(gapped, "#ffffff")).toBeGreaterThan(count(plain, "#ffffff"));
+  expect(gapped.palette).toEqual(plain.palette);   // holes only: no new sheet
+
+  // …unless the gap is given a color of its own, which is then its own sheet
+  const tinted = buildPaperImage(S, fit, { ...opts, gap: 4, gapColor: "#ff2d78" });
+  expect(tinted.palette).toContain("#ff2d78");
+  expect(count(tinted, "#ff2d78")).toBeGreaterThan(0);
+});

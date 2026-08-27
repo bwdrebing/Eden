@@ -502,3 +502,136 @@ test("polish reaches both builders and keeps the picture intact", () => {
   const verts = (r) => r.layers.reduce((n, l) => n + pathPoints(l.d).length, 0);
   expect(verts(pPolished)).toBeLessThan(verts(pPlain));
 });
+
+/* ------------------------------------------------------------------ *
+ * Crest gaps
+ *
+ * The gap is the surface occluding a little past its own silhouette: a band
+ * of background along the FAR side of every visible crest, so a wave that
+ * crosses water its own color still reads as standing in front of it. It is
+ * an overlay, not a re-cut — the color layers have to come out of the build
+ * exactly as they do without it — and it is measured on the frame, so the
+ * export retrace draws the same gap the preview showed.
+ * ------------------------------------------------------------------ */
+
+// area of a path's rings (bezier control points read as a polygon: an
+// approximation, but a consistent one, which is all a comparison needs)
+const pathArea = (d) => {
+  let total = 0;
+  for (const ring of d.split("Z")) {
+    const pts = pathPoints(ring);
+    let a = 0;
+    for (let i = 0; i < pts.length; i++) {
+      const [x0, y0] = pts[i], [x1, y1] = pts[(i + 1) % pts.length];
+      a += x0 * y1 - x1 * y0;
+    }
+    total += a / 2;
+  }
+  return Math.abs(total);
+};
+
+// mean width of a thin band: its area over half its outline
+const pathWidth = (d) => {
+  let perim = 0;
+  for (const ring of d.split("Z")) {
+    const pts = pathPoints(ring);
+    for (let i = 0; i < pts.length; i++) {
+      const [x0, y0] = pts[i], [x1, y1] = pts[(i + 1) % pts.length];
+      perim += Math.hypot(x1 - x0, y1 - y0);
+    }
+  }
+  return perim ? (2 * pathArea(d)) / perim : 0;
+};
+
+// the grazing scene the polish tests use: a real camera over real ripples, so
+// the surface folds all over the frame rather than at one contrived crest
+const foldingScene = (waveScale = 8) => ({
+  ...grazingS(), eLo: -5, eHi: 33, waveScale, surface3d: true,
+  k: (2 * Math.PI) / 2.8, amp: 0.78 * 0.06, sharp: 0.3, decay: 0.18 - 0.5 * 0.16,
+});
+const elevationSpec = (S) => ({
+  scalarAt: (gx, gy) =>
+    (Math.asin(Math.max(-1, Math.min(1, reflectAt(gx, gy, S)[2]))) * 180) / Math.PI,
+  thresholds: [2, 10, 18],
+  cols: ["#0b0f14", "#28405e", "#4f6294", "#8fa5cd"],
+});
+
+test("no crest gap unless one is asked for, and none where nothing folds", () => {
+  const S = foldingScene();
+  expect(buildSolid3D(S, elevationSpec(S), { gN: 150, BW: 440 }).gap).toBeNull();
+  // flat water folds nowhere, so there is no crest to draw along at any width
+  const flat = foldingScene(0);
+  expect(buildSolid3D(flat, elevationSpec(flat), { gN: 150, BW: 440, gap: 4 }).gap).toBeNull();
+});
+
+test("the crest gap is a smooth band, and moves no color boundary", () => {
+  const S = foldingScene();
+  const spec = elevationSpec(S);
+  const plain = buildSolid3D(S, spec, { gN: 150, BW: 440 });
+  const gapped = buildSolid3D(S, spec, { gN: 150, BW: 440, gap: 4 });
+
+  expect(typeof gapped.gap).toBe("string");
+  expect(gapped.gap).toContain("C");            // traced like any other region
+  expect(gapped.gap).toContain("Z");            // closed, fillable rings
+  // an overlay, not a re-cut: every band is where it was without the gap
+  expect(gapped.layers).toEqual(plain.layers);
+
+  // inside the frame, and a band rather than a flood
+  const pts = pathPoints(gapped.gap);
+  expect(pts.length).toBeGreaterThan(200);
+  for (const [x, y] of pts) {
+    expect([x > -40, x < 800, y > -40, y < 540]).toEqual([true, true, true, true]);
+  }
+  expect(pathArea(gapped.gap)).toBeLessThan(0.2 * 760 * 500);
+
+  // It also has to be a band the whole way along rather than a dashed line.
+  // The two steps that decide that are easy to lose: the gap starts a raster
+  // pixel inside the crest, and the outer edge takes back the lift that
+  // blurring a distance field puts in its crease. Without them a gap this
+  // wide comes apart into beads at preview raster, which shows up here as a
+  // mean width (area over half the outline) far under what was asked for.
+  const mean = pathWidth(gapped.gap);
+  expect(mean).toBeGreaterThan(4);
+  expect(mean).toBeLessThan(16);          // …and not a flood, either
+});
+
+test("a wider gap opens more of the background", () => {
+  const S = foldingScene();
+  const spec = elevationSpec(S);
+  const at = (gap) => pathArea(buildSolid3D(S, spec, { gN: 150, BW: 440, gap }).gap);
+  // monotone, but not proportional: where crests crowd, a band stops at the
+  // halfway line to the next one however much wider it is asked to be
+  const [thin, mid, wide] = [at(2), at(4), at(6)];
+  expect(mid).toBeGreaterThan(thin);
+  expect(wide).toBeGreaterThan(mid);
+});
+
+test("the gap is measured on the frame, so a wider raster draws the same one", () => {
+  const S = foldingScene();
+  const spec = elevationSpec(S);
+  const at = (BW) => pathArea(buildSolid3D(S, spec, { gN: 150, BW, gap: 4 }).gap);
+  const preview = at(440), exported = at(880);
+  expect(exported).toBeGreaterThan(preview * 0.75);
+  expect(exported).toBeLessThan(preview * 1.35);
+});
+
+test("both builders carry a gap through buildSolid3D", () => {
+  const S = foldingScene();
+  const raster = { gN: 150, BW: 440, gap: 4 };
+  expect(typeof buildSolid3D(S, elevationSpec(S), raster).gap).toBe("string");
+
+  const AZ = 45, EW = ENV2D_W, EH = 40;
+  const env2d = envFromRows((f) => paletteColorAt("Black Water", f), EW, EH);
+  buildSegmentation(S, env2d, AZ);
+  const uvAt = (gx, gy) => {
+    const R = reflectAt(gx, gy, S);
+    const phi = (Math.asin(Math.max(-1, Math.min(1, R[2]))) * 180) / Math.PI;
+    let psi = (Math.atan2(R[0], R[1]) * 180) / Math.PI;
+    psi = psi < -AZ ? -AZ : psi > AZ ? AZ : psi;
+    let v = magFrac((phi - S.eLo) / (S.eHi - S.eLo), 1); v = v < 0 ? 0 : v > 1 ? 1 : v;
+    let u = magFrac((psi + AZ) / (2 * AZ), 1); u = u < 0 ? 0 : u > 1 ? 1 : u;
+    return [u * EW, v * EH];
+  };
+  expect(typeof buildSolid3D(S, { uvAt, env2d }, raster).gap).toBe("string");
+  expect(buildSolid3D(S, { uvAt, env2d }, { gN: 150, BW: 440 }).gap).toBeNull();
+});
