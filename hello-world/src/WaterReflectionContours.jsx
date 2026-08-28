@@ -1714,6 +1714,290 @@ function buildPenConcentric(S, fit, colorAt, opts) {
   return [...byColor.entries()].map(([color, subs]) => ({ color, d: subs.join("") }));
 }
 
+// ---- slanted-hatch pen style --------------------------------------
+// The engraver's convention: cut the picture into regions and fill each one
+// with straight parallel strokes at its OWN angle. Nothing draws the boundary
+// between two regions — the change of slant is what the eye reads as an edge,
+// the way a wood engraving or a hatched plotter print does. So the edges cost
+// no ink, and the plot stays one stroke width throughout.
+//
+// Unlike the other two pen styles this one works in SCREEN space, on the same
+// z-buffered surface raster the filled 3D mode is contoured from. Three things
+// fall out of that, and none of them come free the other way round:
+//
+//  * Strokes are evenly spaced across the whole frame. A spacing measured in
+//    ground cells (what the ring style uses) bunches to nothing at the horizon
+//    and sprawls in the near field; hatching wants an even weave, because its
+//    density is what reads as tone.
+//  * Hidden-line removal is already done. A raster pixel only ever holds the
+//    front-most sheet, so a region simply stops where a nearer crest starts —
+//    there is no separate occlusion pass and no `hidden` option.
+//  * A region is a connected patch of the PICTURE, not of the ground plane.
+//    That is what an engraver's region is: the far side of a crest and the
+//    near sheet in front of it are two regions even when they carry one color.
+//
+// The strokes themselves stay straight in the picture plane — they are not
+// bent onto the wave. The form is carried by the region shapes and by the
+// slant changing across them, which is the whole point of the technique; a
+// hatch that also followed the surface would be doing the ring style's job.
+const HATCH_MIN_AREA = 5;      // px: below this a patch is speckle, not a region
+const HATCH_STEP = 0.55;       // px along a stroke, walking a region's mask
+const HATCH_MAX_LINES = 4000;  // per region, a guard against a tiny spacing
+
+// principal direction of a 2×2 symmetric tensor, in degrees, and how strongly
+// it is one direction rather than none: (λ₁−λ₂)/(λ₁+λ₂), which is 0 for a
+// round blob and 1 for a line. An isotropic region has no axis worth using,
+// and this is what fades its angle back to the base one instead of letting
+// numerical noise pick a slant for it.
+function tensorAxis(Jxx, Jxy, Jyy) {
+  const tr = Jxx + Jyy;
+  return {
+    deg: (0.5 * Math.atan2(2 * Jxy, Jxx - Jyy) * 180) / Math.PI,
+    coh: tr > 1e-12 ? Math.hypot(Jxx - Jyy, 2 * Jxy) / tr : 0,
+  };
+}
+
+// fold an angle difference into (−90, 90]: hatch strokes have no head or tail,
+// so a slant and that slant plus 180° are the same stroke
+function foldAngle(a) { return (((a + 90) % 180) + 180) % 180 - 90; }
+
+// stable per-region jitter for the "scattered" aim. Keyed on the region's
+// rounded centroid rather than on its index in the scan, so nudging an
+// unrelated slider doesn't re-deal every angle in the frame.
+function hatchHash(x, y, id) {
+  let h = (Math.round(x / 4) * 73856093) ^ (Math.round(y / 4) * 19349663) ^ (id * 83492791);
+  h = Math.imul(h ^ (h >>> 15), 2246822519);
+  h = Math.imul(h ^ (h >>> 13), 3266489917);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+
+function relLum(c) {
+  const s = d3.rgb(c);
+  return (0.2126 * s.r + 0.7152 * s.g + 0.0722 * s.b) / 255;
+}
+
+// Where each region's deviation from the base angle comes from. Ordered as the
+// UI shows them: the two that read the picture first, the one that doesn't last.
+const HATCH_AIMS = [
+  ["wave", "Wave", "strokes run across the local slope, so the weave bends with the swell"],
+  ["shape", "Shape", "strokes run along each region's own long axis, so a sliver is hatched lengthwise"],
+  ["scatter", "Scatter", "each region takes an arbitrary slant — the plainest woodcut reading of an edge"],
+];
+
+function buildPenHatch(S, fit, colorAt, opts) {
+  const { spacing, relief, threeD, angleDeg, spreadDeg, aim, tone, paper, BW, gN } = opts;
+  // the raster carries the front-most surface point's grid coordinate, so the
+  // color, the height and the occlusion all come off one pass
+  const R = rasterizeSurface(threeD ? { ...S, waveScale: relief } : S, fit, gN, BW, threeD);
+  const { BH, NP, GI, GJ, cov } = R;
+  const groundAt = (p) => cell2ground((GI[p] / gN) * S.nx, (GJ[p] / gN) * S.ny, S);
+
+  // ---- what color each pixel of the visible surface is
+  const cmap = new Map(), palette = [];
+  const idxField = new Int32Array(NP).fill(-1);
+  for (let p = 0; p < NP; p++) {
+    if (!cov[p]) continue;
+    const [gx, gy] = groundAt(p);
+    const c = colorAt(gx, gy);
+    let id = cmap.get(c);
+    if (id === undefined) { id = palette.length; cmap.set(c, id); palette.push(c); }
+    idxField[p] = id;
+  }
+
+  // ---- screen-space gradient of the wave height, for the "wave" aim.
+  // Sampled off the mesh through the raster's own grid coordinates, so it is
+  // the height of the point actually visible at that pixel — across a crest
+  // silhouette the two sheets keep their own slopes instead of averaging.
+  let HGX = null, HGY = null;
+  if (aim === "wave") {
+    const stride = gN + 1;
+    const HG = new Float64Array(stride * stride);
+    for (let j = 0; j <= gN; j++) for (let i = 0; i <= gN; i++) {
+      const [gx, gy] = cell2ground((i / gN) * S.nx, (j / gN) * S.ny, S);
+      HG[j * stride + i] = heightAt(gx, gy, S);
+    }
+    const HR = new Float64Array(NP);
+    for (let p = 0; p < NP; p++) {
+      if (!cov[p]) continue;
+      const fi = Math.max(0, Math.min(gN - 1e-6, GI[p])), fj = Math.max(0, Math.min(gN - 1e-6, GJ[p]));
+      const i0 = Math.floor(fi), j0 = Math.floor(fj), tx = fi - i0, ty = fj - j0, q = j0 * stride + i0;
+      HR[p] = (HG[q] * (1 - tx) + HG[q + 1] * tx) * (1 - ty)
+            + (HG[q + stride] * (1 - tx) + HG[q + stride + 1] * tx) * ty;
+    }
+    HGX = new Float64Array(NP); HGY = new Float64Array(NP);
+    for (let y = 0; y < BH; y++) for (let x = 0; x < BW; x++) {
+      const p = y * BW + x;
+      if (!cov[p]) continue;
+      // one-sided at the water's edge: an uncovered neighbour holds no height
+      const xm = x > 0 && cov[p - 1] ? p - 1 : p, xp = x < BW - 1 && cov[p + 1] ? p + 1 : p;
+      const ym = y > 0 && cov[p - BW] ? p - BW : p, yp = y < BH - 1 && cov[p + BW] ? p + BW : p;
+      const hx = xp - xm, hy = (yp - ym) / BW;      // 0, 1 or 2 pixels apart
+      HGX[p] = hx ? (HR[xp] - HR[xm]) / hx : 0;
+      HGY[p] = hy ? (HR[yp] - HR[ym]) / hy : 0;
+    }
+  }
+
+  // ---- connected regions of one color, with the moments each aim needs
+  const label = new Int32Array(NP).fill(-1);
+  const stack = new Int32Array(NP);
+  const comps = [];
+  for (let seed = 0; seed < NP; seed++) {
+    if (idxField[seed] < 0 || label[seed] >= 0) continue;
+    const id = idxField[seed], ci = comps.length;
+    let sp = 0; stack[sp++] = seed; label[seed] = ci;
+    let area = 0, sx = 0, sy = 0, sxx = 0, sxy = 0, syy = 0;
+    let jxx = 0, jxy = 0, jyy = 0;
+    let x0 = BW, x1 = -1, y0 = BH, y1 = -1;
+    while (sp) {
+      const p = stack[--sp], x = p % BW, y = (p - x) / BW;
+      area++; sx += x; sy += y; sxx += x * x; sxy += x * y; syy += y * y;
+      if (x < x0) x0 = x; if (x > x1) x1 = x;
+      if (y < y0) y0 = y; if (y > y1) y1 = y;
+      if (HGX) { const a = HGX[p], b = HGY[p]; jxx += a * a; jxy += a * b; jyy += b * b; }
+      if (x > 0 && idxField[p - 1] === id && label[p - 1] < 0) { label[p - 1] = ci; stack[sp++] = p - 1; }
+      if (x < BW - 1 && idxField[p + 1] === id && label[p + 1] < 0) { label[p + 1] = ci; stack[sp++] = p + 1; }
+      if (y > 0 && idxField[p - BW] === id && label[p - BW] < 0) { label[p - BW] = ci; stack[sp++] = p - BW; }
+      if (y < BH - 1 && idxField[p + BW] === id && label[p + BW] < 0) { label[p + BW] = ci; stack[sp++] = p + BW; }
+    }
+    const cx = sx / area, cy = sy / area;
+    comps.push({
+      id, area, cx, cy, x0, x1, y0, y1,
+      cov: [sxx / area - cx * cx, sxy / area - cx * cy, syy / area - cy * cy],
+      grad: HGX ? [jxx, jxy, jyy] : null,
+    });
+  }
+
+  // ---- each region's slant.
+  // The aim only ever supplies a deviation from the base angle, scaled by the
+  // spread: at spread 0 the whole frame is one flat hatch, at 90° each region
+  // sits on the angle its own aim asked for. That keeps the base angle the
+  // thing that sets the picture's grain, and the spread the thing that decides
+  // how much the regions are allowed to argue with it.
+  const angleOf = (c) => {
+    let u;
+    if (aim === "scatter") u = 2 * hatchHash(c.cx, c.cy, c.id) - 1;
+    else {
+      const t = aim === "wave" ? tensorAxis(c.grad[0], c.grad[1], c.grad[2])
+                               : tensorAxis(c.cov[0], c.cov[1], c.cov[2]);
+      // "wave": the tensor's axis is the steepest-slope direction, and hatching
+      // across the slope reads as form, so the strokes run 90° off it.
+      // "shape": it is the region's own long axis, and strokes run along it.
+      const want = aim === "wave" ? t.deg + 90 : t.deg;
+      u = (foldAngle(want - angleDeg) / 90) * t.coh;
+    }
+    return ((angleDeg + spreadDeg * u) * Math.PI) / 180;
+  };
+
+  // ---- tone: how far a region's color is from the paper decides its density.
+  // On white stock a near-white region wants almost no ink and a dark one wants
+  // a tight weave; that difference is most of what makes a hatched print read
+  // as a picture rather than as a texture. At tone 0 every region is woven the
+  // same and only the slant carries the drawing.
+  const paperLum = relLum(paper);
+  const spaceCache = new Map();
+  const spacingFor = (id) => {
+    let s = spaceCache.get(id);
+    if (s === undefined) {
+      const contrast = Math.min(1, Math.abs(relLum(palette[id]) - paperLum) / 0.75);
+      s = spacing * (1 + tone * 2.2 * (1 - contrast));
+      spaceCache.set(id, s);
+    }
+    return s;
+  };
+
+  const kx = VB_W / BW, ky = VB_H / BH;
+  const byColor = new Map();
+  const add = (color, sub) => { const a = byColor.get(color) || []; a.push(sub); byColor.set(color, a); };
+  // Two decimals, as elsewhere in the export: a stroke is often only a couple
+  // of viewBox units long, and a tenth of a unit at each end tilts one of those
+  // by degrees. On a style whose entire signal is a consistent slant per
+  // region, that is the last thing to round away.
+  const pt = (x, y) => (x * kx).toFixed(2) + " " + (y * ky).toFixed(2) + " ";
+
+  for (let ci = 0; ci < comps.length; ci++) {
+    const c = comps[ci];
+    if (c.area < HATCH_MIN_AREA) continue;
+    // A region's own mask is a staircase of whole pixels, and a stroke that
+    // stopped on it would end on a pixel edge — a ragged rim along every
+    // boundary, at exactly the raster's pitch. Blur the mask into a ramp and
+    // take the half crossing instead: the ends land sub-pixel on the curve the
+    // boundary actually is, which is the same trick the filled path's
+    // silhouette uses.
+    const PAD = 2;
+    const w = c.x1 - c.x0 + 1 + 2 * PAD, h = c.y1 - c.y0 + 1 + 2 * PAD;
+    const ox = c.x0 - PAD, oy = c.y0 - PAD;
+    const ind = new Float64Array(w * h);
+    for (let y = c.y0; y <= c.y1; y++) for (let x = c.x0; x <= c.x1; x++)
+      if (label[y * BW + x] === ci) ind[(y - oy) * w + (x - ox)] = 1;
+    blurField(ind, w, h, new Float64Array(w * h), 1);
+    const sample = (u, v) => {
+      if (u < 0 || v < 0 || u > w - 1 || v > h - 1) return 0;
+      const i0 = Math.floor(u), j0 = Math.floor(v);
+      const i1 = Math.min(w - 1, i0 + 1), j1 = Math.min(h - 1, j0 + 1);
+      const tx = u - i0, ty = v - j0;
+      return (ind[j0 * w + i0] * (1 - tx) + ind[j0 * w + i1] * tx) * (1 - ty)
+           + (ind[j1 * w + i0] * (1 - tx) + ind[j1 * w + i1] * tx) * ty;
+    };
+
+    const th = angleOf(c), dx = Math.cos(th), dy = Math.sin(th), nx = -dy, ny = dx;
+    let sMin = Infinity, sMax = -Infinity, tMin = Infinity, tMax = -Infinity;
+    for (const [x, y] of [[ox, oy], [ox + w, oy], [ox, oy + h], [ox + w, oy + h]]) {
+      const s = x * dx + y * dy, t = x * nx + y * ny;
+      if (s < sMin) sMin = s; if (s > sMax) sMax = s;
+      if (t < tMin) tMin = t; if (t > tMax) tMax = t;
+    }
+    // Phase the stroke set off the region's centroid, not off the frame: a
+    // region thinner than the spacing then always has one stroke through its
+    // middle instead of falling between two and vanishing. The far field is
+    // full of such slivers.
+    const step = spacingFor(c.id);
+    const tc = c.cx * nx + c.cy * ny;
+    const k0 = Math.ceil((tMin - tc) / step), k1 = Math.floor((tMax - tc) / step);
+    // Where the water runs off the edge of the raster its mask ends on the
+    // frame, and the blurred ramp puts a boundary there like any other — half a
+    // pixel OUTSIDE it, which is what makes the weave reach the edge rather than
+    // stop a hair short of it. The stroke itself still has to stay on the page,
+    // so every span is clipped to the frame: a plotter would otherwise be asked
+    // to draw off the sheet.
+    const slab = (hi, b, d) => {
+      if (Math.abs(d) < 1e-9) return b >= 0 && b <= hi ? [-Infinity, Infinity] : null;
+      const a = -b / d, z = (hi - b) / d;
+      return a < z ? [a, z] : [z, a];
+    };
+    const parts = [];
+    const emit = (bx, by, lo0, hi0, clipLo, clipHi) => {
+      const lo = Math.max(lo0, clipLo), hi = Math.min(hi0, clipHi);
+      if (hi - lo > 0.4)
+        parts.push("M" + pt(bx + lo * dx, by + lo * dy) + "L" + pt(bx + hi * dx, by + hi * dy));
+    };
+    for (let k = k0; k <= k1 && k - k0 < HATCH_MAX_LINES; k++) {
+      const t = tc + k * step;
+      const bx = t * nx, by = t * ny;
+      const spanX = slab(BW - 1, bx, dx), spanY = slab(BH - 1, by, dy);
+      if (!spanX || !spanY) continue;
+      const clipLo = Math.max(spanX[0], spanY[0]), clipHi = Math.min(spanX[1], spanY[1]);
+      if (clipHi <= clipLo) continue;
+      let prevV = 0, prevS = sMin - HATCH_STEP, inRun = false, aS = 0;
+      for (let s = sMin - HATCH_STEP; s <= sMax + HATCH_STEP; s += HATCH_STEP) {
+        const v = sample(bx + s * dx - ox, by + s * dy - oy);
+        if (!inRun && v >= 0.5) {
+          const f = (0.5 - prevV) / ((v - prevV) || 1);
+          aS = prevS + (s - prevS) * Math.max(0, Math.min(1, f));
+          inRun = true;
+        } else if (inRun && v < 0.5) {
+          const f = (prevV - 0.5) / ((prevV - v) || 1);
+          emit(bx, by, aS, prevS + (s - prevS) * Math.max(0, Math.min(1, f)), clipLo, clipHi);
+          inRun = false;
+        }
+        prevV = v; prevS = s;
+      }
+      if (inRun) emit(bx, by, aS, prevS, clipLo, clipHi);
+    }
+    if (parts.length) add(palette[c.id], parts.join(""));
+  }
+  return [...byColor.entries()].map(([color, subs]) => ({ color, d: subs.join("") }));
+}
+
 // Resolution of the 3D surface pass, as named steps. `BW` is the width of the
 // screen-space raster the regions are contoured on, `gN` the tessellation of
 // the wave surface fed into it — the two limits on how fine a 3D edge can be,
@@ -2336,6 +2620,7 @@ export {
   computeFit, cell2ground, heightAt, clampLift, penProject, reflectAt, magFrac,
   withWakes, newWake, WAKE_ANGLE_DEG, prepField, slopeAt,
   buildSurface3D, buildSurface3DPanorama, buildSolid3D, crestField,
+  buildPenLines, buildPenConcentric, buildPenHatch, HATCH_AIMS,
   RASTER_LEVELS, RASTER_DEFAULT, EXPORT_MULTS, EXPORT_DEFAULT, EXPORT_MAX_BW,
   EXPORT_MESHES, EXPORT_MESH_DEFAULT, EXPORT_MESH_FLOOR, exportRaster,
   EXPORT_POLISH, EXPORT_POLISH_DEFAULT, smoothField,
@@ -3171,6 +3456,11 @@ export default function App() {
   const [penStyle, setPenStyle] = useState("lines"); // "lines" | "rings"
   const [penSpacing, setPenSpacing] = useState(7);   // ring spacing (cells)
   const [penEven, setPenEven] = useState(false);     // even spacing on screen
+  const [penHatchGap, setPenHatchGap] = useState(5); // hatch spacing (viewBox units)
+  const [penHatchAngle, setPenHatchAngle] = useState(20);  // base slant, degrees
+  const [penHatchSpread, setPenHatchSpread] = useState(60); // per-region deviation
+  const [penHatchAim, setPenHatchAim] = useState("shape"); // what sets the deviation
+  const [penHatchTone, setPenHatchTone] = useState(0);      // density from color/paper contrast
   const [bgColor, setBgColor] = useState("");       // "" = auto
 
   const [zoom, setZoom] = useState(5);
@@ -3243,6 +3533,9 @@ export default function App() {
     penRelief: [penRelief, setPenRelief], penWidth: [penWidth, setPenWidth],
     penHidden: [penHidden, setPenHidden], penStyle: [penStyle, setPenStyle],
     penSpacing: [penSpacing, setPenSpacing], penEven: [penEven, setPenEven],
+    penHatchGap: [penHatchGap, setPenHatchGap], penHatchAngle: [penHatchAngle, setPenHatchAngle],
+    penHatchSpread: [penHatchSpread, setPenHatchSpread], penHatchAim: [penHatchAim, setPenHatchAim],
+    penHatchTone: [penHatchTone, setPenHatchTone],
     bgColor: [bgColor, setBgColor], zoom: [zoom, setZoom], panX: [panX, setPanX],
     panY: [panY, setPanY], smooth: [smooth, setSmooth], mode: [mode, setMode],
     envColors: [envColors, setEnvColors],
@@ -3513,6 +3806,18 @@ export default function App() {
       };
     }
     const threeD = S.perspective && penRelief > 0;
+    if (penStyle === "hatch") {
+      // Hatching is cut from the screen raster, so it wants the same two
+      // resolution knobs the filled 3D mode has: the raster decides how finely
+      // a region boundary — and so a stroke end — is placed, the mesh how much
+      // surface there is to cut up.
+      return buildPenHatch(S, fit, colorAt, {
+        spacing: penHatchGap, relief: penRelief, threeD,
+        angleDeg: penHatchAngle, spreadDeg: penHatchSpread, aim: penHatchAim,
+        tone: penHatchTone, paper: bgFill,
+        BW: rasterLevel.BW, gN: rasterLevel.gN,
+      });
+    }
     if (penStyle === "rings") {
       return buildPenConcentric(S, fit, colorAt, {
         spacing: penSpacing, relief: penRelief, threeD, hidden: penHidden,
@@ -3523,6 +3828,7 @@ export default function App() {
       threeD, hidden: penHidden, evenScreen: penEven,
     });
   }, [penMode, penStyle, penCount, penSpacing, penRelief, penHidden, penEven, S, use2d, mode,
+      penHatchGap, penHatchAngle, penHatchSpread, penHatchAim, penHatchTone, bgFill, rasterLevel,
       envEffective, azSpan, colors1d, presetColors, fresOn, fresBands, mixDeep]);
 
   // The fields any surface-raster pass contours: one continuous scalar for
@@ -3953,7 +4259,7 @@ export default function App() {
             </svg>
             <div style={{ position: "absolute", left: 12, bottom: 10, fontSize: 10.5,
               color: "#6d808f", fontFamily: "ui-monospace, monospace", letterSpacing: 0.5 }}>
-              {penMode ? `${penStyle === "rings" ? "rings" : penCount + " lines"} · ${penLines.length} pens${S.perspective && penRelief > 0 ? " · 3D" : ""}${penHidden ? " · hidden-line" : ""}`
+              {penMode ? `${penStyle === "rings" ? "rings" : penStyle === "hatch" ? `hatch ${penHatchAngle}\u00b0\u00b1${penHatchSpread}\u00b0` : penCount + " lines"} · ${penLines.length} pens${S.perspective && penRelief > 0 ? " · 3D" : ""}${penHidden || penStyle === "hatch" ? " · hidden-line" : ""}`
                 : solid3d ? `${drawLayers.length + 1} regions · ${S.nx}×${S.ny} sample grid · 3D ${rasterLevel.name} ${rasterLevel.BW}px`
                 : `${regionCount} regions · ${S.nx}×${S.ny} sample grid${surface3d && perspective ? " · 3D" : ""}`}
             </div>
@@ -4518,8 +4824,12 @@ export default function App() {
                       + " max are meant for a still you export, not for panning around — and for"
                       + " an export you can leave this where you like to work and let export"
                       + " detail (next to the button) do the fine trace instead."
-                    : "The 3D wave surface is off, so this only sets the resolution of the"
-                      + " layered-paper export, which is cut from the same kind of raster."}
+                    : penMode && penStyle === "hatch"
+                      ? "The hatched pen style is cut from the same kind of raster: it sets how"
+                        + " finely a region boundary is placed, and so where a stroke stops."
+                        + " The other pen styles don't use it."
+                      : "The 3D wave surface is off, so this only sets the resolution of the"
+                        + " layered-paper export, which is cut from the same kind of raster."}
                   {` The paper stack caps it at ${PAPER_MAX_BW}px — past that the`
                     + " cut lines get finer than paper and scissors care about."}
                   {lowPower && rasterQ > 0 && " Low power mode is holding this at draft."}
@@ -4559,7 +4869,7 @@ export default function App() {
               {penMode && (
                 <div style={{ marginTop: 10 }}>
                   <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
-                    {[["lines", "Parallel"], ["rings", "Concentric"]].map(([v, lbl]) => (
+                    {[["lines", "Parallel"], ["rings", "Concentric"], ["hatch", "Hatched"]].map(([v, lbl]) => (
                       <button key={v} onClick={() => setPenStyle(v)}
                         style={{ flex: 1, padding: "7px 4px", fontSize: 11.5, borderRadius: 6, cursor: "pointer",
                           fontFamily: "ui-monospace, monospace",
@@ -4568,24 +4878,62 @@ export default function App() {
                           border: "1px solid " + (penStyle === v ? "#3f7e8f" : "#26313c") }}>{lbl}</button>
                     ))}
                   </div>
-                  {penStyle === "rings"
-                    ? <Slider label="ring spacing" value={penSpacing} min={0.5} max={20} step={0.5}
-                        onChange={setPenSpacing} fmt={(v) => v.toFixed(1)} />
-                    : <Slider label="lines" value={penCount} min={8} max={140} step={2} onChange={setPenCount} />}
+                  {penStyle === "rings" &&
+                    <Slider label="ring spacing" value={penSpacing} min={0.5} max={20} step={0.5}
+                      onChange={setPenSpacing} fmt={(v) => v.toFixed(1)} />}
+                  {penStyle === "lines" &&
+                    <Slider label="lines" value={penCount} min={8} max={140} step={2} onChange={setPenCount} />}
                   {penStyle === "lines" && perspective &&
                     <Toggle label="Even spacing on screen" value={penEven} onChange={setPenEven} />}
+                  {penStyle === "hatch" && (
+                    <>
+                      <Slider label="stroke spacing" value={penHatchGap} min={1.5} max={20} step={0.5}
+                        onChange={setPenHatchGap} fmt={(v) => v.toFixed(1)} />
+                      <Slider label="base slant" value={penHatchAngle} min={-90} max={90} step={5}
+                        onChange={setPenHatchAngle} fmt={(v) => v + "\u00b0"} />
+                      <Slider label="slant spread" value={penHatchSpread} min={0} max={90} step={5}
+                        onChange={setPenHatchSpread}
+                        fmt={(v) => (v === 0 ? "one angle" : v + "\u00b0")} />
+                      <div style={{ display: "flex", gap: 6, margin: "6px 0 8px" }}>
+                        {HATCH_AIMS.map(([v, lbl]) => (
+                          <button key={v} onClick={() => setPenHatchAim(v)}
+                            disabled={penHatchSpread === 0}
+                            style={{ flex: 1, padding: "6px 4px", fontSize: 11, borderRadius: 6,
+                              cursor: penHatchSpread === 0 ? "not-allowed" : "pointer",
+                              opacity: penHatchSpread === 0 ? 0.45 : 1,
+                              fontFamily: "ui-monospace, monospace",
+                              background: penHatchAim === v ? "#27424b" : "#1a232c",
+                              color: penHatchAim === v ? "#dff1f6" : "#9fb0c0",
+                              border: "1px solid " + (penHatchAim === v ? "#3f7e8f" : "#26313c") }}>{lbl}</button>
+                        ))}
+                      </div>
+                      <Slider label="tone from color" value={penHatchTone} min={0} max={1} step={0.05}
+                        onChange={setPenHatchTone}
+                        fmt={(v) => (v === 0 ? "even weave" : v.toFixed(2))} />
+                    </>
+                  )}
                   <Slider label="line width" value={penWidth} min={0.4} max={4} step={0.1}
                     onChange={setPenWidth} fmt={(v) => v.toFixed(1)} />
                   <Slider label="3D relief" value={penRelief} min={0} max={120} step={2}
                     onChange={setPenRelief}
                     fmt={(v) => (v === 0 || !perspective ? "flat" : String(v))} />
-                  <Toggle label="Hide obscured lines" value={penHidden} onChange={setPenHidden} />
+                  {penStyle !== "hatch" &&
+                    <Toggle label="Hide obscured lines" value={penHidden} onChange={setPenHidden} />}
                   <div style={{ fontSize: 10, color: "#6d808f", marginTop: 2, lineHeight: 1.5,
                     fontFamily: "ui-monospace, monospace" }}>
                     {penStyle === "rings"
                       ? "Each color region filled with nested rings that follow its shape — like woodgrain."
-                      : "Equally-spaced scan lines across the surface."}
-                    {perspective ? " Lifted to the wave height (3D); nearer crests hide what's behind." : " Turn on Perspective for 3D."}
+                      : penStyle === "hatch"
+                        ? "Every color region filled with straight parallel strokes at its own slant, engraving-style — "
+                          + "the change of angle draws the edge, so no outline is plotted. "
+                          + (penHatchSpread === 0 ? "Spread 0 lays one angle over the whole frame."
+                             : HATCH_AIMS.find(([v]) => v === penHatchAim)[2] + ".")
+                        : "Equally-spaced scan lines across the surface."}
+                    {penStyle === "hatch"
+                      ? (perspective
+                          ? " Cut from the depth-sorted surface, so nearer crests hide what's behind without an extra pass."
+                          : " Turn on Perspective for 3D.")
+                      : (perspective ? " Lifted to the wave height (3D); nearer crests hide what's behind." : " Turn on Perspective for 3D.")}
                   </div>
                 </div>
               )}
