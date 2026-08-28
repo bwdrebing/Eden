@@ -78,6 +78,15 @@ scaled inside a fixed-size `<div>` gives a zoomed crop to screenshot.
   the frame and occlusion for free. So `BW`/`gN` bound how fine a hatch edge can
   be, exactly as they do for the filled path — the pen panel's own sliders do
   not.
+- **The video export renders frames, it does not record them.** `frameAt(t)` in
+  the studio component rebuilds every phase-dependent piece of the picture —
+  segmentation, field spec, `buildSolid3D`, pen lines, buoy — at an arbitrary
+  wave phase, and `buildSvg(over, frame)` draws that instead of the memoized
+  preview frame. Anything new that moves with `S.t` has to be added to *both*
+  the memo and `frameAt`, or the video will quietly freeze that part of the
+  scene. Frames are built on the preview's own raster and mesh (no polish, no
+  export retrace), for the same reason the PNG is: fidelity to what was on
+  screen. `videoExport.js` drives WebCodecs, `mp4.js` is the container.
 - The 1D/preset path and the 2D panorama path are separate builders
   (`buildSurface3D`, `buildSurface3DPanorama`) that must stay in step. A new
   option on one usually belongs on the other; `buildSolid3D` is where both are

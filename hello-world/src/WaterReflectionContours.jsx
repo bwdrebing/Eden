@@ -1,8 +1,13 @@
-import React, { useState, useMemo, useRef, useEffect } from "react";
+import React, { useState, useMemo, useRef, useEffect, useCallback } from "react";
 import * as d3 from "d3";
 import { labelRegions, buildAdjacency, denoiseGrid, planCollapse } from "./paperStack";
 import { useUrlSync } from "./urlSettings";
 import { extractPhotoStrip } from "./photoPalette";
+import {
+  VIDEO_FPS, VIDEO_MIN_SEC, VIDEO_MAX_SEC, VIDEO_DEFAULT_SEC,
+  VIDEO_SCALES, VIDEO_DEFAULT_SCALE, videoSize, framePlan,
+  videoSupported, encodeMp4, formatDuration, etaSeconds,
+} from "./videoExport";
 
 /* ------------------------------------------------------------------ *
  *  Water-reflection contour studio
@@ -2119,35 +2124,52 @@ function sizedSvg(svg, w, h) {
   return svg.replace(/^<svg /, `<svg width="${w}" height="${h}" `);
 }
 
-// SVG string -> PNG blob at w x h.
+// SVG string -> a canvas holding it at w x h.
 //
 // The picture goes through an <img> rather than being redrawn onto the canvas
 // by hand, so the browser's own SVG rasterizer resolves it — the same one that
 // composites the preview, with the same antialiasing, fill rules and clips. The
-// PNG is therefore the preview with more pixels, not a second renderer's
+// raster is therefore the preview with more pixels, not a second renderer's
 // opinion of it. The markup references nothing external, so the data URL counts
 // as same-origin and the canvas stays untainted (toBlob throws otherwise).
-function svgToPngBlob(svg, w, h) {
+//
+// `into` reuses a canvas across calls, which is what the video export wants:
+// one allocation for a couple of hundred frames rather than one apiece.
+function svgToCanvas(svg, w, h, into) {
   return new Promise((resolve, reject) => {
-    let canvas = null, ctx = null;
+    let canvas = into || null, ctx = null;
     try {
-      canvas = document.createElement("canvas");
-      canvas.width = w; canvas.height = h;
+      if (!canvas) canvas = document.createElement("canvas");
+      if (canvas.width !== w) canvas.width = w;
+      if (canvas.height !== h) canvas.height = h;
       ctx = canvas.getContext("2d");
     } catch (e) { ctx = null; }
     // no 2D context (jsdom, a locked-down sandbox) means no rasterizer at all —
     // fail here rather than waiting on an onload that is never coming
-    if (!ctx || !canvas.toBlob) { reject(new Error("no canvas")); return; }
+    if (!ctx) { reject(new Error("no canvas")); return; }
     const img = new Image();
     img.onload = () => {
       try {
+        // a reused canvas still holds the frame before this one; anything the
+        // new picture does not cover should read as empty, not as a ghost
+        ctx.clearRect(0, 0, w, h);
         ctx.drawImage(img, 0, 0, w, h);
-        canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("png encode failed"))), "image/png");
+        resolve(canvas);
       } catch (e) { reject(e); }
     };
     img.onerror = () => reject(new Error("svg decode failed"));
     img.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(sizedSvg(svg, w, h));
   });
+}
+
+// SVG string -> PNG blob at w x h.
+function svgToPngBlob(svg, w, h) {
+  return svgToCanvas(svg, w, h).then((canvas) => new Promise((resolve, reject) => {
+    if (!canvas.toBlob) { reject(new Error("no canvas")); return; }
+    try {
+      canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("png encode failed"))), "image/png");
+    } catch (e) { reject(e); }
+  }));
 }
 
 // ---- color environment --------------------------------------------
@@ -2624,7 +2646,7 @@ export {
   RASTER_LEVELS, RASTER_DEFAULT, EXPORT_MULTS, EXPORT_DEFAULT, EXPORT_MAX_BW,
   EXPORT_MESHES, EXPORT_MESH_DEFAULT, EXPORT_MESH_FLOOR, exportRaster,
   EXPORT_POLISH, EXPORT_POLISH_DEFAULT, smoothField,
-  PNG_SCALES, PNG_DEFAULT, PNG_MAX_PIXELS, pngSize, sizedSvg, svgToPngBlob,
+  PNG_SCALES, PNG_DEFAULT, PNG_MAX_PIXELS, pngSize, sizedSvg, svgToPngBlob, svgToCanvas,
 };
 
 // ---- layered-paper stack export -----------------------------------
@@ -3396,6 +3418,10 @@ export default function App() {
   const [exporting, setExporting] = useState(false);       // the big retrace is synchronous
   const [pngQ, setPngQ] = useState(PNG_DEFAULT);           // PNG size, x the SVG frame
   const [pngBusy, setPngBusy] = useState(false);           // retrace + rasterize, same pause
+  const [vidSec, setVidSec] = useState(VIDEO_DEFAULT_SEC); // video length, seconds
+  const [vidQ, setVidQ] = useState(VIDEO_DEFAULT_SCALE);   // video frame size, x the SVG frame
+  const [vidBusy, setVidBusy] = useState(false);           // one frame at a time, for minutes
+  const [vidProg, setVidProg] = useState(null);            // { done, total, startedAt }
   const [quality, setQuality] = useState(() =>
     (typeof window !== "undefined" && window.innerWidth < 820) ? 100 : 140);
   const [advanced, setAdvanced] = useState(false);
@@ -3500,6 +3526,14 @@ export default function App() {
   const [pngErr, setPngErr] = useState(null);
   const pngUrlRef = useRef(null);
   useEffect(() => () => { if (pngUrlRef.current) URL.revokeObjectURL(pngUrlRef.current); }, []);
+  // the finished MP4, same arrangement — plus the one canvas every frame is
+  // drawn into, and the flag the render loop polls to stop early
+  const [vidOut, setVidOut] = useState(null);   // { url, w, h, bytes, name, seconds, frames }
+  const [vidErr, setVidErr] = useState(null);
+  const vidUrlRef = useRef(null);
+  const vidCancelRef = useRef(false);
+  const vidCanvasRef = useRef(null);
+  useEffect(() => () => { if (vidUrlRef.current) URL.revokeObjectURL(vidUrlRef.current); }, []);
 
   // Serialize every studio setting into the URL hash (the painted 1D/2D
   // environment buffers are excluded — they are freehand pixel data, not
@@ -3520,6 +3554,7 @@ export default function App() {
     rasterQ: [rasterQ, setRasterQ], exportQ: [exportQ, setExportQ],
     exportMeshQ: [exportMeshQ, setExportMeshQ],
     exportPolishQ: [exportPolishQ, setExportPolishQ], pngQ: [pngQ, setPngQ],
+    vidSec: [vidSec, setVidSec], vidQ: [vidQ, setVidQ],
     advanced: [advanced, setAdvanced], emitters: [emitters, setEmitters],
     wakes: [wakes, setWakes],
     halfW: [halfW, setHalfW], yNear: [yNear, setYNear], yFar: [yFar, setYFar],
@@ -3649,7 +3684,9 @@ export default function App() {
   const tRef = useRef(0);
   const [, force] = useState(0);
   useEffect(() => {
-    if (!animate) return;
+    // a video export renders one frame at a time on this same thread; letting
+    // the preview keep animating underneath it only steals time from it
+    if (!animate || vidBusy) return;
     let raf, last = 0;
     // Low power caps the loop to ~15fps: fewer full recomputes of the water
     // field per second is the single biggest battery saving while animating.
@@ -3663,7 +3700,7 @@ export default function App() {
     };
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
-  }, [animate, speed, lowPower]);
+  }, [animate, speed, lowPower, vidBusy]);
 
   // banded palette stops / painted-strip runs -> non-uniform band boundaries
   const stops = useMemo(() => paletteStops(palette), [palette]);
@@ -3764,8 +3801,10 @@ export default function App() {
 
   const regionCount = (use2d ? seg.count : layers.length + 1) * fresIdx.length;
 
-  // pen-plot lines: equally spaced scan lines colored by the reflection beneath
-  const penLines = useMemo(() => {
+  // pen-plot lines: equally spaced scan lines colored by the reflection beneath.
+  // Takes the scene rather than closing over it, so the video export can build
+  // the same lines at a wave phase this render is not showing.
+  const makePenLines = useCallback((S) => {
     if (!penMode) return null;
     const fit = computeFit(S);
     const mag = S.reflMag || 1;
@@ -3827,9 +3866,10 @@ export default function App() {
       nLines: penCount, samples: penHidden ? 360 : 260, relief: penRelief,
       threeD, hidden: penHidden, evenScreen: penEven,
     });
-  }, [penMode, penStyle, penCount, penSpacing, penRelief, penHidden, penEven, S, use2d, mode,
+  }, [penMode, penStyle, penCount, penSpacing, penRelief, penHidden, penEven, use2d, mode,
       penHatchGap, penHatchAngle, penHatchSpread, penHatchAim, penHatchTone, bgFill, rasterLevel,
       envEffective, azSpan, colors1d, presetColors, fresOn, fresBands, mixDeep]);
+  const penLines = useMemo(() => makePenLines(S), [makePenLines, S]);
 
   // The fields any surface-raster pass contours: one continuous scalar for
   // preset/1D palettes (the reflected elevation, banded at the palette's
@@ -3837,7 +3877,7 @@ export default function App() {
   // coordinate for painted ones, plus the Fresnel deep-water weight. The live
   // 3D render and the layered-paper export both build their picture from
   // these, so a cut line lands where the rendered color edge does.
-  const fieldSpec = useMemo(() => {
+  const makeFieldSpec = useCallback((S) => {
     const mag = S.reflMag || 1;
     // occluded Fresnel: the deep-water weight at the front-most surface point,
     // contoured into the same bands the flat path clips with
@@ -3865,7 +3905,8 @@ export default function App() {
     const scalarAt = (gx, gy) =>
       Math.asin(Math.max(-1, Math.min(1, reflectAt(gx, gy, S)[2]))) * 180 / Math.PI;
     return { scalarAt, thresholds, cols, fresAt, fresThresholds };
-  }, [S, use2d, mode, envEffective, azSpan, colors1d, presetColors, fresOn, fresBands]);
+  }, [use2d, mode, envEffective, azSpan, colors1d, presetColors, fresOn, fresBands]);
+  const fieldSpec = useMemo(() => makeFieldSpec(S), [makeFieldSpec, S]);
 
   // 3D solid surface: hidden-surface removal on a z-buffered raster, then the
   // usual smooth contouring on top — so the lifted water keeps the flat modes'
@@ -3889,12 +3930,13 @@ export default function App() {
   const drawGap = solid3d ? surf3d.gap : null;
 
   // floating buoy: projected cap + waterline clip + mirrored reflection
-  const buoy = useMemo(() => {
+  const makeBuoy = useCallback((S) => {
     if (!objOn) return null;
     const fit = computeFit(S);
     prepField(S);
     return buildBuoy(S, fit, { x: objX, y: objY, size: objSize, sub: objSub });
-  }, [objOn, objX, objY, objSize, objSub, S]);
+  }, [objOn, objX, objY, objSize, objSub]);
+  const buoy = useMemo(() => makeBuoy(S), [makeBuoy, S]);
   const buoyShade = useMemo(() => makeBuoyBands(objBands, objLight), [objBands, objLight]);
 
   // auto-fit the elevation range to the actual reflected φ, so steep/near water
@@ -3908,15 +3950,56 @@ export default function App() {
     if (hi !== eHi) setEHi(hi);
   }, [autoFit, rng.lo, rng.hi, eLo, eHi]);
 
+  // Everything about the picture that changes when the wave phase does,
+  // gathered into one object. The preview's is memoized above, a frame at a
+  // time; `frameAt` builds another from scratch at any phase, which is what
+  // the video export walks through. Color, camera roll, Fresnel banding and
+  // the rest do not move with the phase, so they stay closed over.
+  const liveFrame = {
+    seg, fresPaths, penLines, buoy,
+    drawLayers, drawFres, drawBg, drawGap, bgFill, gapFill,
+  };
+  const frameAt = (t) => {
+    const St = { ...S, t };
+    if (penMode) {
+      // pen mode has no filled regions at all: lines, the buoy, and paper
+      return { ...liveFrame, penLines: makePenLines(St), buoy: makeBuoy(St) };
+    }
+    const geomT = use2d ? null : buildGeometry(St);
+    const segT = use2d ? buildSegmentation(St, envEffective, azSpan) : null;
+    const bgT = use2d ? segT.bg : isobandColors[0];
+    const bgFillT = bgColor || bgT;
+    const layersT = use2d ? (segT.layers || null)
+      : geomT.ds.map((d, k) => ({ d, color: isobandColors[k + 1] }));
+    const fresT = fresOn ? (use2d ? segT.fres : geomT.fres) : null;
+    // the preview's own raster and mesh, deliberately: a video frame is not a
+    // print, and the export retrace would multiply a minutes-long render by
+    // the frame count for edges nobody will pause on
+    const solidT = solid3d
+      ? buildSolid3D(St, makeFieldSpec(St),
+          { gN: rasterLevel.gN, BW: rasterLevel.BW, gap: crestGap })
+      : null;
+    return {
+      seg: segT, fresPaths: fresT, penLines: null, buoy: makeBuoy(St),
+      drawLayers: solid3d ? solidT.layers : layersT,
+      drawFres: solid3d ? solidT.fres : fresT,
+      drawBg: solid3d ? solidT.bg : bgT,
+      drawGap: solid3d ? solidT.gap : null,
+      bgFill: bgFillT, gapFill: crestGapColor || bgFillT,
+    };
+  };
+
   // `over` is an alternate { bg, layers, fres } for the filled regions — the
   // export retrace at a wider raster. Everything else about the picture (roll,
   // Fresnel banding, buoy, background) is unchanged, so the file matches what
   // is on screen; only the outlines are resolved finer.
-  const buildSvg = (over) => {
-    const svgLayers = over ? over.layers : drawLayers;
-    const svgFres = over ? over.fres : drawFres;
-    const svgBg = over ? over.bg : drawBg;
-    const svgGap = over ? over.gap : drawGap;
+  const buildSvg = (over, frame) => {
+    const F = frame || liveFrame;
+    const { seg, fresPaths, penLines, buoy, bgFill, gapFill } = F;
+    const svgLayers = over ? over.layers : F.drawLayers;
+    const svgFres = over ? over.fres : F.drawFres;
+    const svgBg = over ? over.bg : F.drawBg;
+    const svgGap = over ? over.gap : F.drawGap;
     const buoyStr = buoy ? buoySvg(buoy, buoyShade) : "";
     const rollOpen = rollTf ? `<g transform="${rollTf}">` : `<g>`;
     if (penMode) {
@@ -4069,6 +4152,69 @@ export default function App() {
           + " and opening that file in any image editor gets you the same PNG.");
       }).then(() => setPngBusy(false), () => setPngBusy(false));
     }, 30);
+  };
+
+  // MP4 at `vidSec` seconds: the animation, rendered one frame at a time and
+  // played back at a rate this scene may be nowhere near able to hit live.
+  //
+  // Each frame is the preview's own geometry rebuilt at the wave phase the
+  // clip is at by then — `frameAt` — so what comes out is what the animation
+  // is *meant* to look like, not what the machine managed. The settings are
+  // whatever they were when the button was pressed: the loop holds this
+  // render's closures, so moving a slider mid-export changes the next export,
+  // never the frames still to come in this one.
+  const vidAt = videoSize(VIDEO_SCALES[Math.max(0, Math.min(VIDEO_SCALES.length - 1, vidQ))],
+    VB_W, VB_H);
+  const vidPlan = framePlan(vidSec, speed);
+  const showVid = (blob, name, plan, out) => {
+    let url = null;
+    try {
+      if (vidUrlRef.current) URL.revokeObjectURL(vidUrlRef.current);
+      url = URL.createObjectURL(blob);
+      vidUrlRef.current = url;
+    } catch (e) { url = null; }
+    setVidOut({ url, w: vidAt.w, h: vidAt.h, bytes: blob.size, name,
+      seconds: plan.seconds, frames: plan.count, entry: out.entry, codec: out.codec });
+  };
+  const cancelVideo = () => { vidCancelRef.current = true; };
+  const exportVideo = async () => {
+    if (vidBusy || pngBusy || exporting) return;
+    setVidErr(null);
+    if (!videoSupported()) {
+      setVidErr("This browser has no video encoder at all (WebCodecs). Chrome, Edge,"
+        + " Firefox and Safari 16.4+ can write the file; everywhere else, the PNG export"
+        + " still gets you one frame at a time.");
+      return;
+    }
+    const plan = vidPlan;
+    const startedAt = Date.now();
+    vidCancelRef.current = false;
+    setVidBusy(true);
+    setVidProg({ done: 0, total: plan.count, startedAt });
+    // one frame to let the progress bar paint before the first render blocks
+    await new Promise((r) => setTimeout(r, 30));
+    if (!vidCanvasRef.current && typeof document !== "undefined")
+      vidCanvasRef.current = document.createElement("canvas");
+    try {
+      const out = await encodeMp4({
+        width: vidAt.w, height: vidAt.h, fps: plan.fps, count: plan.count,
+        renderFrame: (i) => svgToCanvas(buildSvg(null, frameAt(plan.phaseAt(i))),
+          vidAt.w, vidAt.h, vidCanvasRef.current),
+        onProgress: (done, total) => setVidProg({ done, total, startedAt }),
+        cancelled: () => vidCancelRef.current,
+      });
+      if (out) {
+        const blob = new Blob(out.parts, { type: "video/mp4" });
+        saveBlob(blob, "reflection-regions.mp4");
+        showVid(blob, "reflection-regions.mp4", plan, out);
+      }
+    } catch (e) {
+      setVidErr("The video encoder would not take this scene"
+        + (e && e.message ? ` (${e.message})` : "") + "."
+        + " The PNG export still writes a single frame at any size.");
+    }
+    setVidBusy(false);
+    setVidProg(null);
   };
 
   // Layered paper: cut the same picture the SVG export draws. Both resolve the
@@ -4995,7 +5141,7 @@ export default function App() {
               </div>
             )}
 
-            <button onClick={downloadSVG} disabled={exporting || pngBusy}
+            <button onClick={downloadSVG} disabled={exporting || pngBusy || vidBusy}
               style={{ width: "100%", background: exporting ? "#1f4650" : "#2f6b78", border: "none",
                 color: exporting ? "#9fc4cd" : "#f1fbff",
                 padding: "12px", borderRadius: 10, cursor: exporting ? "wait" : "pointer",
@@ -5011,7 +5157,7 @@ export default function App() {
                   return `${sz.w} \u00d7 ${sz.h}` + (sz.capped ? " (capped)" : "");
                 }} />
             </div>
-            <button onClick={downloadPNG} disabled={pngBusy || exporting}
+            <button onClick={downloadPNG} disabled={pngBusy || exporting || vidBusy}
               title="A pixel image of exactly what is on screen, at print size"
               style={{ width: "100%", background: pngBusy ? "#1f4650" : "#2f6b78", border: "none",
                 color: pngBusy ? "#9fc4cd" : "#f1fbff",
@@ -5076,7 +5222,111 @@ export default function App() {
               </div>
             )}
 
-            <button onClick={exportPaperStack} disabled={penMode}
+            <div style={{ marginTop: 14, marginBottom: 8 }}>
+              <Slider label="video length" value={vidSec} min={VIDEO_MIN_SEC} max={VIDEO_MAX_SEC}
+                step={0.5} onChange={setVidSec}
+                fmt={(v) => {
+                  const p = framePlan(v, speed);
+                  return `${p.seconds.toFixed(1)} s \u00b7 ${p.count} frames`;
+                }} />
+              <Slider label="video size" value={vidQ} min={0} max={VIDEO_SCALES.length - 1}
+                step={1} onChange={setVidQ}
+                fmt={(v) => {
+                  const sz = videoSize(VIDEO_SCALES[v], VB_W, VB_H);
+                  return `${sz.w} \u00d7 ${sz.h}`;
+                }} />
+            </div>
+            <button onClick={exportVideo} disabled={vidBusy || pngBusy || exporting}
+              title="Render the animation frame by frame and write it as an MP4"
+              style={{ width: "100%", background: vidBusy ? "#1f4650" : "#2f6b78", border: "none",
+                color: vidBusy ? "#9fc4cd" : "#f1fbff",
+                padding: "12px", borderRadius: 10, cursor: vidBusy ? "wait" : "pointer",
+                fontSize: 13.5, fontWeight: 600, letterSpacing: 0.3 }}>
+              {vidBusy
+                ? `Rendering ${vidPlan.count} frames\u2026`
+                : `Export MP4 \u00b7 ${vidPlan.seconds.toFixed(1)} s at ${VIDEO_FPS}fps`}
+            </button>
+
+            {vidProg && (
+              <div style={{ marginTop: 8 }}>
+                <div style={{ height: 8, borderRadius: 5, background: "#141c24",
+                  border: "1px solid #26313c", overflow: "hidden" }}>
+                  <div style={{ height: "100%", borderRadius: 4, background: "#4fb0c4",
+                    width: `${Math.round((vidProg.done / vidProg.total) * 100)}%`,
+                    transition: "width 120ms linear" }} />
+                </div>
+                <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 6 }}>
+                  <span style={{ fontSize: 10.5, color: "#8a9bab", flex: 1,
+                    fontFamily: "ui-monospace, monospace" }}>
+                    frame {vidProg.done} / {vidProg.total}
+                    {vidProg.done > 0 && vidProg.done < vidProg.total
+                      ? ` \u00b7 ~${formatDuration(etaSeconds(vidProg.done, vidProg.total,
+                          (Date.now() - vidProg.startedAt) / 1000))} left`
+                      : ""}
+                  </span>
+                  <button onClick={cancelVideo}
+                    style={{ ...miniBtn, flex: "none", padding: "4px 10px" }}>
+                    {vidCancelRef.current ? "stopping\u2026" : "cancel"}
+                  </button>
+                </div>
+              </div>
+            )}
+
+            <div style={{ fontSize: 10, color: "#6d808f", marginTop: 5, lineHeight: 1.5,
+              fontFamily: "ui-monospace, monospace" }}>
+              The animation, written out at a steady {VIDEO_FPS}fps whatever this scene renders
+              at live. Each frame is built at the wave phase it is due at — starting from
+              t&nbsp;=&nbsp;0, ending at {vidPlan.endPhase.toFixed(1)} — so the file plays at the
+              speed the scene was set up for, however long it takes to make. Detail costs the
+              render, not the playback: a frame that takes two seconds on screen takes two
+              seconds here too, and there are {vidPlan.count} of them. The picture is the
+              preview's own geometry, like the PNG — no polish pass, no export retrace.
+              {speed === 0 ? " Speed is at zero, so every frame would be identical." : ""}
+            </div>
+
+            {vidErr && (
+              <div style={{ fontSize: 10.5, color: "#e0a37a", marginTop: 6, lineHeight: 1.5,
+                fontFamily: "ui-monospace, monospace" }}>{vidErr}</div>
+            )}
+
+            {vidOut && (
+              <div style={{ ...panel, marginTop: 12, marginBottom: 0 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+                  <span style={{ ...heading, margin: 0, flex: 1 }}>MP4</span>
+                  <button onClick={() => {
+                    try { if (vidUrlRef.current) URL.revokeObjectURL(vidUrlRef.current); } catch (e) {}
+                    vidUrlRef.current = null; setVidOut(null);
+                  }} style={{ ...miniBtn, flex: "none", padding: "4px 10px" }}>close</button>
+                </div>
+                {vidOut.url && (
+                  <video src={vidOut.url} controls loop playsInline
+                    style={{ width: "100%", display: "block", borderRadius: 8,
+                      border: "1px solid #26313c", marginBottom: 10 }} />
+                )}
+                <div style={{ fontSize: 10.5, color: "#8a9bab", marginBottom: 10, lineHeight: 1.5 }}>
+                  {vidOut.w} × {vidOut.h} px · {vidOut.seconds.toFixed(1)} s ·
+                  {" "}{vidOut.frames} frames · {(vidOut.bytes / 1024 / 1024).toFixed(1)} MB.
+                  A download may have started. If not (some sandboxes block it), use the
+                  button below.
+                  {vidOut.entry === "vp09" && (
+                    <> This browser has no H.264 encoder, so the file carries VP9 instead —
+                      still an .mp4, and Chrome, Firefox, VLC and Windows play it, but
+                      QuickTime and some editors will not.</>
+                  )}
+                </div>
+                {vidOut.url && (
+                  <a href={vidOut.url} download={vidOut.name}
+                    target="_blank" rel="noopener noreferrer"
+                    style={{ display: "block", background: "#1a232c", color: "#cfe6ec",
+                      textAlign: "center", padding: "11px", borderRadius: 9, fontSize: 13,
+                      fontWeight: 600, textDecoration: "none", border: "1px solid #2f6b78" }}>
+                    Open / save MP4
+                  </a>
+                )}
+              </div>
+            )}
+
+            <button onClick={exportPaperStack} disabled={penMode || vidBusy}
               title={penMode ? "Turn off pen-plot mode — the paper stack needs filled color regions"
                 : "Decompose the scene into cuttable paper sheets"}
               style={{ width: "100%", marginTop: 8, background: penMode ? "#1a232c" : "#274b3f",
