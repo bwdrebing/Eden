@@ -71,6 +71,13 @@ scaled inside a fixed-size `<div>` gives a zoomed crop to screenshot.
 - **Smoothing that acts on the traced path cannot fix a jagged edge**; Chaikin
   already converges to the spline of that polyline. The field is where to act
   (see `smoothField`), before the topology is decided.
+- **The three pen styles are not the same kind of thing.** `buildPenLines` and
+  `buildPenConcentric` work in ground space and do their own hidden-line pass;
+  `buildPenHatch` works in *screen* space, on the same `rasterizeSurface` pass
+  the filled 3D mode contours, which is what gives it even stroke spacing across
+  the frame and occlusion for free. So `BW`/`gN` bound how fine a hatch edge can
+  be, exactly as they do for the filled path — the pen panel's own sliders do
+  not.
 - The 1D/preset path and the 2D panorama path are separate builders
   (`buildSurface3D`, `buildSurface3DPanorama`) that must stay in step. A new
   option on one usually belongs on the other; `buildSolid3D` is where both are
