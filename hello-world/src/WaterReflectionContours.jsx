@@ -1409,6 +1409,32 @@ function rasterField(R, vals) {
   return dst;
 }
 
+// "Edge ripple" (coherence) blurs the reflected field in water space before
+// the regions are cut. The flat builders do that on their own nx×ny grid; the
+// 3D builders only ever see the field at mesh vertices, so without this the
+// slider silently did nothing once the surface was lifted — the same scene
+// lost every pass of blur the moment 3D went on, and any contour running close
+// to a band boundary came back as a staircase or a run of scallops.
+//
+// The mesh is a different resolution from the sample grid, and a box blur's
+// reach goes with the cell size, so the pass count is scaled to cover the same
+// ground distance. That is also what keeps the slider meaning one thing in the
+// preview and the same thing in an export traced at a finer mesh. A mesh too
+// coarse to hold the blur rounds to no passes, which is right — at that point
+// the mesh is already doing the smoothing.
+function coherencePasses(S, gN) {
+  const c = Math.max(0, S.coherence | 0);
+  if (!c) return 0;
+  const r = gN / Math.max(1, S.nx);
+  return Math.min(60, Math.round(c * r * r));
+}
+
+// blur one mesh-vertex field in place, in water space
+function meshBlur(R, vals, passes, tmp) {
+  if (passes) blurField(vals, R.stride, R.stride, tmp, passes);
+  return vals;
+}
+
 // ---- edge polish ---------------------------------------------------
 // Smooth a reconstructed raster field before it is contoured.
 //
@@ -1506,14 +1532,16 @@ function buildSurface3D(S, fit, opts) {
   const iters = S.smooth || 0;
   const buf = new Float64Array(R.NP);
   const scratch = polishScratch(R.NP, polish);
-  const fs = rasterField(R, gridSamples(R, scalarAt));
+  const coh = coherencePasses(S, gN);
+  const cbuf = coh ? new Float64Array(R.stride * R.stride) : null;
+  const fs = rasterField(R, meshBlur(R, gridSamples(R, scalarAt), coh, cbuf));
   // one scalar carries every band here, so polishing it once moves all of them
   // together and the bands stay parallel
   smoothField(fs, R.cov, R.BW, R.BH, polish, scratch);
   const layers = thresholds.map((t) => contourRegion(R, fs, t, iters, buf));
   let fres = null;
   if (fresAt) {
-    const ff = rasterField(R, gridSamples(R, fresAt));
+    const ff = rasterField(R, meshBlur(R, gridSamples(R, fresAt), coh, cbuf));
     smoothField(ff, R.cov, R.BW, R.BH, polish, scratch);
     fres = fresThresholds.map((t) => contourRegion(R, ff, t, iters, buf));
   }
@@ -1540,6 +1568,9 @@ function buildSurface3DPanorama(S, fit, opts) {
   for (let q = 0; q < nv; q++) {
     const uv = uvAt(R.GX[q], R.GY[q]); su[q] = uv[0]; sv[q] = uv[1];
   }
+  const coh = coherencePasses(S, gN);
+  const cbuf = coh ? new Float64Array(R.stride * R.stride) : null;
+  meshBlur(R, su, coh, cbuf); meshBlur(R, sv, coh, cbuf);
   const fu = rasterField(R, su), fv = rasterField(R, sv);
 
   // bilinear taps into panorama space, shared by every layer
@@ -1594,7 +1625,7 @@ function buildSurface3DPanorama(S, fit, opts) {
 
   let fres = null;
   if (fresAt) {
-    const ff = rasterField(R, gridSamples(R, fresAt));
+    const ff = rasterField(R, meshBlur(R, gridSamples(R, fresAt), coh, cbuf));
     smoothField(ff, cov, BW, BH, polish, scratch);
     fres = fresThresholds.map((t) => contourRegion(R, ff, t, iters, buf));
   }
@@ -2484,6 +2515,8 @@ function buildPaperImage(S, fit, opts) {
   const gapF = R.gap;
   const gapId = gapF && gapColor ? idFor(gapColor) : bgId;
 
+  const coh = coherencePasses(S, gN);
+  const cbuf = coh ? new Float64Array(R.stride * R.stride) : null;
   let colorOf;
   if (uvAt) {
     const { w: EW, h: EH, cells } = env2d;
@@ -2492,6 +2525,7 @@ function buildPaperImage(S, fit, opts) {
     for (let q = 0; q < nv; q++) {
       const uv = uvAt(R.GX[q], R.GY[q]); su[q] = uv[0]; sv[q] = uv[1];
     }
+    meshBlur(R, su, coh, cbuf); meshBlur(R, sv, coh, cbuf);
     const fu = rasterField(R, su), fv = rasterField(R, sv);
     colorOf = (p) => {
       const u = fu[p] < 0 ? 0 : fu[p] > EW - 1 ? EW - 1 : fu[p] | 0;
@@ -2499,14 +2533,15 @@ function buildPaperImage(S, fit, opts) {
       return cells[v * EW + u];
     };
   } else {
-    const fs = rasterField(R, gridSamples(R, scalarAt));
+    const fs = rasterField(R, meshBlur(R, gridSamples(R, scalarAt), coh, cbuf));
     colorOf = (p) => {
       let k = 0;
       for (const t of thresholds) { if (fs[p] >= t) k++; else break; }
       return cols[k] || cols[0];
     };
   }
-  const fw = fresAt ? rasterField(R, gridSamples(R, fresAt)) : null;
+  const fw = fresAt
+    ? rasterField(R, meshBlur(R, gridSamples(R, fresAt), coh, cbuf)) : null;
 
   const grid = new Int32Array(NP);
   const counts = [];
