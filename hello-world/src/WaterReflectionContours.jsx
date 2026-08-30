@@ -6,7 +6,7 @@ import { extractPhotoStrip } from "./photoPalette";
 import {
   VIDEO_FPS, VIDEO_MIN_SEC, VIDEO_MAX_SEC, VIDEO_DEFAULT_SEC,
   VIDEO_SCALES, VIDEO_DEFAULT_SCALE, videoSize, framePlan,
-  videoSupported, encodeMp4, formatDuration, etaSeconds,
+  videoSupported, encodeMp4, formatDuration, etaSeconds, PHASE_PER_SEC,
 } from "./videoExport";
 
 /* ------------------------------------------------------------------ *
@@ -68,6 +68,16 @@ function paletteColorAt(name, f) {
   for (const s of stops) if (f < s.f1) return s.c;
   return stops[stops.length - 1].c;
 }
+
+// How fast the one clock runs. The floor is low enough that ten seconds of
+// video can cover a couple of phase — a long slow swell rather than a loop —
+// and the ceiling is where the ripples start to strobe against the frame rate.
+const SPEED_MIN = 0.05;
+const SPEED_MAX = 1.5;
+// Per-emitter rate: a multiplier on the clock for one wave train, so a slow
+// swell can roll under fast chop. 1 is the clock itself; 0 freezes that train
+// without freezing the scene.
+const EMITTER_RATE_DEFAULT = 1;
 
 const VB_W = 760;
 const VB_H = 500;
@@ -296,7 +306,13 @@ function newWake(id, halfW, yFar, strength) {
 function prepEmitter(em, S) {
   const baseLambda = (2 * Math.PI / S.k) * em.size; // global λ × size
   const A = S.amp * em.amp;
-  const wt = S.omega * S.t;
+  // The scene has one clock; `rate` is this train's gearing off it, so a long
+  // swell can roll while the chop on top of it races. It scales the phase only
+  // — the shape, wavelength and amplitude of the train are untouched — which is
+  // why a rate of 0 leaves a still wave pattern rather than a flat sheet.
+  const rate = em.rate == null ? EMITTER_RATE_DEFAULT : em.rate;
+  const t = S.t * rate;
+  const wt = S.omega * t;
   const q = S.sharp || 0;   // Stokes-style crest sharpening, 2nd harmonic weight
 
   if (em.type === "point") {
@@ -370,7 +386,7 @@ function prepEmitter(em, S) {
     DX.push(Math.cos(th));
     DY.push(Math.sin(th));
     AMP.push(A * (lam / baseLambda) / N * 1.5);       // longer waves carry more energy
-    PH.push(rand1(i * 2 + 2) * Math.PI * 2 - om * S.t);
+    PH.push(rand1(i * 2 + 2) * Math.PI * 2 - om * t);
     AA.push(aaCoef(ki, S));
   }
   return { type: "spectrum", K, DX, DY, AMP, PH, AA, N, q };
@@ -2647,6 +2663,7 @@ export {
   EXPORT_MESHES, EXPORT_MESH_DEFAULT, EXPORT_MESH_FLOOR, exportRaster,
   EXPORT_POLISH, EXPORT_POLISH_DEFAULT, smoothField,
   PNG_SCALES, PNG_DEFAULT, PNG_MAX_PIXELS, pngSize, sizedSvg, svgToPngBlob, svgToCanvas,
+  SPEED_MIN, SPEED_MAX, EMITTER_RATE_DEFAULT,
 };
 
 // ---- layered-paper stack export -----------------------------------
@@ -3242,6 +3259,10 @@ function EmitterCard({ em, idx, halfW, yFar, onChange, onRemove }) {
         min={0.3} max={5} step={0.1} onChange={(v) => onChange({ size: v })} fmt={(v) => v.toFixed(1) + "×"} />
       <Slider label="strength" value={em.amp} min={0} max={2} step={0.05}
         onChange={(v) => onChange({ amp: v })} fmt={(v) => v.toFixed(2)} />
+      <Slider label="rate (× the scene clock)"
+        value={em.rate == null ? EMITTER_RATE_DEFAULT : em.rate}
+        min={0} max={3} step={0.05} onChange={(v) => onChange({ rate: v })}
+        fmt={(v) => (v === 0 ? "frozen" : v.toFixed(2) + "\u00d7")} />
     </div>
   );
 }
@@ -3432,7 +3453,8 @@ export default function App() {
   const addEmitter = () =>
     setEmitters((es) => es.length >= 5 ? es :
       [...es, { id: es.reduce((m, e) => Math.max(m, e.id), 0) + 1, on: true, type: "rings",
-        x: 0, y: 20, dir: 90, size: 1.0, amp: 0.8, spread: 25, roughness: 0.45, detail: 10 }]);
+        x: 0, y: 20, dir: 90, size: 1.0, amp: 0.8, spread: 25, roughness: 0.45, detail: 10,
+        rate: EMITTER_RATE_DEFAULT }]);
   const removeEmitter = (id) => setEmitters((es) => es.filter((e) => e.id !== id));
   const [halfW, setHalfW] = useState(22); // 44 units across
   const [yNear, setYNear] = useState(3);
@@ -4884,12 +4906,26 @@ export default function App() {
               )}
               <Toggle label="Show region edges" value={edges} onChange={setEdges} />
               <Toggle label="Animate ripples" value={animate} onChange={setAnimate} />
-              {animate ? (
-                <div style={{ marginTop: 8 }}>
-                  <Slider label="Speed" value={speed} min={0.1} max={1.5} step={0.05}
-                    onChange={setSpeed} fmt={(v) => v.toFixed(2)} />
+              {/* Speed is the rate of the one clock the whole scene reads, so it
+                  belongs here whether or not the preview is currently running it:
+                  with the animation off it still sets how much water a second of
+                  exported video covers. */}
+              <div style={{ marginTop: 8 }}>
+                <Slider label="Speed" value={speed} min={SPEED_MIN} max={SPEED_MAX} step={0.05}
+                  onChange={setSpeed}
+                  fmt={(v) => `${v.toFixed(2)} \u00b7 ${(v * PHASE_PER_SEC).toFixed(1)} phase/s`} />
+                <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5, marginTop: -4,
+                  fontFamily: "ui-monospace, monospace" }}>
+                  One clock drives every emitter, the buoy and its reflection, and this is
+                  its rate — for the animation above and for the video export alike. Turning
+                  it down and the video length up is how you get the same stretch of water
+                  to unfold slowly: a {vidPlan.seconds.toFixed(1)} s export covers
+                  {" "}{vidPlan.endPhase.toFixed(1)} of phase at this setting. Under advanced,
+                  each emitter has its own rate against this one, so a long swell can roll
+                  while the chop on top of it races.
                 </div>
-              ) : (
+              </div>
+              {animate ? null : (
                 <div style={{ marginTop: 8 }}>
                   <Slider label="Time (wave phase)" value={manualTime} min={0} max={20} step={0.05}
                     onChange={setManualTime} fmt={(v) => v.toFixed(2)} />
@@ -4916,7 +4952,9 @@ export default function App() {
                   Swell = one long straight-crested wave train. Spectrum = a wind field of many
                   straight waves (raise roughness for chop). Rings = a scattered field of radial
                   ripples — the source of the concentric color rings you see on a real lake.
-                  Point = a single spreading ripple.
+                  Point = a single spreading ripple. Each carries a rate — its gearing off
+                  the scene clock — so a long swell can roll under fast chop, or one train
+                  can be frozen while the rest of the water moves.
                 </div>
                 {emitters.map((em, i) => (
                   <EmitterCard key={em.id} em={em} idx={i} halfW={halfW} yFar={yFar}
@@ -5280,8 +5318,9 @@ export default function App() {
               speed the scene was set up for, however long it takes to make. Detail costs the
               render, not the playback: a frame that takes two seconds on screen takes two
               seconds here too, and there are {vidPlan.count} of them. The picture is the
-              preview's own geometry, like the PNG — no polish pass, no export retrace.
-              {speed === 0 ? " Speed is at zero, so every frame would be identical." : ""}
+              preview's own geometry, like the PNG — no polish pass, no export retrace. How
+              much water it covers is Speed, under Display: turn that down and this up, and
+              the same swell unfolds slowly instead of racing past.
             </div>
 
             {vidErr && (
