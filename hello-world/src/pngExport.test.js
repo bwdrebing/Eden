@@ -52,6 +52,7 @@ test("no 2D context means a rejection, not a promise that never settles", async 
 
 test("Export PNG offers the preview at print size, and says so when it cannot", async () => {
   render(<App />);
+  fireEvent.click(screen.getByRole("tab", { name: /output/i }));
 
   expect(screen.getByText(/3040 × 2000/)).toBeInTheDocument();
 

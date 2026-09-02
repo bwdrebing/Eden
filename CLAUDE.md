@@ -7,6 +7,13 @@ it lives in one file, `hello-world/src/WaterReflectionContours.jsx`, whose
 comments carry the reasoning behind each stage — read the comment above a
 function before changing it.
 
+The control panel is organized into six task-based workspace tabs. Before
+adding, moving, or renaming **any UI control** — even "just one slider" —
+read `.claude/skills/control-surface/SKILL.md`: it says which workspace a
+control belongs in, when something earns a new workspace vs. a section, and
+the one-screen height budget that keeps the panel from regrowing into the
+8-screen scroll it replaced.
+
 ## Commands
 
 Run from `hello-world/`:
