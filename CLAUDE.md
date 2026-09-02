@@ -63,6 +63,24 @@ scaled inside a fixed-size `<div>` gives a zoomed crop to screenshot.
   geometry instead (no polish, no mesh stand-down; it keeps only the width
   multiplier, which resolves rather than smooths), so it is where fidelity to
   the preview lives. Keep it that way.
+- **There are two cameras, and the wide one is not a projection tweak.** The
+  ordinary camera looks from one seat: a point far off to the side is seen
+  edge-on, so its reflected ray leaves at a steep azimuth and its cells shear
+  toward the vanishing point — which is what makes the ends of a very wide
+  scene look wrong. The wide camera (`S.wide`, "Wide (scan) camera") slides the
+  seat along x so every point is seen head-on from its own distance: a linear
+  pushbroom. It changes `reflectAt` (the view ray loses its x component) as
+  much as it changes the projection (screen x becomes affine in `gx`, so the
+  plane is a rectangle and grid *i* interpolates linearly across a raster
+  triangle instead of through the depth divide). Anything new that reads the
+  camera has to ask `isWide(S)`, not assume the divide.
+- **The frame is 760×500 only by default.** `S.vbW` widens it — same height,
+  more picture beside the picture, which is how a wide scene becomes a wide
+  file instead of a squeezed one. Sample columns and the contour raster scale
+  with it, so a viewBox unit means the same thing at any width; every unit-
+  denominated setting (pen width, hatch spacing, crest gap, smoothing) keeps
+  its meaning. Read the frame through `vbW(S)`, never the `VB_W` constant. The
+  wave mesh `gN` is the one thing that does not grow with the frame.
 - **Two different limits control how fine an edge can be.** `BW` is the raster
   the regions are contoured on — how finely an outline is *drawn*. `gN` is the
   wave mesh — how much surface there is *to* draw. They are not

@@ -28,9 +28,15 @@ export const VIDEO_DEFAULT_SEC = 3;
 // two, so an odd dimension is rejected outright by some encoders.
 export const VIDEO_SCALES = [1, 1.5, 2];
 export const VIDEO_DEFAULT_SCALE = 1;
+// Hardware H.264 encoders top out around 4096 px on the long side, and refuse
+// the frame rather than downscaling it — which a long print frame at 2x would
+// walk straight into. Clamp the whole frame down instead, so a wide scene
+// still exports, just not at the multiple that was asked for.
+export const VIDEO_MAX_DIM = 4096;
 export function videoSize(scale, vbW, vbH) {
   const even = (n) => Math.max(2, Math.round(n / 2) * 2);
-  return { w: even(vbW * scale), h: even(vbH * scale) };
+  const s = Math.min(scale, VIDEO_MAX_DIM / Math.max(vbW, vbH));
+  return { w: even(vbW * s), h: even(vbH * s) };
 }
 
 // The preview's animation loop advances the wave phase by 0.12 * speed per

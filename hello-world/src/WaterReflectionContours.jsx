@@ -82,6 +82,17 @@ const EMITTER_RATE_DEFAULT = 1;
 const VB_W = 760;
 const VB_H = 500;
 
+// The frame is 760×500 unless the picture asks for a longer sheet. Only the
+// WIDTH ever varies — the height is the same 500 units in every frame, so a
+// wider frame is strictly more picture beside the same picture, not a
+// re-scaled one: pen widths, hatch spacing, crest gaps and smoothing radii are
+// all in viewBox units and keep meaning exactly what they meant. `S.vbW`
+// carries it, and everything in this file that needs the frame asks vbW(S) for
+// it rather than reading the constant.
+function vbW(S) {
+  return (S && S.vbW) || VB_W;
+}
+
 const DEFAULT_EMITTERS = [
   { id: 1, on: true, type: "swell",    x: 0, y: 20, dir: 65,  size: 3.2, amp: 1.85, spread: 25, roughness: 0.4,  detail: 14 },
   { id: 2, on: true, type: "spectrum", x: 0, y: 20, dir: 125, size: 1.5, amp: 1.1,  spread: 59, roughness: 0.1,  detail: 15 },
@@ -490,6 +501,48 @@ function slopeAt(gx, gy, S) {
   return [hx, hy];
 }
 
+// ---- wide ("scan") camera -----------------------------------------
+// One vantage point is what makes the far left and right of a WIDE scene look
+// wrong. Forty units off to the side, the water is seen almost edge-on: its
+// reflected ray leaves at a steep azimuth, so it fetches a color from the far
+// corner of the environment window that the water straight ahead never sees,
+// and its cells shear toward the vanishing point. Nothing is broken — that is
+// what a wide-angle lens does — but it is not what a wide PRINT wants, where
+// the eye travels along the paper and expects each stretch of water to read
+// like the stretch beside it.
+//
+// So the wide camera gives up the single vantage point for a scan: the camera
+// slides sideways along x, always level with — directly behind — the point it
+// is looking at. Every point is then seen head-on, from a distance that
+// depends only on how far away it is, so the reflection at (40, 20) is the
+// reflection at (0, 20), and the frame stops converging sideways: the water
+// plane projects to a rectangle, however wide it gets. Depth is untouched —
+// rows still compress toward the horizon exactly as before.
+//
+// (This is a linear pushbroom camera, the geometry of a flatbed scan or a
+// slit camera on a slide. Its one oddity is that a ground line running
+// crosswise is no longer straight on screen — it bows — because screen x is
+// affine in gx while screen y stays projective in gy. Nothing here draws long
+// straight ground lines, and the mesh is tessellated far finer than that
+// curvature.)
+//
+// The horizontal image scale of a scanning camera is a free parameter (the
+// scan rate, not the lens). This choice is the one that makes switching it on
+// least surprising: the near edge keeps exactly the width the perspective
+// camera gave it, and the picture's center column does not move at all —
+// everything else simply stops leaning in.
+function wideScale(S, cp, sp) {
+  const c = cp === undefined ? Math.cos(S.pitch) : cp;
+  const p = sp === undefined ? Math.sin(S.pitch) : sp;
+  return 1 / Math.max(1e-3, S.yMin * c + S.H * p);
+}
+
+// the wide camera only means anything under the perspective projection: the
+// orthographic mode already has no vantage point to be off-axis from
+function isWide(S) {
+  return !!(S.wide && S.perspective);
+}
+
 // full reflected direction (unit) — gives both elevation and azimuth.
 // 4th component = cos of the incidence angle (view ray vs surface normal),
 // which sets the Fresnel reflectance at this point.
@@ -497,7 +550,9 @@ function reflectAt(gx, gy, S) {
   const [hx, hy] = slopeAt(gx, gy, S);
   let nx = -hx, ny = -hy, nz = 1;
   const nl = Math.hypot(nx, ny, nz); nx /= nl; ny /= nl; nz /= nl;
-  let vx = gx, vy = gy, vz = -S.H;
+  // wide camera: the eye is level with this point, so the view ray lies in the
+  // point's own vertical plane and its slant is set by the distance alone
+  let vx = isWide(S) ? 0 : gx, vy = gy, vz = -S.H;
   const vl = Math.hypot(vx, vy, vz); vx /= vl; vy /= vl; vz /= vl;
   const d = vx * nx + vy * ny + vz * nz;
   return [vx - 2 * d * nx, vy - 2 * d * ny, vz - 2 * d * nz, -d];
@@ -548,6 +603,9 @@ function cell2ground(ix, iy, S) {
     const rNear = ryOf(S.yMin), rFar = ryOf(S.yMax);
     const r = rNear + (iy / S.ny) * (rFar - rNear);
     const gy = S.H * (cp - r * sp) / (r * cp + sp);          // invert ry(gy)
+    // the wide camera has no lateral convergence to undo — the plane is
+    // already a rectangle — so its columns stay evenly spaced on the ground
+    if (isWide(S)) return [S.xMin + (ix / S.nx) * (S.xMax - S.xMin), gy];
     const Zc = gy * cp + S.H * sp;
     const Znear = S.yMin * cp + S.H * sp;
     const A = ((S.xMax - S.xMin) / 2) / Znear;               // near-edge half width in rx
@@ -569,7 +627,8 @@ function rawProject(gx, gy, S) {
   const Xc = gx;
   const Yc = gy * sp - S.H * cp;
   const Zc = gy * cp + S.H * sp;
-  return [Xc / Zc, -Yc / Zc];
+  // wide camera: x is the scan position, not an angle — no divide by depth
+  return [isWide(S) ? Xc * wideScale(S, cp, sp) : Xc / Zc, -Yc / Zc];
 }
 
 function computeFit(S) {
@@ -584,14 +643,15 @@ function computeFit(S) {
     minY = Math.min(minY, ry); maxY = Math.max(maxY, ry);
   }
   const m = 14;
-  const baseScale = Math.min((VB_W - 2 * m) / (maxX - minX), (VB_H - 2 * m) / (maxY - minY));
+  const W = vbW(S);
+  const baseScale = Math.min((W - 2 * m) / (maxX - minX), (VB_H - 2 * m) / (maxY - minY));
   let scale = baseScale * (S.zoom || 1), scaleY = scale;
   if (S.rectOutput && S.perspective) {   // fill the frame as a rectangle
-    scale = ((VB_W - 2 * m) / (maxX - minX)) * (S.zoom || 1);
+    scale = ((W - 2 * m) / (maxX - minX)) * (S.zoom || 1);
     scaleY = ((VB_H - 2 * m) / (maxY - minY)) * (S.zoom || 1);
   }
   const bcx = (minX + maxX) / 2, bcy = (minY + maxY) / 2;
-  const ox = VB_W / 2 - scale * bcx + (S.panX || 0) * (VB_W / 2);
+  const ox = W / 2 - scale * bcx + (S.panX || 0) * (W / 2);
   const oy = VB_H / 2 - scaleY * bcy + (S.panY || 0) * (VB_H / 2);
   return { scale, scaleY, ox, oy };
 }
@@ -600,12 +660,12 @@ function computeFit(S) {
 // up just enough that the rotated frame still covers the viewport (cover-fit,
 // like rotating a photo). Applied as one SVG group transform so every mode —
 // regions, pen lines, buoy, clips — rolls consistently.
-function rollTransform(rollDeg) {
+function rollTransform(rollDeg, W = VB_W) {
   if (!rollDeg) return null;
   const r = (rollDeg * Math.PI) / 180;
   const ca = Math.abs(Math.cos(r)), sa = Math.abs(Math.sin(r));
-  const s = Math.max((VB_W * ca + VB_H * sa) / VB_W, (VB_W * sa + VB_H * ca) / VB_H);
-  const cx = VB_W / 2, cy = VB_H / 2;
+  const s = Math.max((W * ca + VB_H * sa) / W, (W * sa + VB_H * ca) / VB_H);
+  const cx = W / 2, cy = VB_H / 2;
   return `rotate(${rollDeg} ${cx} ${cy}) translate(${(cx * (1 - s)).toFixed(2)} ${(cy * (1 - s)).toFixed(2)}) scale(${s.toFixed(4)})`;
 }
 
@@ -754,7 +814,8 @@ function penProject(gx, gy, gz, S, fit) {
     const cp = Math.cos(S.pitch), sp = Math.sin(S.pitch);
     const Zc = gy * cp - (gz - S.H) * sp;
     const Yc = gy * sp + (gz - S.H) * cp;
-    rx = gx / Zc; ry = -Yc / Zc; depth = Zc;
+    rx = isWide(S) ? gx * wideScale(S, cp, sp) : gx / Zc;
+    ry = -Yc / Zc; depth = Zc;
   }
   return [fit.ox + fit.scale * rx, fit.oy + (fit.scaleY || fit.scale) * ry, depth];
 }
@@ -775,8 +836,11 @@ function buildBuoy(S, fit, obj) {
   const syS = fit.scaleY || fit.scale;
   const [cx, cy, Zc] = penProject(obj.x, obj.y, zc, S, fit);
   let rx, ry;
+  // under the wide camera the horizontal scale is the scan's, the same at
+  // every depth; only the vertical still shrinks with distance
+  const wk = isWide(S) ? wideScale(S) : 0;
   if (S.perspective) {
-    rx = fit.scale * r / Zc; ry = syS * r / Zc;
+    rx = fit.scale * r * (wk || 1 / Zc); ry = syS * r / Zc;
   } else {
     rx = fit.scale * r / (S.xMax - S.xMin);
     ry = syS * r / (S.yMax - S.yMin);
@@ -811,7 +875,7 @@ function buildBuoy(S, fit, obj) {
   let reflD = null;
   if (S.perspective) {
     const [mx, my, mZc] = penProject(obj.x, obj.y, -zc, S, fit);
-    const mrx = fit.scale * r / mZc, mry = syS * r / mZc;
+    const mrx = fit.scale * r * (wk || 1 / mZc), mry = syS * r / mZc;
     const strength = S.amp / 0.06;               // global ripple strength 0..1
     const wAmp = Math.min(8, mrx * 0.25 * strength);
     const wLen = Math.max(3, mry * 0.8);
@@ -881,7 +945,7 @@ function buoySvg(b, bands) {
 // horizon") clips any farther row that falls behind it.
 function buildPenLines(S, fit, colorAt, opts) {
   const { nLines, samples, relief, threeD, hidden, evenScreen } = opts;
-  const W = Math.max(2, Math.round(VB_W));
+  const W = Math.max(2, Math.round(vbW(S)));
   const horizon = hidden ? new Float64Array(W + 1).fill(Infinity) : null;
   const clampB = (x) => (x < 0 ? 0 : x > W ? W : x);
   const byColor = new Map();
@@ -981,6 +1045,7 @@ function rasterTri(buf, BW, BH, x0, y0, z0, x1, y1, z1, x2, y2, z2) {
 
 // depth image of the wave surface, used to occlude rings behind nearer waves
 function buildDepthBuffer(S, fit, relief, threeD, BW, BH) {
+  const VW = vbW(S);
   const buf = new Float64Array(BW * BH).fill(Infinity);
   const gN = 100, stride = gN + 1;
   const SX = new Float64Array(stride * stride), SY = new Float64Array(stride * stride), DP = new Float64Array(stride * stride);
@@ -988,7 +1053,7 @@ function buildDepthBuffer(S, fit, relief, threeD, BW, BH) {
     const [gx, gy] = cell2ground((i / gN) * S.nx, (j / gN) * S.ny, S);
     const gz = threeD ? clampLift(heightAt(gx, gy, S) * relief, S, fit) : 0;
     const [sx, sy, dp] = penProject(gx, gy, gz, S, fit);
-    const q = j * stride + i; SX[q] = sx / VB_W * BW; SY[q] = sy / VB_H * BH; DP[q] = dp;
+    const q = j * stride + i; SX[q] = sx / VW * BW; SY[q] = sy / VB_H * BH; DP[q] = dp;
   }
   for (let j = 0; j < gN; j++) for (let i = 0; i < gN; i++) {
     const a = j * stride + i, b = a + 1, c = a + stride, e = c + 1;
@@ -1047,8 +1112,8 @@ const CREST_OVERLAP = 1;
 // coordinates (the raster is BW×BH, the viewBox VB_W×VB_H). `off` shifts
 // contour coordinates back from a padded raster (a one-pixel replicated border
 // lets a region's edge cross the frame instead of stopping half a pixel inside).
-function contourToScreenPath(multi, BW, BH, iters, off = 0) {
-  const kx = VB_W / BW, ky = VB_H / BH;
+function contourToScreenPath(multi, BW, BH, iters, off = 0, vw = VB_W) {
+  const kx = vw / BW, ky = VB_H / BH;
   let d = "";
   for (const poly of multi.coordinates) {
     for (const ring0 of poly) {
@@ -1084,7 +1149,8 @@ function cr4(a, b, c, d, t) {
 // `gapVB` > 0 also traces the crest gaps (see crestGapField), as a width in
 // viewBox units.
 function rasterizeSurface(S, fit, gN, BW, lift = true, gapVB = 0) {
-  const BH = Math.max(2, Math.round(BW * VB_H / VB_W));
+  const VW = vbW(S);
+  const BH = Math.max(2, Math.round(BW * VB_H / VW));
   const stride = gN + 1, NV = stride * stride, NP = BW * BH;
   const GX = new Float64Array(NV), GY = new Float64Array(NV);
   const SX = new Float64Array(NV), SY = new Float64Array(NV), QW = new Float64Array(NV);
@@ -1094,12 +1160,19 @@ function rasterizeSurface(S, fit, gN, BW, lift = true, gapVB = 0) {
     const [sx, sy, dp] = penProject(gx, gy, gz, S, fit);
     const q = j * stride + i;
     GX[q] = gx; GY[q] = gy;
-    SX[q] = (sx / VB_W) * BW; SY[q] = (sy / VB_H) * BH;
+    SX[q] = (sx / VW) * BW; SY[q] = (sy / VB_H) * BH;
     QW[q] = dp > 1e-6 ? 1 / dp : 0;      // 1/depth: the perspective divide
   }
   const zb = new Float64Array(NP).fill(Infinity);
   const GI = new Float32Array(NP), GJ = new Float32Array(NP);
   const cov = new Uint8Array(NP), occ = new Uint8Array(NP);
+  // Which interpolation each grid coordinate wants is a question about the
+  // camera. Under perspective both are projective in screen space, so both
+  // need the 1/depth weighting. The wide camera's screen x is AFFINE in gx —
+  // the scan carries the column, not a divide — so its grid i is an exact
+  // linear function of screen x, and dividing it through depth as well would
+  // bend it back the wrong way across any cell that spans depth.
+  const affineX = isWide(S);
   const tri = (a, b, c) => {
     const q0 = QW[a], q1 = QW[b], q2 = QW[c];
     if (!q0 || !q1 || !q2) return;                 // vertex at/behind the eye
@@ -1128,7 +1201,8 @@ function rasterizeSurface(S, fit, gN, BW, lift = true, gapVB = 0) {
         // other water, which is what makes it part of an occluding sheet
         if (prev < Infinity && z < prev * CREST_MARGIN) occ[p] = 1;
         zb[p] = z;
-        GI[p] = (w0 * q0 * ia + w1 * q1 * ib + w2 * q2 * ic) / iw;
+        GI[p] = affineX ? w0 * ia + w1 * ib + w2 * ic
+                        : (w0 * q0 * ia + w1 * q1 * ib + w2 * q2 * ic) / iw;
         GJ[p] = (w0 * q0 * ja + w1 * q1 * jb + w2 * q2 * jc) / iw;
         cov[p] = 1;
       } else if (z > prev * CREST_MARGIN_INV) {
@@ -1162,9 +1236,9 @@ function rasterizeSurface(S, fit, gN, BW, lift = true, gapVB = 0) {
   // the same setting draws the same gap whatever raster the picture is traced
   // on — the export retrace stays the picture the preview showed.
   const gap = occluding && gapVB > 0
-    ? crestGapField(SX, SY, QW, gN, stride, zb, BW, BH, (gapVB * BW) / VB_W, tmp)
+    ? crestGapField(SX, SY, QW, gN, stride, zb, BW, BH, (gapVB * BW) / VW, tmp)
     : null;
-  return { BW, BH, NP, stride, GX, GY, GI, GJ, cov, sil, crest, gap };
+  return { BW, BH, NP, stride, GX, GY, GI, GJ, cov, sil, crest, gap, vw: VW };
 }
 
 // ---- crest seams ---------------------------------------------------
@@ -1527,7 +1601,7 @@ function contourRegion(R, field, t, iters, buf) {
     buf[p] = b;
   }
   const multi = d3.contours().size([BW, BH]).thresholds([0])(buf)[0];
-  return contourToScreenPath(multi, BW, BH, iters);
+  return contourToScreenPath(multi, BW, BH, iters, 0, R.vw);
 }
 
 // The crest gaps as one path: the band on the far side of every visible crest,
@@ -1540,7 +1614,7 @@ function gapRegion(R, iters, buf) {
   const { NP, BW, BH, sil, gap } = R;
   for (let p = 0; p < NP; p++) { const s = sil[p], g = gap[p]; buf[p] = g < s ? g : s; }
   const multi = d3.contours().size([BW, BH]).thresholds([0])(buf)[0];
-  return contourToScreenPath(multi, BW, BH, iters);
+  return contourToScreenPath(multi, BW, BH, iters, 0, R.vw);
 }
 
 // Preset / 1D path: one continuous scalar (the reflected elevation), contoured
@@ -1641,7 +1715,7 @@ function buildSurface3DPanorama(S, fit, opts) {
       buf[p] = b;
     }
     const multi = d3.contours().size([BW, BH]).thresholds([0])(buf)[0];
-    layers[k] = { d: contourToScreenPath(multi, BW, BH, iters), color: colorOf[order[k]] };
+    layers[k] = { d: contourToScreenPath(multi, BW, BH, iters, 0, R.vw), color: colorOf[order[k]] };
   });
 
   let fres = null;
@@ -1688,13 +1762,14 @@ function buildPenConcentric(S, fit, colorAt, opts) {
     let id = cmap.get(c); if (id === undefined) { id = palette.length; cmap.set(c, id); palette.push(c); }
     idxField[j * nx + i] = id;
   }
-  const BW = 340, BH = Math.max(2, Math.round(BW * VB_H / VB_W));
+  const VW = vbW(S);
+  const BW = 340, BH = Math.max(2, Math.round(BW * VB_H / VW));
   const zbuf = hidden ? buildDepthBuffer(S, fit, relief, threeD, BW, BH) : null;
   let bias = 0;
   if (zbuf) { let mn = Infinity, mx = -Infinity; for (const v of zbuf) if (isFinite(v)) { if (v < mn) mn = v; if (v > mx) mx = v; } bias = ((mx - mn) || 1) * 0.02; }
   const visAt = (sx, sy, depth) => {
     if (!zbuf) return true;
-    const bx = Math.round(sx / VB_W * BW), by = Math.round(sy / VB_H * BH);
+    const bx = Math.round(sx / VW * BW), by = Math.round(sy / VB_H * BH);
     if (bx < 0 || bx >= BW || by < 0 || by >= BH) return true;
     return depth - bias <= zbuf[by * BW + bx];
   };
@@ -1926,7 +2001,7 @@ function buildPenHatch(S, fit, colorAt, opts) {
     return s;
   };
 
-  const kx = VB_W / BW, ky = VB_H / BH;
+  const kx = vbW(S) / BW, ky = VB_H / BH;
   const byColor = new Map();
   const add = (color, sub) => { const a = byColor.get(color) || []; a.push(sub); byColor.set(color, a); };
   // Two decimals, as elsewhere in the export: a stroke is often only a couple
@@ -2127,10 +2202,10 @@ const PNG_DEFAULT = 2;     // 4x — 3040 x 2000
 // top step above sits just under the cap at the current frame; the clamp is
 // what keeps that true if the frame ever changes shape.
 const PNG_MAX_PIXELS = 16.5e6;
-function pngSize(scale) {
-  const s = Math.min(scale, Math.sqrt(PNG_MAX_PIXELS / (VB_W * VB_H)));
+function pngSize(scale, W = VB_W) {
+  const s = Math.min(scale, Math.sqrt(PNG_MAX_PIXELS / (W * VB_H)));
   // floor, not round: rounding a clamped scale can land a pixel over the cap
-  return { w: Math.floor(VB_W * s), h: Math.floor(VB_H * s), capped: s < scale - 1e-9 };
+  return { w: Math.floor(W * s), h: Math.floor(VB_H * s), capped: s < scale - 1e-9 };
 }
 
 // An <img> needs the markup to state its own pixel size: a viewBox alone leaves
@@ -2653,9 +2728,10 @@ function buildSegmentation(S, env2d, azSpan) {
 // exported for tests: the two render paths plus the helpers needed to feed
 // them, so 1D/2D fidelity parity can be checked without mounting the UI
 export {
+  VB_W, VB_H,
   buildGeometry, buildSegmentation, envFromRows, stampObjects,
   paletteStops, paletteColorAt, DERIVED_ENV_H, ENV2D_W, DEFAULT_EMITTERS,
-  computeFit, cell2ground, heightAt, clampLift, penProject, reflectAt, magFrac,
+  computeFit, cell2ground, heightAt, clampLift, rawProject, penProject, reflectAt, magFrac,
   withWakes, newWake, WAKE_ANGLE_DEG, prepField, slopeAt,
   buildSurface3D, buildSurface3DPanorama, buildSolid3D, crestField,
   buildPenLines, buildPenConcentric, buildPenHatch, HATCH_AIMS,
@@ -2889,7 +2965,7 @@ function buildPaperImage(S, fit, opts) {
   // posterize to a buyable number of papers (see PAPER_MAX_COLORS)
   const q = maxColors ? reducePaperPalette(palette, counts, maxColors, bgId) : null;
   if (q) for (let p = 0; p < NP; p++) grid[p] = q.map(grid[p]);
-  return { W: R.BW, H: R.BH, grid, palette };
+  return { W: R.BW, H: R.BH, grid, palette, vw: R.vw };
 }
 
 // full pipeline: color image (+ palette id->hex) -> ordered sheets with paths.
@@ -3011,7 +3087,7 @@ function buildPaperStack(image, bgColor, opts = {}) {
         }
       }
       const cont = d3.contours().size([px, py]).thresholds([0])(FP)[0];
-      if (cont) d = contourToScreenPath(cont, W, H, iters, -1);
+      if (cont) d = contourToScreenPath(cont, W, H, iters, -1, image.vw || VB_W);
     }
     out.push({ color: sh.color, d, frame: !!sh.frame, solid });
   }
@@ -3021,15 +3097,15 @@ function buildPaperStack(image, bgColor, opts = {}) {
 // tile the sheets into one printable SVG: each is the full viewport in its
 // paper color with the holes shown as a hatched "cut" fill and a dashed cut
 // line. Listed top -> bottom (assemble the stack bottom -> top).
-function buildPaperStackSvg(stack, rollTf) {
+function buildPaperStackSvg(stack, rollTf, VW = VB_W) {
   const sheets = stack.sheets, N = sheets.length;
   const cols = Math.min(4, Math.max(1, N));
   const rows = Math.ceil(N / cols);
-  const tileW = 240, tileH = Math.round(tileW * VB_H / VB_W);
+  const tileW = 240, tileH = Math.round(tileW * VB_H / VW);
   const labelH = 26, gap = 18, pad = 20, top = 46;
   const W = pad * 2 + cols * tileW + (cols - 1) * gap;
   const H = top + pad + rows * (tileH + labelH) + (rows - 1) * gap;
-  const sx = tileW / VB_W;
+  const sx = tileW / VW;
   const ord = stack.method === "optimal" ? "provably fewest" : "greedy order";
   let body = `<text x="${pad}" y="26" font-family="ui-monospace,monospace" font-size="15" fill="#e6eef5">`
     + `Layered paper stack · ${N} sheets (${ord}) · top → bottom (assemble bottom → top)</text>`;
@@ -3422,6 +3498,12 @@ export default function App() {
   const [bands, setBands] = useState(9);
   const [palette, setPalette] = useState("Sunset Lake");
   const [perspective, setPerspective] = useState(true);
+  // wide ("scan") camera — see wideScale(): the vantage point slides along x
+  const [wideCam, setWideCam] = useState(false);
+  // the frame's own width in viewBox units (its height is always VB_H), which
+  // is what lets a wide scene come out as a wide FILE rather than a wide scene
+  // squeezed into a 3:2 one
+  const [frameW, setFrameW] = useState(VB_W);
   const [rectOutput, setRectOutput] = useState(false);
   const [surface3d, setSurface3d] = useState(true); // lift color regions onto the waves
   const [waveScale, setWaveScale] = useState(8);     // 3D wave-height exaggeration
@@ -3568,6 +3650,7 @@ export default function App() {
     wavelength: [wavelength, setWavelength], strength: [strength, setStrength],
     sharp: [sharp, setSharp], spread: [spread, setSpread], bands: [bands, setBands],
     palette: [palette, setPalette], perspective: [perspective, setPerspective],
+    wide: [wideCam, setWideCam], frameW: [frameW, setFrameW],
     rectOutput: [rectOutput, setRectOutput], surface3d: [surface3d, setSurface3d],
     waveScale: [waveScale, setWaveScale], edges: [edges, setEdges],
     crestGap: [crestGap, setCrestGap], crestGapColor: [crestGapColor, setCrestGapColor],
@@ -3738,11 +3821,24 @@ export default function App() {
   // animation frame) does far less contour work.
   const effQuality = lowPower ? Math.min(quality, 70) : quality;
   // low power pins the 3D pass to "draft" — the battery saver has the last word
-  const rasterLevel = RASTER_LEVELS[
+  const rasterLevel0 = RASTER_LEVELS[
     Math.max(0, Math.min(RASTER_LEVELS.length - 1, lowPower ? 0 : rasterQ))];
+  // …and so does the raster the regions are contoured on: a wider frame is
+  // more picture at the same resolution, not the same picture drawn coarser,
+  // so a raster pixel stays the same size in viewBox units however long the
+  // sheet gets (and costs proportionally more to draw). The mesh does not
+  // stretch with it — see the note on the frame-width slider.
+  const rasterLevel = useMemo(() => (frameW === VB_W ? rasterLevel0 : {
+    ...rasterLevel0,
+    BW: Math.min(EXPORT_MAX_BW, Math.round(rasterLevel0.BW * frameW / VB_W)),
+  }), [rasterLevel0, frameW]);
 
   const S = useMemo(() => ({
-    nx: effQuality, ny: effQuality,
+    // the sample grid is a density, not a count: one more column of frame is
+    // one more column of samples, so a long sheet is sampled as finely as a
+    // short one instead of being stretched over the same grid
+    nx: Math.round(effQuality * frameW / VB_W), ny: effQuality,
+    vbW: frameW,
     xMin: -halfW, xMax: halfW, yMin: Math.min(yNear, yFar - 2), yMax: yFar,
     H: 0.4 * Math.pow(22.5, steep),
     pitch: (pitchDeg * Math.PI) / 180,
@@ -3752,7 +3848,7 @@ export default function App() {
     decay: 0.18 - spread * 0.16,
     omega: 1.0,
     t: animate ? tRef.current : manualTime,
-    bands, perspective, eLo, eHi, zoom, panX, panY, smooth, coherence, rectOutput,
+    bands, perspective, wide: wideCam, eLo, eHi, zoom, panX, panY, smooth, coherence, rectOutput,
     surface3d, waveScale, bandFractions, fresOn, fresBands, reflMag,
     // waves scatter off the buoy's hull: a ring source pinned to the object,
     // with a tight decay so the disturbance stays local
@@ -3760,7 +3856,7 @@ export default function App() {
       ? [...emitters, { id: "buoy", on: true, type: "point", x: objX, y: objY,
           size: Math.max(0.3, objSize * objRippleScale), amp: objRipple * 1.5, decay: 0.28 }]
       : emitters, wakes),
-  }), [effQuality, steep, pitchDeg, wavelength, strength, sharp, spread, bands, perspective,
+  }), [effQuality, frameW, steep, pitchDeg, wavelength, strength, sharp, spread, bands, perspective, wideCam,
        halfW, yNear, yFar, eLo, eHi, zoom, panX, panY, smooth, coherence, rectOutput, surface3d, waveScale,
        bandFractions, fresOn, fresBands, reflMag,
        emitters, wakes, animate, speed, tRef.current, manualTime,
@@ -3819,7 +3915,7 @@ export default function App() {
   const fresIdx = useMemo(
     () => (fresOn && fresPaths ? d3.range(fresBands) : [0]),
     [fresOn, fresPaths, fresBands]);
-  const rollTf = rollTransform(rollDeg);
+  const rollTf = rollTransform(rollDeg, frameW);
 
   const regionCount = (use2d ? seg.count : layers.length + 1) * fresIdx.length;
 
@@ -4025,14 +4121,14 @@ export default function App() {
     const buoyStr = buoy ? buoySvg(buoy, buoyShade) : "";
     const rollOpen = rollTf ? `<g transform="${rollTf}">` : `<g>`;
     if (penMode) {
-      let body = `<rect width="${VB_W}" height="${VB_H}" fill="${bgFill}"/>` + rollOpen;
+      let body = `<rect width="${frameW}" height="${VB_H}" fill="${bgFill}"/>` + rollOpen;
       penLines.forEach((l) => {
         body += `<path d="${l.d}" fill="none" stroke="${l.color}" stroke-width="${penWidth}" stroke-linecap="round" stroke-linejoin="round"/>`;
       });
       body += buoyStr + `</g>`;
-      return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${VB_W} ${VB_H}">${body}</svg>`;
+      return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${frameW} ${VB_H}">${body}</svg>`;
     }
-    let body = `<rect width="${VB_W}" height="${VB_H}" fill="${bgFill}"/>` + rollOpen;
+    let body = `<rect width="${frameW}" height="${VB_H}" fill="${bgFill}"/>` + rollOpen;
     const stroke = edges ? ` stroke="#000" stroke-opacity="0.25" stroke-width="0.6"` : "";
     let defs = "";
     if (fresOn && svgFres) svgFres.forEach((d, i) => {
@@ -4048,7 +4144,7 @@ export default function App() {
         body += bandOpen(b);
         seg.rows.forEach((row, ri) => {
           let g = row.clip ? `<g clip-path="url(#el${ri})">` : `<g>`;
-          if (row.base) g += `<rect width="${VB_W}" height="${VB_H}" fill="${mixDeep(row.base, b)}"/>`;
+          if (row.base) g += `<rect width="${frameW}" height="${VB_H}" fill="${mixDeep(row.base, b)}"/>`;
           row.az.forEach((a) => { g += `<path d="${a.d}" fill="${mixDeep(a.color, b)}" fill-rule="evenodd"${stroke}/>`; });
           if (edges && row.clip) g += `<path d="${row.clip}" fill="none"${stroke}/>`;
           g += `</g>`;
@@ -4057,7 +4153,7 @@ export default function App() {
         body += `</g>`;
       });
       body += buoyStr + `</g>`;
-      return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${VB_W} ${VB_H}"><defs>${defs}</defs>${body}</svg>`;
+      return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${frameW} ${VB_H}"><defs>${defs}</defs>${body}</svg>`;
     }
     // layered paths, preset & 2D alike. With Fresnel on, the geometry is
     // shared via <use> so each depth band re-colors the same paths.
@@ -4071,7 +4167,7 @@ export default function App() {
     fresIdx.forEach((b) => {
       if (b > 0 && !svgFres[b - 1]) return;
       body += bandOpen(b);
-      if (b > 0) body += `<rect width="${VB_W}" height="${VB_H}" fill="${mixDeep(svgBg, b)}"/>`;
+      if (b > 0) body += `<rect width="${frameW}" height="${VB_H}" fill="${mixDeep(svgBg, b)}"/>`;
       svgLayers.forEach((l, i) => {
         body += fresOn
           ? `<use href="#lyr${i}" fill="${mixDeep(l.color, b)}" fill-rule="evenodd"${stroke}/>`
@@ -4081,7 +4177,7 @@ export default function App() {
     });
     if (svgGap) body += `<path d="${svgGap}" fill="${gapFill}" fill-rule="evenodd"/>`;
     body += `</g>` + buoyStr + `</g>`;
-    return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${VB_W} ${VB_H}">${defs ? `<defs>${defs}</defs>` : ""}${body}</svg>`;
+    return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${frameW} ${VB_H}">${defs ? `<defs>${defs}</defs>` : ""}${body}</svg>`;
   };
   const saveBlob = (blob, name) => {
     try {
@@ -4140,7 +4236,7 @@ export default function App() {
   // needed — and deliberately skips the mesh and polish steps, which change the
   // picture to protect a vector edge this file does not have. Same pause as the
   // SVG export when a retrace is involved, then one async rasterize.
-  const pngAt = pngSize(PNG_SCALES[Math.max(0, Math.min(PNG_SCALES.length - 1, pngQ))]);
+  const pngAt = pngSize(PNG_SCALES[Math.max(0, Math.min(PNG_SCALES.length - 1, pngQ))], frameW);
   const pngRetrace = solid3d && exportMult > 1;
   const pngGeom = pngRetrace
     ? { ...exportRaster(rasterLevel, exportMult), polish: 0, gap: crestGap } : null;
@@ -4186,7 +4282,7 @@ export default function App() {
   // render's closures, so moving a slider mid-export changes the next export,
   // never the frames still to come in this one.
   const vidAt = videoSize(VIDEO_SCALES[Math.max(0, Math.min(VIDEO_SCALES.length - 1, vidQ))],
-    VB_W, VB_H);
+    frameW, VB_H);
   const vidPlan = framePlan(vidSec, speed);
   const showVid = (blob, name, plan, out) => {
     let url = null;
@@ -4254,7 +4350,7 @@ export default function App() {
       ...fieldSpec,
     });
     const stack = buildPaperStack(image, bgFill, { iters: S.smooth || 0 });
-    const svg = buildPaperStackSvg(stack, rollTf);
+    const svg = buildPaperStackSvg(stack, rollTf, frameW);
     saveSvg(svg, "reflection-paper-stack.svg");
     setSvgName("reflection-paper-stack.svg");
     setStackInfo({ nSheets: stack.nSheets, method: stack.method });
@@ -4327,8 +4423,8 @@ export default function App() {
             touchAction: camDrag ? "none" : undefined,
             cursor: camDrag ? "grab" : undefined,
             boxShadow: "0 8px 24px rgba(0,0,0,0.55)" }}>
-            <svg viewBox={`0 0 ${VB_W} ${VB_H}`} style={{ width: "100%", display: "block" }}>
-              <rect width={VB_W} height={VB_H} fill={bgFill} />
+            <svg viewBox={`0 0 ${frameW} ${VB_H}`} style={{ width: "100%", display: "block" }}>
+              <rect width={frameW} height={VB_H} fill={bgFill} />
               <g transform={rollTf || undefined}>
               {penMode ? (
                 penLines.map((l, i) => (
@@ -4349,7 +4445,7 @@ export default function App() {
                     <g key={`fb${b}`} clipPath={b > 0 ? `url(#fres${b})` : undefined}>
                       {seg.rows.map((row, ri) => (
                         <g key={ri} clipPath={row.clip ? `url(#el${ri})` : undefined}>
-                          {row.base && <rect width={VB_W} height={VB_H} fill={mixDeep(row.base, b)} />}
+                          {row.base && <rect width={frameW} height={VB_H} fill={mixDeep(row.base, b)} />}
                           {row.az.map((a, ai) => (
                             <path key={ai} d={a.d} fill={mixDeep(a.color, b)} fillRule="evenodd" />
                           ))}
@@ -4378,7 +4474,7 @@ export default function App() {
                   <g clipPath={use2d && !surface3d ? "url(#watertrap)" : undefined} opacity={0.999}>
                     {fresIdx.map((b) => (b > 0 && !drawFres[b - 1]) ? null : (
                       <g key={`fb${b}`} clipPath={b > 0 ? `url(#fres${b})` : undefined}>
-                        {b > 0 && <rect width={VB_W} height={VB_H} fill={mixDeep(drawBg, b)} />}
+                        {b > 0 && <rect width={frameW} height={VB_H} fill={mixDeep(drawBg, b)} />}
                         {drawLayers.map((l, i) => fresOn ? (
                           <use key={i} href={`#lyr${i}`} fill={mixDeep(l.color, b)} fillRule="evenodd"
                             stroke={edges ? "#000" : "none"} strokeOpacity={edges ? 0.28 : 0}
@@ -4429,7 +4525,7 @@ export default function App() {
               color: "#6d808f", fontFamily: "ui-monospace, monospace", letterSpacing: 0.5 }}>
               {penMode ? `${penStyle === "rings" ? "rings" : penStyle === "hatch" ? `hatch ${penHatchAngle}\u00b0\u00b1${penHatchSpread}\u00b0` : penCount + " lines"} · ${penLines.length} pens${S.perspective && penRelief > 0 ? " · 3D" : ""}${penHidden || penStyle === "hatch" ? " · hidden-line" : ""}`
                 : solid3d ? `${drawLayers.length + 1} regions · ${S.nx}×${S.ny} sample grid · 3D ${rasterLevel.name} ${rasterLevel.BW}px`
-                : `${regionCount} regions · ${S.nx}×${S.ny} sample grid${surface3d && perspective ? " · 3D" : ""}`}
+                : `${regionCount} regions · ${S.nx}×${S.ny} sample grid${surface3d && perspective ? " · 3D" : ""}`}{wideCam && perspective ? " · wide" : ""}
             </div>
             <button onClick={() => setCamDrag((v) => !v)}
               onPointerDown={(e) => e.stopPropagation()}
@@ -4452,6 +4548,31 @@ export default function App() {
               {perspective && (
                 <Slider label="Pitch (perspective squash)" value={pitchDeg} min={4} max={80} step={0.5}
                   onChange={setPitchDeg} fmt={(v) => v.toFixed(1) + "°"} />
+              )}
+              {perspective && (
+                <>
+                  <Toggle label="Wide (scan) camera" value={wideCam} onChange={setWideCam} />
+                  <div style={{ fontSize: 9.5, color: "#6d808f", marginTop: -4, marginBottom: 8,
+                    lineHeight: 1.5, fontFamily: "ui-monospace, monospace" }}>
+                    {wideCam
+                      ? "The eye slides sideways instead of staring from one spot: every point is seen head-on, from its own distance. No lateral convergence — the water fills a rectangle, and the far left and right read like the middle however wide the plane gets. Depth is unchanged. A scan has no fixed horizontal scale, so \"Rectangular output\" below is free here: filling the sheet sideways is a scan rate, not a stretch."
+                      : "For very wide prints: drops the single vantage point so the edges of a wide plane stop being seen edge-on. Then take Plane width as far as you like."}
+                  </div>
+                </>
+              )}
+              <Slider label="Frame width (print shape)" value={frameW} min={VB_W} max={4000} step={20}
+                onChange={setFrameW}
+                fmt={(v) => `${(v / VB_H).toFixed(2)}:1` + (v === VB_W ? " (default)" : "")} />
+              {frameW !== VB_W && (
+                <div style={{ fontSize: 9.5, color: "#6d808f", marginTop: -4, marginBottom: 8,
+                  lineHeight: 1.5, fontFamily: "ui-monospace, monospace" }}>
+                  A longer sheet at the same height: sample grid and raster grow
+                  with it, so the picture is not stretched and the edges stay as
+                  fine — it just costs proportionally more to draw. The 3D wave
+                  mesh is the one thing that does not grow with it, so on a very
+                  long sheet the crests are the coarse part, not the outlines.
+                  {!wideCam && perspective ? " Without the wide camera the extra width is mostly the near edge fanning out." : ""}
+                </div>
               )}
               <Slider label="Roll" value={rollDeg} min={-30} max={30} step={0.5}
                 onChange={setRollDeg} fmt={(v) => (v === 0 ? "level" : v.toFixed(1) + "°")} />
@@ -4493,7 +4614,11 @@ export default function App() {
                 fmt={(v) => (v === 0 ? "sine (soft)" : v < 0.35 ? "gentle" : v < 0.6 ? "peaked" : "steep")} />
               <Slider label="Spread / reach" value={spread} min={0} max={1} step={0.01}
                 onChange={setSpread} fmt={(v) => (v < 0.4 ? "tight" : v < 0.75 ? "medium" : "wide")} />
-              <Slider label="Plane width" value={halfW} min={2} max={40} step={1}
+              {/* the wide camera is the whole point of a very wide plane, so it
+                  gets the long slider; a one-vantage-point scene past ~80 units
+                  across is all edge-on water at the sides */}
+              <Slider label="Plane width" value={halfW} min={2}
+                max={wideCam && perspective ? 200 : Math.max(40, halfW)} step={1}
                 onChange={setHalfW} fmt={(v) => v * 2 + " units"} />
             </div>
 
@@ -5191,7 +5316,7 @@ export default function App() {
               <Slider label="PNG size" value={pngQ} min={0} max={PNG_SCALES.length - 1}
                 step={1} onChange={setPngQ}
                 fmt={(v) => {
-                  const sz = pngSize(PNG_SCALES[v]);
+                  const sz = pngSize(PNG_SCALES[v], frameW);
                   return `${sz.w} \u00d7 ${sz.h}` + (sz.capped ? " (capped)" : "");
                 }} />
             </div>
@@ -5270,7 +5395,7 @@ export default function App() {
               <Slider label="video size" value={vidQ} min={0} max={VIDEO_SCALES.length - 1}
                 step={1} onChange={setVidQ}
                 fmt={(v) => {
-                  const sz = videoSize(VIDEO_SCALES[v], VB_W, VB_H);
+                  const sz = videoSize(VIDEO_SCALES[v], frameW, VB_H);
                   return `${sz.w} \u00d7 ${sz.h}`;
                 }} />
             </div>

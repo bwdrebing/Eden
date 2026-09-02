@@ -16,7 +16,7 @@
 //  if the component starts deriving S differently this needs the same edit —
 //  the fixture test will keep rendering, just not the scene you meant.
 // ------------------------------------------------------------------ //
-import { reflectAt, buildGeometry, computeFit, withWakes } from "./WaterReflectionContours";
+import { reflectAt, buildGeometry, computeFit, withWakes, VB_W } from "./WaterReflectionContours";
 
 export const GRAZING_RIPPLES = {
     "steep": 0.81,
@@ -436,8 +436,9 @@ export const HARBOR_WAKE = {
 export function buildScene(settings) {
   const g = settings;
   const runs = envRuns(g.envColors);
+  const vbWidth = g.frameW || VB_W;
   const S = {
-    nx: g.quality, ny: g.quality,
+    nx: Math.round(g.quality * vbWidth / VB_W), ny: g.quality, vbW: vbWidth,
     xMin: -g.halfW, xMax: g.halfW,
     yMin: Math.min(g.yNear, g.yFar - 2), yMax: g.yFar,
     H: 0.4 * Math.pow(22.5, g.steep),
@@ -447,7 +448,7 @@ export function buildScene(settings) {
     sharp: g.sharp,
     decay: 0.18 - g.spread * 0.16,
     omega: 1.0, t: g.manualTime,
-    bands: g.bands, perspective: g.perspective, eLo: g.eLo, eHi: g.eHi,
+    bands: g.bands, perspective: g.perspective, wide: g.wide, eLo: g.eLo, eHi: g.eHi,
     zoom: g.zoom, panX: g.panX, panY: g.panY, smooth: g.smooth,
     coherence: g.coherence, rectOutput: g.rectOutput,
     surface3d: g.surface3d, waveScale: g.waveScale,
