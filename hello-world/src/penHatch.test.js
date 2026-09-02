@@ -121,7 +121,9 @@ test("closer spacing lays down more ink, tone re-weights it by color", () => {
 }, 240000);
 
 test("the studio wires the hatched style up end to end", () => {
-  const saved = { reflection: { ...GRAZING_RIPPLES, quality: 70, penMode: true, penStyle: "hatch", rasterQ: 0 } };
+  // uiTab rides in the saved scene like any other setting — landing on the
+  // Style workspace is itself part of the wiring under test
+  const saved = { reflection: { ...GRAZING_RIPPLES, quality: 70, penMode: true, penStyle: "hatch", rasterQ: 0, uiTab: "style" } };
   const bytes = new TextEncoder().encode(JSON.stringify(saved));
   let bin = ""; for (const b of bytes) bin += String.fromCharCode(b);
   const hash = btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");

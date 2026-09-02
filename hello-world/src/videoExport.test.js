@@ -252,6 +252,7 @@ test("the export offers a length and says what it will cost, and jsdom cannot en
   expect(videoSupported()).toBe(false);            // no WebCodecs here
 
   render(<App />);
+  fireEvent.click(screen.getByRole("tab", { name: /output/i }));
   expect(screen.getByText(/3\.0 s · 60 frames/)).toBeInTheDocument();
   expect(screen.getByText(/1140 × 750/)).toBeInTheDocument();
 
