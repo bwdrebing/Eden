@@ -25,6 +25,24 @@ jobs:
           cache: 'npm'
           cache-dependency-path: hello-world/package-lock.json
 
+      - name: Install dependencies
+        if: github.event.action != 'closed'
+        working-directory: hello-world
+        run: npm ci
+
+      - name: Build
+        if: github.event.action != 'closed'
+        working-directory: hello-world
+        run: npm run build
+        env:
+          # package.json pins homepage to the production GitHub Pages URL. A
+          # preview is served from a per-PR surge.sh domain instead, so build
+          # relative asset paths rather than absolute ones.
+          PUBLIC_URL: '.'
+          # Matches deploy.yml: one pre-existing lint warning fails the build
+          # under CI=true.
+          CI: 'false'
+
       - uses: afc163/surge-preview@v1
         with:
           surge_token: ${{ secrets.SURGE_TOKEN }}
@@ -32,7 +50,9 @@ jobs:
           dist: hello-world/build
           teardown: 'true'
           failOnError: 'true'
-          build: |
-            cd hello-world
-            npm ci
-            PUBLIC_URL=. CI=false npm run build
+          # The build ran in the steps above. This has to stay a real
+          # executable: the action runs each line directly rather than
+          # through a shell, and leaving it empty makes it fall back to
+          # npm install && npm run build at the repo root, which has no
+          # package.json.
+          build: echo "Build completed in a previous step"
