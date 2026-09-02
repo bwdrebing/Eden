@@ -256,6 +256,7 @@ describe("the wakes panel", () => {
   // actually reaches S, which is the half a saved scene depends on.
   test("adding a wake puts one in the studio and in the URL", async () => {
     render(<App />);
+    fireEvent.click(screen.getByRole("tab", { name: /objects/i }));
     fireEvent.click(screen.getByRole("button", { name: /add wake/i }));
     expect(screen.getByText("WAKE 1")).toBeInTheDocument();
     expect(screen.getByText(/scale \(vessel length\)/i)).toBeInTheDocument();

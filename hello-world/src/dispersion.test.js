@@ -246,7 +246,8 @@ describe("the studio", () => {
     expect(DISPERSION_DEFAULT).toBe(true);
     window.history.replaceState(null, "", "/");
     render(<App />);
-    fireEvent.click(screen.getByText(/\+ advanced/));
+    // the emitter cards live in the Waves workspace, with the wave controls
+    fireEvent.click(screen.getByRole("tab", { name: /waves/i }));
     expect(screen.getAllByText(ON).length).toBe(3);       // one per emitter
     expect(screen.getAllByText(RATE_ON).length).toBe(3);
     expect(screen.queryByText(RATE_OFF)).toBeNull();
@@ -265,6 +266,7 @@ describe("the studio", () => {
       .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
     window.history.replaceState(null, "", "/?s=" + b64);
     render(<App />);
+    fireEvent.click(screen.getByRole("tab", { name: /waves/i }));
     expect(screen.getAllByText(RATE_OFF).length).toBe(3);
     expect(screen.queryByText(ON)).toBeNull();
     // and reopening it writes the choice down, so the link stops being

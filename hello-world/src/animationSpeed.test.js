@@ -113,6 +113,8 @@ test("the speed control is reachable whether or not the preview is animating", (
   // and scrubbing to a frozen moment is still offered alongside it
   expect(screen.getByLabelText(/Time \(wave phase\)/)).toBeInTheDocument();
 
-  fireEvent.click(screen.getByText(/Animate ripples/));
+  // the animation is started from the transport docked under the preview, and
+  // the rate stays put across the switch — only the scrub drops away
+  fireEvent.click(screen.getByTitle(/animate the ripples/));
   expect(screen.getByLabelText(/^Speed/)).toBeInTheDocument();
 }, 120000);

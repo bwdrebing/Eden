@@ -14,6 +14,7 @@ import App from "./App";
 
 test("Export SVG retraces at the export raster, then hands back a file", async () => {
   render(<App />);
+  fireEvent.click(screen.getByRole("tab", { name: /output/i }));
 
   // the controls default to 2x the preview's raster ("normal" -> 880px) and to
   // the preview's own mesh — a faithful file unless asked otherwise
