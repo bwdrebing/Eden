@@ -87,6 +87,20 @@ scaled inside a fixed-size `<div>` gives a zoomed crop to screenshot.
   scene. Frames are built on the preview's own raster and mesh (no polish, no
   export retrace), for the same reason the PNG is: fidelity to what was on
   screen. `videoExport.js` drives WebCodecs, `mp4.js` is the container.
+  `frameAt` is async: its 3D-solid pass goes through the worker below.
+- **The 3D-solid pass runs in a Web Worker in the browser** (`solidWorker.js`,
+  reached through `solidBuilder.js`) and inline in tests, where jsdom has no
+  workers and `package.json` maps the worker factory to a stub. The preview
+  keeps the last finished picture, marked "rendering…", until the next one
+  lands, and only the newest request waits; while animating, the phase
+  advances once per delivered frame. The worker gets the scene `S` and the
+  field-spec options as plain data and rebuilds the spec with `fieldSpecFor`,
+  so nothing a builder needs may be a closure, a DOM object or module state —
+  it would not survive the crossing, and the worker result would silently
+  differ from an inline build. In 3D-solid and pen modes the flat builders
+  (`buildGeometry`, `buildSegmentation`) do not run at all: nothing drawn
+  comes from them there, and `elevationRange` supplies the two numbers
+  auto-fit reads.
 - The 1D/preset path and the 2D panorama path are separate builders
   (`buildSurface3D`, `buildSurface3DPanorama`) that must stay in step. A new
   option on one usually belongs on the other; `buildSolid3D` is where both are
