@@ -38,9 +38,18 @@ looks fine on an invented test scene can still wreck this one.
 So, for any change to the contouring, rasterizing, projection or export path:
 
 1. Run `src/sceneFixture.test.js` — the smoke test over that scene.
-2. **Look at it**, do not only assert on it. Render it at a real raster
-   (`RASTER_LEVELS[5]`, plus whatever export step is in play), write the layers
-   to an `.svg`, and open it — zoomed well past 1:1, into the top of the frame.
+2. **Look at it**, do not only assert on it. `src/renderFixture.js` writes the
+   scene to an `.svg` at whatever raster and polish you ask for; the harness
+   beside it runs from the test runner, and is skipped unless you name a file:
+
+   ```
+   EDEN_RENDER=/tmp/after.svg CI=true npx react-scripts test \
+     --watchAll=false --testPathPattern renderFixture
+   ```
+
+   `EDEN_LEVEL` picks the raster (0–5, default `RASTER_LEVELS[5]`),
+   `EDEN_POLISH` the export edge polish, `EDEN_MOOD` swaps in one of the water
+   presets. Then open it — zoomed well past 1:1, into the top of the frame.
    Most of what matters here is only visible at 8–24× on a far edge, and no
    assertion in this repo catches it.
 3. Compare before and after at the same crop. A change that trades detail for
@@ -51,6 +60,19 @@ scaled inside a fixed-size `<div>` gives a zoomed crop to screenshot.
 
 ## Things worth knowing before changing the renderer
 
+- **`sea` is the emitter that makes open water read; `spectrum` is its
+  predecessor.** A spectrum is a ladder of sines with an invented energy law, a
+  fixed heading cone and no variation across the plane — long parallel crests,
+  everywhere the same. A sea draws its amplitudes from a Pierson–Moskowitz /
+  JONSWAP spectrum, spreads headings so crests are short, warps the surface
+  toward its crests (`chop`), and carries two envelopes across the water: gust
+  patches and wave groups. Both envelopes scale the *whole* of one emitter —
+  one emitter is one sea. The persistent part of an ocean goes in its own
+  `swell` emitter, where no gust reaches it. Its strength is calibrated on rms
+  *slope*, not height, which is why raising `components` or `fine texture`
+  resolves the field without changing how rough it looks. `WATER_MOODS` are
+  whole emitter stacks tuned together; they are the fastest way to a
+  believable surface, and the fastest way to check one.
 - **The SVG export is the same geometry as the preview**, not a separate render
   — the export path may retrace at a wider raster, but it draws the same
   picture. Keep it that way: a file that does not match what was on screen is a
