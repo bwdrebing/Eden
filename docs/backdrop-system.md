@@ -1,6 +1,7 @@
 # Backdrop system: critique and rearchitecture
 
-Status: proposal. Nothing here is implemented yet.
+Status: phases 0–2 landed; phases 3–6 are still proposals. What each phase
+delivered is noted against it in §5.
 Scope: everything that answers the question *what does the water reflect?* —
 the `preset` / `paint1d` / `paint2d` modes, the reflected-objects catalogue, and
 the elevation/azimuth controls that give them meaning.
@@ -250,7 +251,7 @@ run `src/sceneFixture.test.js`, then render **GRAZING_RIPPLES** at
 `RASTER_LEVELS[5]`, write the layers to `.svg`, and *look at the top of the
 frame at 8–24×* against the same crop before the change.
 
-### Phase 0 — stop the bleeding (~1 day, no new architecture)
+### Phase 0 — stop the bleeding — **landed**
 
 The acute pain, fixed where the code stands today.
 
@@ -263,28 +264,43 @@ The acute pain, fixed where the code stands today.
    band the water can actually reach.
 5. Show `EnvPreview` in both paint modes, not only when an object is on.
 
-### Phase 1 — document and compiler, no UI change (~3–4 days)
+### Phase 1 — document and compiler, no UI change — **landed**
 
 New `src/backdrop/`: `document.js`, `compile.js`, `rasterize.js`, `place.js`.
 Represent today's three modes as documents; `buildSegmentation` and
 `buildSurface3DPanorama` consume compiled regions instead of `env2d`. The
 existing UI writes documents through a thin adapter.
 
-Exit criteria: legacy `?s=` URLs — the fixture URL in `CLAUDE.md` above all —
-open **byte-identical geometry**, proven by a parity test that diffs the emitted
-path data against the pre-change builder.
+Exit criteria met: the saved scene renders a byte-identical 14,478,436-byte SVG
+at `RASTER_LEVELS[5]` across the change, and `backdropParity.test.js` pins a
+painted panorama — bands, a hand-painted blob, two stamped objects with their
+ink rims — against a baseline recorded before the refactor, hashing every
+region's path data. That test is the regression net for phases 3–6.
 
-### Phase 2 — the backdrop in the viewport (~1–2 days)
+### Phase 2 — the backdrop in the viewport — **landed**
 
 Pulled ahead of the editor deliberately: it is cheap once Phase 1 lands, and it
 is the thing that makes every later phase authorable. You cannot tune an
 elevation window you cannot see.
 
-`computeFit` gains optional sky headroom (the horizon sits at
-`ry = −tan(pitch)`, above the water plane's far edge — currently just out of
+`computeFit` gained optional sky headroom (the horizon sits at
+`ry = −tan(pitch)`, above the water plane's far edge — previously just out of
 frame). Screen points above it are inverted to view rays and the same compiled
-flats are contoured through them, so the sky is drawn as flat vector regions in
-the same idiom as the water, not as a bitmap. Toggle: **Show backdrop**.
+regions are contoured through them, so the sky draws as flat vector regions in
+the same idiom as the water, not as a bitmap. Toggle: **Show the backdrop
+itself**.
+
+Two things the implementation found. A painted backdrop goes through its
+regions, but a preset or 1D one bands a single scalar exactly as `buildGeometry`
+does for the water — taking the region path there would mean one contour per
+distinct colour, and a smooth palette has one per row (~60 passes for a picture
+with a dozen visible edges). And the sky needs far less raster than the water:
+it carries no ripple detail, and on a pinhole camera its edges are conics, so
+it is contoured at 300px with one round of corner-cutting rather than the
+water's three.
+
+Not covered: the layered-paper export cuts water only. Pen mode draws no
+backdrop and is not reframed for one.
 
 ### Phase 3 — layers and the repeater (~4–5 days)
 

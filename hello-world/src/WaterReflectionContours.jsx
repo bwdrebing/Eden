@@ -88,6 +88,16 @@ const EMITTER_RATE_DEFAULT = 1;
 
 const VB_W = 760;
 const VB_H = 500;
+// How much sky "Show backdrop" frames, as a fraction of the water's own
+// projected height above the horizon.
+const SKY_PAD = 0.55;
+// Raster the drawn backdrop is contoured on. It carries no ripple detail — its
+// edges are the backdrop's own, and on a pinhole camera they are conics — so
+// it needs far less grid than the water, and one round of corner-cutting
+// rather than the water's three. Both matter: a smooth 1D ramp draws sixty-odd
+// bands up here, and cost is per band.
+const SKY_BW = 300;
+const SKY_SMOOTH = 1;
 
 const DEFAULT_EMITTERS = [
   { id: 1, on: true, type: "swell",    x: 0, y: 20, dir: 65,  size: 3.2, amp: 1.85, spread: 25, roughness: 0.4,  detail: 14 },
@@ -569,6 +579,12 @@ function rawProject(gx, gy, S) {
   return [Xc / Zc, -Yc / Zc];
 }
 
+// The horizon in raw projected coordinates. A view ray at elevation e above
+// the horizon lands at -tan(pitch + e), so e = 0 gives this; it sits ABOVE the
+// water plane's far edge (which is a finite distance out) and, normally, just
+// off the top of the frame.
+function horizonRaw(S) { return -Math.tan(S.pitch); }
+
 function computeFit(S) {
   const corners = [
     [S.xMin, S.yMin], [S.xMax, S.yMin],
@@ -579,6 +595,14 @@ function computeFit(S) {
     const [rx, ry] = rawProject(gx, gy, S);
     minX = Math.min(minX, rx); maxX = Math.max(maxX, rx);
     minY = Math.min(minY, ry); maxY = Math.max(maxY, ry);
+  }
+  // Showing the backdrop means framing sky as well as water: pull the top of
+  // the fitted box up past the horizon by a fraction of the water's own
+  // height. A fraction rather than an elevation, because elevation runs to
+  // infinity on a perspective camera — framing to eHi would squash the water
+  // to a sliver at any normal pitch.
+  if (S.skyPad && S.perspective) {
+    minY = Math.min(minY, horizonRaw(S) - S.skyPad * (maxY - minY));
   }
   const m = 14;
   const baseScale = Math.min((VB_W - 2 * m) / (maxX - minX), (VB_H - 2 * m) / (maxY - minY));
@@ -2301,6 +2325,15 @@ function stampObjects(env, objects, azSpan, eLo, eHi) {
   return { w, h, cells };
 }
 
+// Band boundaries in degrees: the palette's fractions through the
+// reflection-detail window. Shared by the water's own field spec and by the
+// drawn backdrop, so both band at the same elevations.
+function bandThresholds(S, NB) {
+  const mid = (S.eLo + S.eHi) / 2, magSpan = (S.eHi - S.eLo) / (S.reflMag || 1);
+  const bnd = (f) => mid + (f - 0.5) * magSpan;
+  return S.bandFractions ? S.bandFractions.map(bnd) : d3.range(1, NB).map((k) => bnd(k / NB));
+}
+
 // preset palette as ordered elevation bands (for the non-custom path)
 function bandColors(NB, palette) {
   const interp = d3.interpolateRgbBasis(PALETTES[palette]);
@@ -2357,6 +2390,111 @@ function buildGeometry(S) {
     fres = fc.map((c) => multiToPath(c, S, fit));
   }
   return { ds: contours.map((c) => multiToPath(c, S, fit)), fres, lo, hi };
+}
+
+// ---- the backdrop itself, drawn -----------------------------------
+// Everywhere else in this file the backdrop is only ever seen through its
+// reflection, which is why the elevation window is so hard to read: you are
+// tuning a mapping whose input you cannot see. The picture already contains
+// the answer, though — above the horizon the camera looks straight AT the
+// backdrop, and "straight at" is the same query as "reflected onto", with a
+// different ray.
+//
+// So this is the segmentation with one substitution: instead of the reflected
+// direction at a water sample, the view direction at a screen point. Same
+// mapping (backdrop/place.js), same regions, same contour at zero, so the sky
+// comes out as flat vector regions in the same idiom as the water rather than
+// a bitmap pasted behind it.
+//
+// Rays at or below the horizon are marked BELOW_HORIZON, so every contour
+// closes along the horizon line by construction — no separate mask, and the
+// horizon lands exactly where the geometry says it does.
+const BELOW_HORIZON = -1e3;
+// above every marked ray, below every real elevation (which cannot pass -90)
+const SKY_FLOOR = -500;
+
+// Invert the projection over a raster of the frame: screen point -> view ray
+// -> the two angles the backdrop is indexed by.
+function skyRayField(S, fit, BW) {
+  const BH = Math.max(1, Math.round((BW * VB_H) / VB_W));
+  const NP = BW * BH;
+  const phi = new Float64Array(NP), psi = new Float64Array(NP);
+  const sky = new Uint8Array(NP);
+  const sp = Math.sin(S.pitch), cp = Math.cos(S.pitch);
+  const scaleY = fit.scaleY || fit.scale;
+  let any = false;
+  for (let j = 0; j < BH; j++) {
+    const ry = (((j + 0.5) * VB_H) / BH - fit.oy) / scaleY;
+    for (let i = 0; i < BW; i++) {
+      const p = j * BW + i;
+      const rx = (((i + 0.5) * VB_W) / BW - fit.ox) / fit.scale;
+      // camera-space direction (rx, -ry, 1), rotated back out of the camera's
+      // pitch onto world axes
+      const dx = rx, dy = -ry * sp + cp, dz = -ry * cp - sp;
+      if (dz <= 0) { phi[p] = BELOW_HORIZON; continue; }   // the water's half
+      const len = Math.hypot(dx, dy, dz);
+      const a = rayAngles([dx / len, dy / len, dz / len]);
+      phi[p] = a[0]; psi[p] = a[1];
+      sky[p] = 1; any = true;
+    }
+  }
+  return any ? { BW, BH, NP, phi, psi, sky } : null;
+}
+
+// Painted backdrops: one contour per region, through its distance field —
+// the buildSegmentation construction, on view rays.
+function buildSkyRegions(S, fit, backdrop, azSpan, opts = {}) {
+  if (!S.perspective || !backdrop || backdrop.overflow) return null;
+  const R = skyRayField(S, fit, opts.BW || SKY_BW);
+  if (!R) return null;                        // horizon off the top of the frame
+  const { BW, BH, NP, phi, psi, sky } = R;
+  const { EW, EH, count: K } = backdrop;
+  const iters = Math.min(S.smooth || 0, SKY_SMOOTH);
+  const place = makeSkyPlace({ eLo: S.eLo, eHi: S.eHi, azSpan,
+    mag: S.reflMag || 1, EW, EH });
+
+  // one screen -> backdrop tap per pixel, shared by every region
+  const tap = new Int32Array(NP), tx = new Float32Array(NP), ty = new Float32Array(NP);
+  for (let p = 0; p < NP; p++) {
+    if (!sky[p]) continue;
+    const u = place.col(place.clampAz(psi[p])), v = place.row(phi[p]);
+    let x = u - 0.5; x = x < 0 ? 0 : x > EW - 1 ? EW - 1 : x;
+    let y = v - 0.5; y = y < 0 ? 0 : y > EH - 1 ? EH - 1 : y;
+    const i0 = Math.min(EW - 2, Math.floor(x)), j0 = Math.min(EH - 2, Math.floor(y));
+    tap[p] = j0 * EW + i0; tx[p] = x - i0; ty[p] = y - j0;
+  }
+
+  const F = new Float64Array(NP);
+  const layers = new Array(K);
+  backdrop.eachField((k, D) => {
+    for (let p = 0; p < NP; p++) {
+      if (!sky[p]) { F[p] = BELOW_HORIZON; continue; }
+      const q = tap[p], fx = tx[p], fy = ty[p];
+      F[p] = (D[q] * (1 - fx) + D[q + 1] * fx) * (1 - fy)
+           + (D[q + EW] * (1 - fx) + D[q + EW + 1] * fx) * fy;
+    }
+    const multi = d3.contours().size([BW, BH]).thresholds([0])(F)[0];
+    layers[k] = { d: contourToScreenPath(multi, BW, BH, iters), color: backdrop.colorAt(k) };
+  });
+  return layers.filter((l) => l.d);
+}
+
+// Preset and 1D backdrops: colour depends on elevation alone, so — exactly as
+// buildGeometry does for the water — there is one scalar to contour at the
+// band boundaries, in a single pass. Taking the SDF path here instead would
+// mean one contour per distinct colour, and a smooth palette has one per row:
+// ~60 passes for a picture with a dozen visible edges in it.
+function buildSkyBands(S, fit, thresholds, cols, opts = {}) {
+  if (!S.perspective || !cols || !cols.length) return null;
+  const R = skyRayField(S, fit, opts.BW || SKY_BW);
+  if (!R) return null;
+  const { BW, BH, phi } = R;
+  const iters = Math.min(S.smooth || 0, SKY_SMOOTH);
+  // the first threshold cuts sky from water, so band 0 is the whole sky and
+  // every later contour lands on top of it, upper sets all the way up
+  return d3.contours().size([BW, BH]).thresholds([SKY_FLOOR, ...thresholds])(phi)
+    .map((c, k) => ({ d: contourToScreenPath(c, BW, BH, iters), color: cols[k] }))
+    .filter((l) => l.d && l.color);
 }
 
 // ---- geometry build, custom 2D path ------------------------------
@@ -2521,7 +2659,8 @@ function buildSegmentation(S, backdrop, azSpan) {
 // exported for tests: the two render paths plus the helpers needed to feed
 // them, so 1D/2D fidelity parity can be checked without mounting the UI
 export {
-  buildGeometry, buildSegmentation, stampObjects,
+  buildGeometry, buildSegmentation, buildSkyRegions, buildSkyBands, skyRayField,
+  horizonRaw, SKY_PAD, SKY_BW, VB_W, VB_H, stampObjects,
   // moved into src/backdrop/, re-exported so the tests that feed the renderer
   // keep one import site
   envFromRows, magFrac,
@@ -3501,6 +3640,8 @@ export default function App() {
   // keeps the same per-ripple detail as the 1D path out of the box
   const [coherence, setCoherence] = useState(0);
   const [activeColor, setActiveColor] = useState("#11324a");
+  // draw the backdrop itself above the horizon, not only its reflection
+  const [showBackdrop, setShowBackdrop] = useState(false);
   // Custom paint chits — extra swatches pinned by hand or lifted from a photo
   // palette. Session-lived (not serialized), deduped against the built-in
   // SWATCHES and each other so a chit stays easy to re-select all session.
@@ -3600,6 +3741,7 @@ export default function App() {
     azSpan: [azSpan, setAzSpan], coherence: [coherence, setCoherence],
     activeColor: [activeColor, setActiveColor], brushSize: [brushSize, setBrushSize],
     brushShape: [brushShape, setBrushShape], env2d: [env2dCode, restoreEnv2d],
+    showBackdrop: [showBackdrop, setShowBackdrop],
   });
 
   // Switching modes must never destroy work. A pristine buffer picks up the
@@ -3768,28 +3910,42 @@ export default function App() {
   const rasterLevel = RASTER_LEVELS[
     Math.max(0, Math.min(RASTER_LEVELS.length - 1, lowPower ? 0 : rasterQ))];
 
-  const S = useMemo(() => ({
+  // The half of the scene that has nothing to do with the waves: where the
+  // camera is, how the picture is framed, and how the backdrop maps into it.
+  // Split out because the drawn backdrop depends on exactly this and not on
+  // the wave phase, so it can be built once per camera move instead of once
+  // per animation frame.
+  const camS = useMemo(() => ({
     nx: effQuality, ny: effQuality,
     xMin: -halfW, xMax: halfW, yMin: Math.min(yNear, yFar - 2), yMax: yFar,
     H: 0.4 * Math.pow(22.5, steep),
     pitch: (pitchDeg * Math.PI) / 180,
+    bands, perspective, eLo, eHi, zoom, panX, panY, smooth, coherence, rectOutput,
+    surface3d, waveScale, bandFractions, fresOn, fresBands, reflMag,
+    // showing the backdrop reframes the picture to include sky, so it belongs
+    // here: every path that fits the water reads it from S. Pen mode draws no
+    // backdrop, so it must not be reframed for one either.
+    skyPad: showBackdrop && !penMode ? SKY_PAD : 0,
+  }), [effQuality, steep, pitchDeg, bands, perspective,
+       halfW, yNear, yFar, eLo, eHi, zoom, panX, panY, smooth, coherence, rectOutput,
+       surface3d, waveScale, bandFractions, fresOn, fresBands, reflMag,
+       showBackdrop, penMode]);
+
+  const S = useMemo(() => ({
+    ...camS,
     k: (2 * Math.PI) / wavelength,
     amp: strength * 0.06,
     sharp,
     decay: 0.18 - spread * 0.16,
     omega: 1.0,
     t: animate ? tRef.current : manualTime,
-    bands, perspective, eLo, eHi, zoom, panX, panY, smooth, coherence, rectOutput,
-    surface3d, waveScale, bandFractions, fresOn, fresBands, reflMag,
     // waves scatter off the buoy's hull: a ring source pinned to the object,
     // with a tight decay so the disturbance stays local
     emitters: withWakes(objOn && objRipple > 0
       ? [...emitters, { id: "buoy", on: true, type: "point", x: objX, y: objY,
           size: Math.max(0.3, objSize * objRippleScale), amp: objRipple * 1.5, decay: 0.28 }]
       : emitters, wakes),
-  }), [effQuality, steep, pitchDeg, wavelength, strength, sharp, spread, bands, perspective,
-       halfW, yNear, yFar, eLo, eHi, zoom, panX, panY, smooth, coherence, rectOutput, surface3d, waveScale,
-       bandFractions, fresOn, fresBands, reflMag,
+  }), [camS, wavelength, strength, sharp, spread,
        emitters, wakes, animate, speed, tRef.current, manualTime,
        objOn, objX, objY, objSize, objRipple, objRippleScale]);
 
@@ -3804,6 +3960,9 @@ export default function App() {
   // the preset / 1D strip, with the objects stamped on top
   const objectsOn = objects.some((o) => o.on);
   const use2d = is2d || objectsOn;
+  // The panorama the water samples. In 2D it is what you painted; in the
+  // preset and 1D modes it is the same colors as rows, which is what an object
+  // stamp and the drawn backdrop both need to sample.
   const baseEnv2d = useMemo(() => {
     if (is2d) return segEnv;
     if (!objectsOn) return null;
@@ -3829,6 +3988,19 @@ export default function App() {
   const backdrop = useMemo(
     () => (use2d ? compileBackdrop(docFromPanorama(envEffective)) : null),
     [use2d, envEffective]);
+
+  // The backdrop as the camera sees it, above the horizon. Keyed on camS, so it
+  // survives every animation frame and rebuilds only when the camera, the
+  // window or the painting moves. Painted backdrops go through their regions;
+  // preset and 1D ones band a single scalar, exactly as the water does.
+  const skyLayers = useMemo(() => {
+    if (!showBackdrop) return null;
+    const fit = computeFit(camS);
+    if (use2d) return buildSkyRegions(camS, fit, backdrop, azSpan);
+    const cols = mode === "paint1d" ? colors1d : presetColors;
+    if (!cols || !cols.length) return null;
+    return buildSkyBands(camS, fit, bandThresholds(camS, cols.length), cols);
+  }, [showBackdrop, use2d, backdrop, camS, azSpan, mode, colors1d, presetColors]);
 
   const geom = useMemo(() => (use2d ? null : buildGeometry(S)), [use2d, S]);
   const seg = useMemo(() => (use2d ? buildSegmentation(S, backdrop, azSpan) : null),
@@ -3955,10 +4127,8 @@ export default function App() {
       };
       return { uvAt, backdrop, fresAt, fresThresholds };
     }
-    const cols = mode === "paint1d" ? colors1d : presetColors, NB = cols.length;
-    const mid = (S.eLo + S.eHi) / 2, magSpan = (S.eHi - S.eLo) / mag;
-    const bnd = (f) => mid + (f - 0.5) * magSpan;
-    const thresholds = S.bandFractions ? S.bandFractions.map(bnd) : d3.range(1, NB).map((k) => bnd(k / NB));
+    const cols = mode === "paint1d" ? colors1d : presetColors;
+    const thresholds = bandThresholds(S, cols.length);
     const scalarAt = (gx, gy) =>
       Math.asin(Math.max(-1, Math.min(1, reflectAt(gx, gy, S)[2]))) * 180 / Math.PI;
     return { scalarAt, thresholds, cols, fresAt, fresThresholds };
@@ -4053,6 +4223,9 @@ export default function App() {
   const buildSvg = (over, frame) => {
     const F = frame || liveFrame;
     const { seg, fresPaths, penLines, buoy, bgFill, gapFill } = F;
+    // the drawn backdrop does not move with the waves, so every frame of a
+    // video export shares the one the preview built
+    const svgSky = penMode ? null : skyLayers;
     const svgLayers = over ? over.layers : F.drawLayers;
     const svgFres = over ? over.fres : F.drawFres;
     const svgBg = over ? over.bg : F.drawBg;
@@ -4069,6 +4242,11 @@ export default function App() {
     }
     let body = `<rect width="${VB_W}" height="${VB_H}" fill="${bgFill}"/>` + rollOpen;
     const stroke = edges ? ` stroke="#000" stroke-opacity="0.25" stroke-width="0.6"` : "";
+    // the backdrop first: the water is drawn over it, so the horizon is
+    // wherever the water's own outline ends
+    if (svgSky) svgSky.forEach((l) => {
+      body += `<path d="${l.d}" fill="${l.color}" fill-rule="evenodd"${stroke}/>`;
+    });
     let defs = "";
     if (fresOn && svgFres) svgFres.forEach((d, i) => {
       if (d) defs += `<clipPath id="fres${i + 1}"><path d="${d}"/></clipPath>`;
@@ -4372,6 +4550,14 @@ export default function App() {
             <svg viewBox={`0 0 ${VB_W} ${VB_H}`} style={{ width: "100%", display: "block" }}>
               <rect width={VB_W} height={VB_H} fill={bgFill} />
               <g transform={rollTf || undefined}>
+              {/* the backdrop itself, drawn where the camera looks straight at
+                  it. First, so the water covers it: the horizon in the picture
+                  is wherever the water's own outline ends. */}
+              {!penMode && skyLayers && skyLayers.map((l, i) => (
+                <path key={`sky${i}`} d={l.d} fill={l.color} fillRule="evenodd"
+                  stroke={edges ? "#000" : "none"} strokeOpacity={edges ? 0.28 : 0}
+                  strokeWidth={edges ? 0.6 : 0} />
+              ))}
               {penMode ? (
                 penLines.map((l, i) => (
                   <path key={i} d={l.d} fill="none" stroke={l.color}
@@ -4745,6 +4931,21 @@ export default function App() {
                 most of why the elevation sliders read as unknowable. */}
             <div style={panel}>
               <div style={heading}>What the water sees</div>
+              <Toggle label="Show the backdrop itself" value={showBackdrop}
+                onChange={setShowBackdrop} />
+              <div style={{ fontSize: 9.5, color: "#6d808f", margin: "2px 0 12px", lineHeight: 1.5,
+                fontFamily: "ui-monospace, monospace" }}>
+                {penMode
+                  ? "Not in pen mode — the pen styles draw the water's own lines."
+                  : showBackdrop
+                    ? "The frame pulls back to the horizon and the backdrop is drawn where the"
+                      + " camera looks straight at it — same colors, same edges, the same regions"
+                      + " the water is reflecting. Move the elevation window and you can watch"
+                      + " both ends of it at once. The SVG, PNG and video exports carry it; the"
+                      + " paper stack cuts water only."
+                    : "Draw the backdrop above the horizon, not only its reflection. The fastest"
+                      + " way to see what the elevation window is doing."}
+              </div>
               <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 10, lineHeight: 1.5,
                 fontFamily: "ui-monospace, monospace" }}>
                 The window of the sky the ripples can reach. Every backdrop row maps into
