@@ -5,6 +5,11 @@ import {
   EXPORT_MESHES, EXPORT_MESH_DEFAULT, EXPORT_MESH_FLOOR, exportRaster,
   EXPORT_POLISH, EXPORT_POLISH_DEFAULT, smoothField,
 } from "./WaterReflectionContours";
+import { compileBackdrop } from "./backdrop/compile";
+import { docFromPanorama } from "./backdrop/document";
+
+// the renderer takes a compiled backdrop document, not a raw grid of cells
+const bd = (env) => compileBackdrop(docFromPanorama(env));
 
 /* ------------------------------------------------------------------ *
  * 3D solid surface: smooth regions + hidden-surface removal
@@ -186,7 +191,7 @@ test("a striped panorama gives the same 3D boundary as the continuous field", ()
   };
   const raster = { gN: 150, BW: 440 };
   const pano = buildSurface3DPanorama(S, fit, {
-    uvAt: (gx, gy) => [EW / 2, vAt(gx, gy)], env2d: { w: EW, h: EH, cells }, ...raster,
+    uvAt: (gx, gy) => [EW / 2, vAt(gx, gy)], backdrop: bd({ w: EW, h: EH, cells }), ...raster,
   });
   const ref = buildSurface3D(S, fit, { scalarAt: vAt, thresholds: [R], ...raster });
 
@@ -211,7 +216,8 @@ test("with the waves flattened, the 3D panorama redraws the flat 2D render", () 
     k: (2 * Math.PI) / 2.8, amp: 0.78 * 0.06, sharp: 0.3, decay: 0.18 - 0.5 * 0.16 };
   const AZ = 45, EW = ENV2D_W, EH = 52;
   const env2d = envFromRows((f) => paletteColorAt("Black Water", f), EW, EH);
-  const flat = buildSegmentation(S, env2d, AZ);   // also prepares S._ems
+  const back = bd(env2d);
+  const flat = buildSegmentation(S, back, AZ);   // also prepares S._ems
   const fit = computeFit(S);
   const uvAt = (gx, gy) => {
     const R = reflectAt(gx, gy, S);
@@ -222,7 +228,7 @@ test("with the waves flattened, the 3D panorama redraws the flat 2D render", () 
     let u = magFrac((psi + AZ) / (2 * AZ), 1); u = u < 0 ? 0 : u > 1 ? 1 : u;
     return [u * EW, v * EH];
   };
-  const pano = buildSurface3DPanorama(S, fit, { uvAt, env2d, gN: 150, BW: 440 });
+  const pano = buildSurface3DPanorama(S, fit, { uvAt, backdrop: back, gN: 150, BW: 440 });
 
   expect(flat.layers.length).toBeGreaterThan(4);
   expect(pano.layers.map((l) => l.color)).toEqual(flat.layers.map((l) => l.color));
@@ -480,7 +486,7 @@ test("polish reaches both builders and keeps the picture intact", () => {
   // by one, and adjacent bands must still meet
   const AZ = 45, EW = ENV2D_W, EH = 52;
   const env2d = envFromRows((f) => paletteColorAt("Black Water", f), EW, EH);
-  buildSegmentation(S, env2d, AZ);
+  buildSegmentation(S, bd(env2d), AZ);
   const uvAt = (gx, gy) => {
     const R = reflectAt(gx, gy, S);
     const phi = (Math.asin(Math.max(-1, Math.min(1, R[2]))) * 180) / Math.PI;
@@ -490,7 +496,7 @@ test("polish reaches both builders and keeps the picture intact", () => {
     let u = magFrac((psi + AZ) / (2 * AZ), 1); u = u < 0 ? 0 : u > 1 ? 1 : u;
     return [u * EW, v * EH];
   };
-  const specPano = { uvAt, env2d };
+  const specPano = { uvAt, backdrop: bd(env2d) };
   const pPlain = buildSolid3D(S, specPano, raster);
   const pPolished = buildSolid3D(S, specPano, { ...raster, polish: passes });
   expect(pPolished.layers.length).toBe(pPlain.layers.length);
@@ -622,7 +628,7 @@ test("both builders carry a gap through buildSolid3D", () => {
 
   const AZ = 45, EW = ENV2D_W, EH = 40;
   const env2d = envFromRows((f) => paletteColorAt("Black Water", f), EW, EH);
-  buildSegmentation(S, env2d, AZ);
+  buildSegmentation(S, bd(env2d), AZ);
   const uvAt = (gx, gy) => {
     const R = reflectAt(gx, gy, S);
     const phi = (Math.asin(Math.max(-1, Math.min(1, R[2]))) * 180) / Math.PI;
@@ -632,6 +638,7 @@ test("both builders carry a gap through buildSolid3D", () => {
     let u = magFrac((psi + AZ) / (2 * AZ), 1); u = u < 0 ? 0 : u > 1 ? 1 : u;
     return [u * EW, v * EH];
   };
-  expect(typeof buildSolid3D(S, { uvAt, env2d }, raster).gap).toBe("string");
-  expect(buildSolid3D(S, { uvAt, env2d }, { gN: 150, BW: 440 }).gap).toBeNull();
+  const back = bd(env2d);
+  expect(typeof buildSolid3D(S, { uvAt, backdrop: back }, raster).gap).toBe("string");
+  expect(buildSolid3D(S, { uvAt, backdrop: back }, { gN: 150, BW: 440 }).gap).toBeNull();
 });
