@@ -1,5 +1,5 @@
 import { compileBackdrop, MAX_REGIONS } from "./compile";
-import { docFromPanorama, envFromRows, flattenDoc, skyFlat, rasterContent, backdropDoc }
+import { docFromPanorama, envFromRows, flattenDoc, flat, rasterContent, backdropDoc }
   from "./document";
 
 const W = 24, H = 16;
@@ -87,17 +87,17 @@ describe("flattening a document", () => {
   });
 
   test("a hidden flat is left out", () => {
-    const top = skyFlat(rasterContent(envFromRows(() => "#ffffff", W, H)));
-    top.visible = false;
-    const doc = backdropDoc([skyFlat(rasterContent(banded())), top]);
+    const top = { ...flat(rasterContent(envFromRows(() => "#ffffff", W, H)), "top"),
+      visible: false };
+    const doc = backdropDoc([flat(rasterContent(banded()), "base"), top], W, H);
     expect(flattenDoc(doc).cells).toEqual(banded().cells);
   });
 
   test("a later flat paints over an earlier one", () => {
     const doc = backdropDoc([
-      skyFlat(rasterContent(banded())),
-      skyFlat(rasterContent(envFromRows(() => "#ffffff", W, H))),
-    ]);
+      flat(rasterContent(banded()), "base"),
+      flat(rasterContent(envFromRows(() => "#ffffff", W, H)), "top"),
+    ], W, H);
     expect(new Set(flattenDoc(doc).cells)).toEqual(new Set(["#ffffff"]));
   });
 

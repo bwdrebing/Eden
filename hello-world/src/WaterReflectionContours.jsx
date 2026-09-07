@@ -3,13 +3,20 @@ import * as d3 from "d3";
 import { labelRegions, buildAdjacency, denoiseGrid, planCollapse } from "./paperStack";
 import { useUrlSync } from "./urlSettings";
 import { extractPhotoStrip } from "./photoPalette";
-import { encodeEnv2d, decodeEnv2d } from "./env2dCodec";
+import { decodeEnv2d } from "./env2dCodec";
 import { emptyHistory, pushEdit, undo as undoHist, redo as redoHist, canUndo, canRedo }
   from "./backdropHistory";
 import { distTransform, blurField } from "./backdrop/field";
 import { magFrac, rayAngles, makeSkyPlace } from "./backdrop/place";
-import { envFromRows, smoothEnv2D, docFromPanorama } from "./backdrop/document";
+import {
+  envFromRows, smoothEnv2D, docFromPanorama, docFromPalette, stripesContent,
+  emptyRaster, renderContent, flattenDoc, updateFlat, addFlat, duplicateFlat,
+  removeFlat, moveFlat, bakeFlat, paintFlat, flatIndex, kindLabel, stripesPeriod,
+} from "./backdrop/document";
+import { encodeDoc, decodeDoc } from "./backdrop/codec";
 import { compileBackdrop } from "./backdrop/compile";
+import { PALETTES, BANDED_PALETTES, paletteStops, paletteColorAt, paletteNames }
+  from "./backdrop/palettes";
 import {
   VIDEO_FPS, VIDEO_MIN_SEC, VIDEO_MAX_SEC, VIDEO_DEFAULT_SEC,
   VIDEO_SCALES, VIDEO_DEFAULT_SCALE, videoSize, framePlan,
@@ -22,59 +29,6 @@ import {
  *  Color blobs = isobands of φ. Contour the scalar field, fill between
  *  thresholds, project to a grazing camera. No raster, no ray tracer.
  * ------------------------------------------------------------------ */
-
-const PALETTES = {
-  "Sunset Lake": ["#1b1640", "#4a2273", "#8e2f72", "#d04e5d", "#f0913f", "#f7d774", "#fbf0cf"],
-  "Tunic Glass": ["#0a2b30", "#0f5454", "#1c8a80", "#56bda3", "#bfe2bd", "#eccd83", "#f6ead0"],
-  "Treeline":    ["#0a130d", "#10301d", "#2c5736", "#6a8a64", "#b6b08e", "#e3a974", "#b9d6ed"],
-  "Obra Dinn":   ["#0b0b0b", "#262626", "#565656", "#8f8f8f", "#c7c7c7", "#f2f2f2"],
-};
-
-// Banded palettes: piecewise-constant elevation strips [color, weight] from
-// horizon (first) to zenith (last), instead of a smooth ramp. The thin dark
-// strips are the key: the reflected-elevation field is continuous, so every
-// boundary between the bands on either side must pass THROUGH the strip —
-// it draws itself as a closed hairline outline around each color region,
-// the "ink line" look of real harbor-water reflections.
-const BANDED_PALETTES = {
-  // each ink strip gets a visually identical but UNIQUE hex: a repeated color
-  // fuses into one multi-strip region in the 2D segmentation, whose union
-  // layer grows hairline protrusions that the sliver blur then eats. Unique
-  // strips keep every union a clean upper set of elevation.
-  "Harbor Ink": [
-    ["#eef7fb", 0.15], ["#06090d", 0.022], ["#9fd2e2", 0.15], ["#070a0e", 0.022],
-    ["#4b93bd", 0.16], ["#05080c", 0.022], ["#20608a", 0.15], ["#060a0e", 0.022],
-    ["#143b58", 0.14], ["#07090d", 0.026], ["#0d2334", 0.126],
-  ],
-  "Sunset Buoy": [
-    ["#f6edc9", 0.13], ["#e5a94b", 0.05], ["#cd5a28", 0.028], ["#f2d98a", 0.07],
-    ["#8c9cc8", 0.12], ["#c8551f", 0.024], ["#46689e", 0.14], ["#2b1710", 0.024],
-    ["#31518a", 0.13], ["#15101e", 0.05], ["#101c38", 0.12], ["#7e2d12", 0.022],
-    ["#060a14", 0.09],
-  ],
-  "Black Water": [
-    ["#d9f0f4", 0.12], ["#f6fbfb", 0.02], ["#a7c4ef", 0.13], ["#8e959d", 0.024],
-    ["#7e97dd", 0.14], ["#494f58", 0.024], ["#0b0e13", 0.22], ["#b9c8ee", 0.028],
-    ["#05070b", 0.294],
-  ],
-};
-
-// cumulative stops of a banded palette: [{c, f0, f1}] with f = fraction of the
-// elevation range, horizon (0) -> zenith (1). null for smooth palettes.
-function paletteStops(name) {
-  const b = BANDED_PALETTES[name];
-  if (!b) return null;
-  const total = b.reduce((s, [, w]) => s + w, 0);
-  let acc = 0;
-  return b.map(([c, w]) => { const f0 = acc / total; acc += w; return { c, f0, f1: acc / total }; });
-}
-
-function paletteColorAt(name, f) {
-  const stops = paletteStops(name);
-  if (!stops) return d3.interpolateRgbBasis(PALETTES[name])(f);
-  for (const s of stops) if (f < s.f1) return s.c;
-  return stops[stops.length - 1].c;
-}
 
 // How fast the one clock runs. The floor is low enough that ten seconds of
 // video can cover a couple of phase — a long slow swell rather than a loop —
@@ -2188,7 +2142,7 @@ function svgToPngBlob(svg, w, h) {
 // ---- color environment --------------------------------------------
 // 2D environment panorama: width = azimuth (looking across the lake),
 // height = elevation (waterline at the bottom, sky at the top).
-const ENV2D_W = 84, ENV2D_H = 52;
+const ENV2D_W = 84;
 // taller row count for panoramas derived from presets / the 1D strip when
 // reflected objects force the 2D path — keeps hairline bands ≥ 2 rows
 const DERIVED_ENV_H = 96;
@@ -2220,9 +2174,6 @@ function smoothEnv(arr) {
     const e = d3.rgb(arr[Math.min(arr.length - 1, i + 1)]);
     return d3.rgb((a.r + b.r + e.r) / 3, (a.g + b.g + e.g) / 3, (a.b + b.b + e.b) / 3).formatHex();
   });
-}
-function seedEnv2D(name, w, h) {
-  return envFromRows((f) => paletteColorAt(name, f), w, h);
 }
 
 // ---- reflected scene objects ---------------------------------------
@@ -2664,7 +2615,8 @@ export {
   // moved into src/backdrop/, re-exported so the tests that feed the renderer
   // keep one import site
   envFromRows, magFrac,
-  paletteStops, paletteColorAt, DERIVED_ENV_H, ENV2D_W, DEFAULT_EMITTERS,
+  paletteStops, paletteColorAt, PALETTES, BANDED_PALETTES,
+  DERIVED_ENV_H, ENV2D_W, DEFAULT_EMITTERS,
   computeFit, cell2ground, heightAt, clampLift, penProject, reflectAt,
   withWakes, newWake, WAKE_ANGLE_DEG, prepField, slopeAt,
   buildSurface3D, buildSurface3DPanorama, buildSolid3D, crestField,
@@ -3213,12 +3165,14 @@ function PaintStrip({ envColors, setEnvColors, activeColor, height, brushSize, o
   );
 }
 
-function PaintGrid2D({ env2d, setEnv2d, activeColor, onStrokeEnd, onEditStart,
-  brushSize, brushShape }) {
+// Shows the whole backdrop — every visible layer composited — and paints into
+// one of them. Which is the ordinary layer-editor arrangement: you draw on the
+// picture you can see, and the strokes land in the layer you have selected.
+function PaintGrid2D({ view, w, h, onPaint, activeColor, onStrokeEnd, onEditStart,
+  brushSize, brushShape, disabled }) {
   const cvRef = useRef(null);
   const wrapRef = useRef(null);
   const painting = useRef(false);
-  const { w, h } = env2d;
   const R = [1, 4, 8, 14][brushSize] ?? 4; // brush radius in cells
 
   // paint the cells onto the backing canvas (1 px per cell, CSS scales it up)
@@ -3230,13 +3184,15 @@ function PaintGrid2D({ env2d, setEnv2d, activeColor, onStrokeEnd, onEditStart,
     for (let r = 0; r < h; r++) {
       const drow = h - 1 - r;                 // canvas top = sky (row h-1)
       for (let c = 0; c < w; c++) {
-        const col = d3.rgb(env2d.cells[r * w + c]);
+        const v = view[r * w + c];
         const p = (drow * w + c) * 4;
+        if (v == null) { img.data[p + 3] = 0; continue; }   // nothing painted here
+        const col = d3.rgb(v);
         img.data[p] = col.r; img.data[p + 1] = col.g; img.data[p + 2] = col.b; img.data[p + 3] = 255;
       }
     }
     ctx.putImageData(img, 0, 0);
-  }, [env2d, w, h]);
+  }, [view, w, h]);
 
   const paintAt = (cx, cy) => {
     const el = wrapRef.current; if (!el) return;
@@ -3245,33 +3201,153 @@ function PaintGrid2D({ env2d, setEnv2d, activeColor, onStrokeEnd, onEditStart,
     const row = Math.floor((1 - (cy - r.top) / r.height) * h); // 0 = waterline
     if (col < -R - 1 || col > w + R || row < -R - 1 || row > h + R) return;
     const rr2 = (R + 0.5) * (R + 0.5);
-    setEnv2d((prev) => {
-      const nc = prev.cells.slice();
+    onPaint((cells) => {
       for (let dy = -R; dy <= R; dy++) for (let dx = -R; dx <= R; dx++) {
         if (brushShape === "round" && dx * dx + dy * dy > rr2) continue;
         if (brushShape === "diamond" && Math.abs(dx) + Math.abs(dy) > R) continue;
         const c = col + dx, rw = row + dy;
-        if (c >= 0 && c < w && rw >= 0 && rw < h) nc[rw * w + c] = activeColor;
+        if (c >= 0 && c < w && rw >= 0 && rw < h) cells[rw * w + c] = activeColor;
       }
-      return { ...prev, cells: nc };
     });
   };
 
   return (
     <div ref={wrapRef}
-      onPointerDown={(e) => { e.preventDefault(); painting.current = true;
+      onPointerDown={(e) => { if (disabled) return;
+        e.preventDefault(); painting.current = true;
         onEditStart && onEditStart();
         e.currentTarget.setPointerCapture(e.pointerId); paintAt(e.clientX, e.clientY); }}
       onPointerMove={(e) => { if (painting.current) paintAt(e.clientX, e.clientY); }}
       onPointerUp={() => { if (painting.current) { painting.current = false; onStrokeEnd && onStrokeEnd(); } }}
       onPointerCancel={() => { painting.current = false; }}
       style={{ width: "100%", aspectRatio: `${w} / ${h}`, borderRadius: 8, overflow: "hidden",
-        border: "1px solid #26313c", cursor: "crosshair", touchAction: "none", lineHeight: 0 }}>
+        border: "1px solid #26313c", cursor: disabled ? "not-allowed" : "crosshair",
+        touchAction: "none", lineHeight: 0,
+        // a checker behind the canvas, so a layer's transparent cells read as
+        // transparent rather than as black paint
+        backgroundColor: "#10161d",
+        backgroundImage: "linear-gradient(45deg,#161f28 25%,transparent 25%,transparent 75%,#161f28 75%),"
+          + "linear-gradient(45deg,#161f28 25%,transparent 25%,transparent 75%,#161f28 75%)",
+        backgroundSize: "14px 14px", backgroundPosition: "0 0, 7px 7px" }}>
       <canvas ref={cvRef}
         style={{ width: "100%", height: "100%", display: "block", imageRendering: "auto" }} />
     </div>
   );
 }
+
+// The layer stack, far at the bottom of the list to near at the top — the way
+// it is drawn, and the way it reads on the canvas.
+function LayerList({ doc, activeId, onSelect, onToggle, onMove }) {
+  const rows = doc.flats.map((f, i) => ({ f, i })).reverse();
+  return (
+    <div style={{ marginTop: 10, border: "1px solid #26313c", borderRadius: 8,
+      overflow: "hidden" }}>
+      {rows.map(({ f, i }) => {
+        const on = f.id === activeId;
+        return (
+          <div key={f.id}
+            style={{ display: "flex", alignItems: "center", gap: 6, padding: "5px 6px",
+              background: on ? "#243642" : "#141c24",
+              borderBottom: i > 0 ? "1px solid #1e2831" : "none" }}>
+            <button onClick={() => onToggle(f.id)} title={f.visible ? "Hide" : "Show"}
+              style={{ width: 22, height: 22, flex: "none", padding: 0, borderRadius: 5,
+                cursor: "pointer", fontSize: 11, lineHeight: 1, background: "#10171e",
+                color: f.visible ? "#9fd0d9" : "#4a5560", border: "1px solid #26313c" }}>
+              {f.visible ? "●" : "○"}
+            </button>
+            <button onClick={() => onSelect(f.id)}
+              style={{ flex: 1, minWidth: 0, textAlign: "left", padding: "2px 4px",
+                background: "transparent", border: "none", cursor: "pointer",
+                fontFamily: "ui-monospace, monospace", fontSize: 11,
+                color: f.visible ? (on ? "#dff1f6" : "#9fb0c0") : "#5d6b78",
+                overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {f.name}
+              <span style={{ color: "#5f7384", fontSize: 9.5 }}> · {kindLabel(f.content)}</span>
+            </button>
+            <button onClick={() => onMove(f.id, 1)} disabled={i === doc.flats.length - 1}
+              title="Nearer" style={layerNudge(i < doc.flats.length - 1)}>↑</button>
+            <button onClick={() => onMove(f.id, -1)} disabled={i === 0}
+              title="Further" style={layerNudge(i > 0)}>↓</button>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+const layerNudge = (on) => ({
+  width: 20, height: 22, flex: "none", padding: 0, borderRadius: 5, fontSize: 10,
+  lineHeight: 1, fontFamily: "ui-monospace, monospace", background: "#10171e",
+  cursor: on ? "pointer" : "default", color: on ? "#9fb0c0" : "#39434e",
+  border: "1px solid #26313c",
+});
+
+// The repeater. A band list and a switch: with repeat on, the list tiles the
+// whole backdrop ("two blue rows, one white row, all the way up"); with it off
+// the list runs once from the anchor and the layer below shows through the
+// rest. Sizes are in rows, because rows are what the pattern is made of and
+// they do not move when the elevation window does — the degrees beside each
+// one are what those rows currently come to.
+function StripesEditor({ content, rowsPerDeg, onChange, activeColor }) {
+  const { bands, repeat, anchor } = content;
+  const setBands = (b) => onChange({ bands: b });
+  const period = stripesPeriod(content);
+  const deg = (rows) => (rows / (rowsPerDeg || 1)).toFixed(1);
+  return (
+    <div style={{ marginTop: 10 }}>
+      <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 8, lineHeight: 1.5,
+        fontFamily: "ui-monospace, monospace" }}>
+        {repeat
+          ? `${period} rows (${deg(period)}°) of pattern, repeating up the backdrop.`
+          : `${period} rows (${deg(period)}°) from row ${anchor}, once. The layer below shows`
+            + " through above and beneath it."}
+      </div>
+      {bands.map((b, i) => (
+        <div key={i} style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 5 }}>
+          <label style={{ width: 26, height: 26, flex: "none", borderRadius: 5, cursor: "pointer",
+            border: "1px solid #44525e", position: "relative", overflow: "hidden",
+            background: b.color, display: "inline-block" }}>
+            <input type="color" value={b.color}
+              onChange={(e) => setBands(bands.map((x, j) =>
+                (j === i ? { ...x, color: e.target.value } : x)))}
+              style={{ position: "absolute", inset: -4, opacity: 0, cursor: "pointer" }} />
+          </label>
+          <input type="range" min={1} max={24} step={1} value={b.size}
+            onChange={(e) => setBands(bands.map((x, j) =>
+              (j === i ? { ...x, size: parseInt(e.target.value, 10) } : x)))}
+            style={{ flex: 1, height: 22, cursor: "pointer" }} />
+          <span style={{ width: 62, textAlign: "right", fontSize: 10,
+            color: "#8fa4b5", fontFamily: "ui-monospace, monospace",
+            fontVariantNumeric: "tabular-nums" }}>
+            {b.size}r · {deg(b.size)}°
+          </span>
+          <button onClick={() => setBands(bands.filter((x, j) => j !== i))}
+            disabled={bands.length <= 1} title="Remove this band"
+            style={layerNudge(bands.length > 1)}>×</button>
+        </div>
+      ))}
+      <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+        <button style={miniBtnBase}
+          onClick={() => setBands([...bands, { color: activeColor, size: 1 }])}>+ band</button>
+        <button style={{ ...miniBtnBase, background: repeat ? "#27424b" : "#1a232c",
+          color: repeat ? "#dff1f6" : "#9fb0c0",
+          border: "1px solid " + (repeat ? "#3f7e8f" : "#26313c") }}
+          onClick={() => onChange({ repeat: !repeat })}>
+          repeat {repeat ? "on" : "off"}
+        </button>
+      </div>
+      <div style={{ marginTop: 8 }}>
+        <Slider label="start row" value={anchor} min={0} max={51} step={1}
+          onChange={(v) => onChange({ anchor: v })}
+          fmt={(v) => v + " · " + deg(v) + "°"} />
+      </div>
+    </div>
+  );
+}
+const miniBtnBase = {
+  flex: 1, padding: "8px 4px", fontSize: 11, borderRadius: 6, cursor: "pointer",
+  background: "#1a232c", color: "#9fb0c0", border: "1px solid #26313c",
+  fontFamily: "ui-monospace, monospace",
+};
 
 function EmitterCard({ em, idx, halfW, yFar, onChange, onRemove }) {
   const types = [["point", "Point"], ["rings", "Rings"], ["swell", "Swell"], ["spectrum", "Spectrum"]];
@@ -3598,10 +3674,29 @@ export default function App() {
   const photoFileRef = useRef(null);
   const [photoK, setPhotoK] = useState(5);
   const [photoInfo, setPhotoInfo] = useState(null); // { name, swatches } | { error }
-  const [env2d, setEnv2d] = useState(() => seedEnv2D("Sunset Lake", ENV2D_W, ENV2D_H));
-  const [segEnv, setSegEnv] = useState(env2d);          // committed copy that drives the water
-  const env2dRef = useRef(env2d); env2dRef.current = env2d;
+  // The layered backdrop. `doc` is what the panel edits; `segDoc` is the copy
+  // the water is built from, committed when a stroke ends, so the renderer is
+  // not rebuilt on every pointer move.
+  const [doc, setDoc] = useState(() => docFromPalette("Sunset Lake"));
+  const [segDoc, setSegDoc] = useState(doc);
+  const docRef = useRef(doc); docRef.current = doc;
+  const [activeFlat, setActiveFlat] = useState(() => doc.flats[0].id);
   const envColorsRef = useRef(envColors); envColorsRef.current = envColors;
+  const active = doc.flats[flatIndex(doc, activeFlat)] || doc.flats[doc.flats.length - 1];
+  // what the canvas shows: every visible layer composited, live (the water
+  // waits for the stroke to end, the canvas under the brush does not)
+  const docView = useMemo(() => {
+    const w = doc.w, h = doc.h;
+    const cells = new Array(w * h).fill(null);
+    for (const f of doc.flats) {
+      if (!f.visible) continue;
+      const src = renderContent(f.content, w, h);
+      for (let p = 0; p < w * h; p++) if (src[p] != null) cells[p] = src[p];
+    }
+    return cells;
+  }, [doc]);
+  // every edit that is not a brush stroke commits straight through
+  const commitDoc = useCallback((next) => { setDoc(next); setSegDoc(next); }, []);
 
   // Painting is destructive by nature — the color under the brush is gone the
   // moment the pointer moves — so every edit records what it is about to
@@ -3610,10 +3705,10 @@ export default function App() {
   const [hist, setHist] = useState(emptyHistory);
   const histRef = useRef(hist); histRef.current = hist;
   const liveBuffer = useCallback(
-    (kind) => (kind === "1d" ? envColorsRef.current : env2dRef.current), []);
+    (kind) => (kind === "1d" ? envColorsRef.current : docRef.current), []);
   const applyBuffer = useCallback((entry) => {
     if (entry.kind === "1d") setEnvColors(entry.value);
-    else { setEnv2d(entry.value); setSegEnv(entry.value); }
+    else { setDoc(entry.value); setSegDoc(entry.value); }
   }, []);
   // state updaters stay pure — the buffer is read and applied out here, so a
   // double-invoked updater (StrictMode) can never apply an edit twice
@@ -3684,19 +3779,31 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [mode, undoBackdrop, redoBackdrop]);
 
-  // The painted panorama, run-length encoded (env2dCodec.js). It used to be
-  // left out of the URL for being too big, which meant a 2D backdrop could not
-  // survive a reload — the single worst thing about painting one. Encoded from
-  // the committed copy, so it re-encodes once per stroke rather than per move.
-  // Only carried once there is a panorama worth carrying — a preset or 1D
-  // scene should not drag a few hundred characters of seeded gradient around.
-  const env2dCode = useMemo(
-    () => (mode === "paint2d" || dirty2d ? encodeEnv2d(segEnv) : null),
-    [mode, dirty2d, segEnv]);
+  // The backdrop document in the URL (backdrop/codec.js). Generated layers cost
+  // almost nothing to carry — a repeating stripe layer is its band list — and
+  // painted ones go through the same run-length encoding the single panorama
+  // used. Encoded from the committed copy, so it re-encodes once per stroke
+  // rather than per pointer move, and only for scenes that have a backdrop
+  // worth carrying.
+  const docCode = useMemo(
+    () => (mode === "paint2d" || dirty2d ? encodeDoc(segDoc) : null),
+    [mode, dirty2d, segDoc]);
+  const restoreDoc = useCallback((code) => {
+    const d = decodeDoc(code);
+    if (!d) return;
+    setDoc(d); setSegDoc(d); setActiveFlat(d.flats[d.flats.length - 1].id); setDirty2d(true);
+  }, []);
+  // Links written before layers carry a single painted panorama instead; it
+  // opens as a one-layer document.
   const restoreEnv2d = useCallback((code) => {
     const env = decodeEnv2d(code);
     if (!env) return;
-    setEnv2d(env); setSegEnv(env); setDirty2d(true);
+    setDoc((d) => {
+      if (d.flats.length > 1 || d.flats[0].content.kind === "raster") return d;  // a doc won
+      const next = docFromPanorama(env);
+      setSegDoc(next); setActiveFlat(next.flats[0].id); setDirty2d(true);
+      return next;
+    });
   }, []);
 
   // Serialize every studio setting into the URL hash. Structured config like
@@ -3740,7 +3847,8 @@ export default function App() {
     envColors: [envColors, setEnvColors],
     azSpan: [azSpan, setAzSpan], coherence: [coherence, setCoherence],
     activeColor: [activeColor, setActiveColor], brushSize: [brushSize, setBrushSize],
-    brushShape: [brushShape, setBrushShape], env2d: [env2dCode, restoreEnv2d],
+    brushShape: [brushShape, setBrushShape], bdoc: [docCode, restoreDoc],
+    env2d: [null, restoreEnv2d],                 // read-only: pre-layers links
     showBackdrop: [showBackdrop, setShowBackdrop],
   });
 
@@ -3753,22 +3861,46 @@ export default function App() {
     if (!dirty1d) setEnvColors(seedEnv(palette, ENV_N));
     setMode("paint1d");
   };
-  const seed2d = (name) => {
-    const seeded = seedEnv2D(name, ENV2D_W, ENV2D_H);
-    setEnv2d(seeded); setSegEnv(seeded);
-  };
   const resetStrip = () => {
     beginEdit("1d"); setEnvColors(seedEnv(palette, ENV_N)); setDirty1d(false);
   };
-  const resetPanorama = () => { beginEdit("2d"); seed2d(palette); setDirty2d(false); };
   const smoothStrip = () => {
     beginEdit("1d"); setEnvColors((p) => smoothEnv(p)); setDirty1d(true);
   };
-  const smoothPanorama = () => {
+
+  // Every layer edit is one undo step and commits straight to the water; only
+  // brush strokes wait for the pointer to come up.
+  const editDoc = useCallback((fn) => {
     beginEdit("2d");
-    const s = smoothEnv2D(env2dRef.current);
-    setEnv2d(s); setSegEnv(s); setDirty2d(true);
-  };
+    setDirty2d(true);
+    const next = fn(docRef.current);
+    commitDoc(next);
+    return next;
+  }, [beginEdit, commitDoc]);
+
+  const addLayer = (content, name) => editDoc((d) => {
+    const { doc: next, id } = addFlat(d, content, name, activeFlat);
+    setActiveFlat(id);
+    return next;
+  });
+  const duplicateLayer = () => editDoc((d) => {
+    const { doc: next, id } = duplicateFlat(d, activeFlat);
+    setActiveFlat(id);
+    return next;
+  });
+  const removeLayer = () => editDoc((d) => {
+    const next = removeFlat(d, activeFlat);
+    if (next !== d) setActiveFlat(next.flats[Math.max(0, flatIndex(d, activeFlat) - 1)].id);
+    return next;
+  });
+  const patchContent = (patch) => editDoc((d) =>
+    updateFlat(d, activeFlat, { content: { ...d.flats[flatIndex(d, activeFlat)].content, ...patch } }));
+  const smoothPanorama = () => editDoc((d) => {
+    const f = d.flats[flatIndex(d, activeFlat)];
+    if (!f || f.content.kind !== "raster") return d;
+    const sm = smoothEnv2D({ w: f.content.w, h: f.content.h, cells: f.content.cells });
+    return updateFlat(d, activeFlat, { content: { ...f.content, cells: sm.cells } });
+  });
 
   // photo -> palette: quantize the photo to a few dominant colors and lift
   // its top-to-bottom color profile into the paint-1D strip (top of the
@@ -3810,7 +3942,10 @@ export default function App() {
     im.src = url;
   };
   const enter2d = () => {
-    if (!dirty2d) seed2d(palette);
+    if (!dirty2d) {
+      const seeded = docFromPalette(palette);
+      commitDoc(seeded); setActiveFlat(seeded.flats[0].id);
+    }
     setMode("paint2d");
   };
 
@@ -3964,7 +4099,7 @@ export default function App() {
   // preset and 1D modes it is the same colors as rows, which is what an object
   // stamp and the drawn backdrop both need to sample.
   const baseEnv2d = useMemo(() => {
-    if (is2d) return segEnv;
+    if (is2d) return flattenDoc(segDoc);
     if (!objectsOn) return null;
     if (mode === "paint1d")
       return envFromRows((f) => envColors[Math.min(ENV_N - 1, Math.floor(f * ENV_N))],
@@ -3973,7 +4108,7 @@ export default function App() {
     const NB = presetColors.length;
     return envFromRows((f) => presetColors[Math.min(NB - 1, Math.floor(f * NB))],
       ENV2D_W, DERIVED_ENV_H);
-  }, [is2d, segEnv, objectsOn, mode, envColors, stops, palette, presetColors]);
+  }, [is2d, segDoc, objectsOn, mode, envColors, stops, palette, presetColors]);
   const envEffective = useMemo(
     () => (use2d ? stampObjects(baseEnv2d, objects, azSpan, eLo, eHi) : null),
     [use2d, baseEnv2d, objects, azSpan, eLo, eHi]);
@@ -4730,7 +4865,7 @@ export default function App() {
               {mode === "preset" && !stops &&
                 <Slider label="Color regions" value={bands} min={3} max={16} step={1} onChange={setBands} />}
               <div style={{ display: "flex", gap: 6, marginBottom: 10, flexWrap: "wrap" }}>
-                {[...Object.keys(PALETTES), ...Object.keys(BANDED_PALETTES)].map((p) => {
+                {paletteNames().map((p) => {
                   const on = mode === "preset" && palette === p;
                   const inked = !!BANDED_PALETTES[p];
                   return (
@@ -4832,8 +4967,10 @@ export default function App() {
               {mode === "paint2d" && (
                 <>
                   <ElevationScale eLo={eLo} eHi={eHi} mag={reflMag} reach={rng}>
-                    <PaintGrid2D env2d={env2d} setEnv2d={setEnv2d} activeColor={activeColor}
-                      onStrokeEnd={() => setSegEnv(env2dRef.current)}
+                    <PaintGrid2D view={docView} w={doc.w} h={doc.h} activeColor={activeColor}
+                      disabled={active.content.kind !== "raster"}
+                      onPaint={(paint) => setDoc((d) => paintFlat(d, activeFlat, paint))}
+                      onStrokeEnd={() => setSegDoc(docRef.current)}
                       onEditStart={() => { beginEdit("2d"); setDirty2d(true); }}
                       brushSize={brushSize} brushShape={brushShape} />
                   </ElevationScale>
@@ -4842,6 +4979,57 @@ export default function App() {
                     fontFamily: "ui-monospace, monospace" }}>
                     <span>−{azSpan}°</span><span>azimuth</span><span>+{azSpan}°</span>
                   </div>
+
+                  <LayerList doc={doc} activeId={activeFlat} onSelect={setActiveFlat}
+                    onToggle={(id) => editDoc((d) =>
+                      updateFlat(d, id, { visible: !d.flats[flatIndex(d, id)].visible }))}
+                    onMove={(id, delta) => editDoc((d) => moveFlat(d, id, delta))} />
+
+                  <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+                    <button style={miniBtn} title="A new painted layer, empty"
+                      onClick={() => addLayer(emptyRaster(doc.w, doc.h), "Painted")}>+ paint</button>
+                    <button style={miniBtn} title="A new repeating band pattern"
+                      onClick={() => addLayer(stripesContent(
+                        [{ color: activeColor, size: 2 }, { color: "#ffffff", size: 1 }], true, 0),
+                        "Repeat")}>+ repeat</button>
+                    <button style={miniBtn} onClick={duplicateLayer}>copy</button>
+                    <button style={{ ...miniBtn, color: doc.flats.length > 1 ? "#c98a7f" : "#4a5560" }}
+                      onClick={removeLayer} disabled={doc.flats.length <= 1}>delete</button>
+                  </div>
+
+                  {active.content.kind === "ramp" && (
+                    <div style={{ marginTop: 10 }}>
+                      <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 6, lineHeight: 1.5,
+                        fontFamily: "ui-monospace, monospace" }}>
+                        A palette down the elevation. Pick another, or bake it to pixels to paint
+                        over it.
+                      </div>
+                      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                        {paletteNames().map((pn) => (
+                          <button key={pn} onClick={() => patchContent({ palette: pn })}
+                            style={{ flex: "1 0 30%", padding: "6px 4px", fontSize: 10.5,
+                              borderRadius: 6, cursor: "pointer", fontFamily: "ui-monospace, monospace",
+                              background: active.content.palette === pn ? "#27424b" : "#1a232c",
+                              color: active.content.palette === pn ? "#dff1f6" : "#9fb0c0",
+                              border: "1px solid " + (active.content.palette === pn ? "#3f7e8f" : "#26313c") }}>
+                            {pn}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {active.content.kind === "stripes" && (
+                    <StripesEditor content={active.content} rowsPerDeg={doc.h / ((eHi - eLo) || 1)}
+                      onChange={patchContent} activeColor={activeColor} />
+                  )}
+
+                  {active.content.kind !== "raster" && (
+                    <button style={{ ...miniBtn, width: "100%", marginTop: 8 }}
+                      onClick={() => editDoc((d) => bakeFlat(d, activeFlat))}>
+                      Bake to pixels (to paint on it)
+                    </button>
+                  )}
                 </>
               )}
 
@@ -4875,7 +5063,9 @@ export default function App() {
                         border: "1px dashed #44525e", display: "inline-flex",
                         alignItems: "center", justifyContent: "center" }}>+</button>
                   </div>
-                  <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 8, flexWrap: "wrap" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 8,
+                    flexWrap: "wrap",
+                    opacity: mode === "paint2d" && active.content.kind !== "raster" ? 0.4 : 1 }}>
                     <span style={{ fontSize: 10.5, color: "#6d808f", fontFamily: "ui-monospace, monospace",
                       width: 38 }}>Brush</span>
                     {[[0, "·"], [1, "S"], [2, "M"], [3, "L"]].map(([s, lbl]) => (
@@ -4894,16 +5084,18 @@ export default function App() {
                       <button style={miniBtn} onClick={smoothStrip}>Smooth</button>
                       <button style={miniBtn} onClick={resetStrip}>Reset to {palette}</button>
                     </>}
-                    {mode === "paint2d" && <>
-                      <button style={miniBtn} onClick={smoothPanorama}>Smooth colors</button>
-                      <button style={miniBtn} onClick={resetPanorama}>Reset to {palette}</button>
+                    {mode === "paint2d" && active.content.kind === "raster" && <>
+                      <button style={miniBtn} onClick={smoothPanorama}>Smooth this layer</button>
+                      <button style={miniBtn}
+                        onClick={() => editDoc((d) => updateFlat(d, activeFlat,
+                          { content: emptyRaster(d.w, d.h) }))}>Clear this layer</button>
                     </>}
                   </div>
-                  {mode === "paint2d" && !env2dCode && (
+                  {mode === "paint2d" && !docCode && (
                     <div style={{ fontSize: 9.5, color: "#c96f5f", marginTop: 8, lineHeight: 1.5,
                       fontFamily: "ui-monospace, monospace" }}>
                       Too many distinct colors to save in the link — smoothing blends a new color
-                      into every cell. This painting will not survive a reload.
+                      into every cell. This backdrop will not survive a reload.
                     </div>
                   )}
                 </>
