@@ -17,6 +17,7 @@
 //  encodes to null rather than writing a megabyte into someone's URL.
 // ------------------------------------------------------------------ //
 import { DOC_VERSION, backdropDoc, flat, rampContent, stripesContent } from "./document";
+import { shapesContent, shape, SHAPE_KINDS } from "./shapes";
 
 const MAX_PALETTE = 64;
 export const MAX_DOC_LEN = 12000;
@@ -85,6 +86,18 @@ export function encodeDoc(doc) {
     const c = f.content;
     const head = { n: f.name, v: f.visible ? 1 : 0 };
     if (c.kind === "ramp") flats.push({ ...head, k: "r", p: c.palette });
+    else if (c.kind === "shapes") {
+      // a shape is its statement: type, box, colours. Four numbers and two
+      // hexes, whatever resolution it ends up rendered at
+      flats.push({ ...head, k: "h", i: c.items.map((it) => ({
+        t: it.type,
+        b: [it.x, it.y, it.w, it.h].map((v) => Math.round(v * 1e4) / 1e4),
+        c: it.color.replace(/^#/, ""),
+        d: (it.color2 || "").replace(/^#/, ""),
+        m: it.rim ? 1 : 0,
+        ...(it.points ? { g: it.points.map((q) => q.map((v) => Math.round(v * 1e4) / 1e4)) } : {}),
+      })) });
+    }
     else if (c.kind === "stripes") {
       flats.push({ ...head, k: "s", r: c.repeat ? 1 : 0, a: c.anchor | 0,
         b: c.bands.map((b) => [b.color.replace(/^#/, ""), b.size | 0]) });
@@ -116,6 +129,18 @@ export function decodeDoc(s) {
         .map((b) => ({ color: "#" + b[0], size: Math.max(1, b[1] | 0) }));
       if (!bands.length) return null;
       content = stripesContent(bands, f.r !== 0, f.a | 0);
+    } else if (f.k === "h" && Array.isArray(f.i)) {
+      const items = f.i
+        .filter((it) => SHAPE_KINDS.includes(it.t) && Array.isArray(it.b) && it.b.length === 4
+          && it.b.every((v) => typeof v === "number" && Number.isFinite(v)))
+        .map((it) => shape(it.t, {
+          x: it.b[0], y: it.b[1], w: it.b[2], h: it.b[3],
+          color: /^[0-9a-f]{6}$/i.test(String(it.c)) ? "#" + it.c : "#141d33",
+          color2: /^[0-9a-f]{6}$/i.test(String(it.d)) ? "#" + it.d : "#9cc3e8",
+          rim: it.m ? 1 : 0,
+          ...(Array.isArray(it.g) ? { points: it.g } : {}),
+        }));
+      content = shapesContent(items);
     } else if (f.k === "p") {
       const env = decodeCells(f.c);
       if (!env) return null;

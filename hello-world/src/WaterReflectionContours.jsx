@@ -14,7 +14,10 @@ import {
   removeFlat, moveFlat, bakeFlat, paintFlat, flatIndex, kindLabel, stripesPeriod,
 } from "./backdrop/document";
 import { encodeDoc, decodeDoc } from "./backdrop/codec";
-import { compileBackdrop } from "./backdrop/compile";
+import {
+  STAMPS, SHAPE_KINDS, shape, shapesContent, shapeAt, shapeBox, shapeLabel,
+} from "./backdrop/shapes";
+import { compileBackdrop, COMPILE_SCALE } from "./backdrop/compile";
 import { PALETTES, BANDED_PALETTES, paletteStops, paletteColorAt, paletteNames }
   from "./backdrop/palettes";
 import {
@@ -3235,6 +3238,147 @@ function PaintGrid2D({ view, w, h, onPaint, activeColor, onStrokeEnd, onEditStar
   );
 }
 
+// Shapes are moved, not repainted, so the canvas grows a selection: click one,
+// drag it, drag a corner to resize. The overlay sits over the same canvas the
+// brush uses and works in flat coordinates (0..1 across, 0..1 up from the
+// waterline), which is what the shapes themselves are stored in.
+function ShapeOverlay({ items, selectedId, onSelect, onChange, onEditStart, onCommit }) {
+  const ref = useRef(null);
+  const drag = useRef(null);
+  const at = (e) => {
+    const r = ref.current.getBoundingClientRect();
+    return [(e.clientX - r.left) / r.width, 1 - (e.clientY - r.top) / r.height];
+  };
+  const HANDLE = 0.022;
+
+  const down = (e) => {
+    e.preventDefault();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    const [fx, fy] = at(e);
+    const sel = items.find((i) => i.id === selectedId);
+    // a corner of the selected shape takes priority over anything under it
+    if (sel) {
+      const b = shapeBox(sel);
+      if (Math.abs(fx - b.x1) < HANDLE && Math.abs(fy - b.y1) < HANDLE) {
+        onEditStart();
+        drag.current = { id: sel.id, mode: "size", fx, fy, w: sel.w, h: sel.h };
+        return;
+      }
+    }
+    // topmost shape under the pointer
+    for (let k = items.length - 1; k >= 0; k--) {
+      if (shapeAt(items[k], fx, fy)) {
+        onSelect(items[k].id);
+        onEditStart();
+        drag.current = { id: items[k].id, mode: "move", fx, fy, x: items[k].x, y: items[k].y };
+        return;
+      }
+    }
+    onSelect(null);
+  };
+  const move = (e) => {
+    const d = drag.current;
+    if (!d) return;
+    const [fx, fy] = at(e);
+    if (d.mode === "move") onChange(d.id, { x: d.x + (fx - d.fx), y: d.y + (fy - d.fy) });
+    else onChange(d.id, { w: Math.max(0.02, d.w + 2 * (fx - d.fx)),
+                          h: Math.max(0.02, d.h + (fy - d.fy)) });
+  };
+  const up = () => { if (drag.current) { drag.current = null; onCommit(); } };
+
+  const sel = items.find((i) => i.id === selectedId);
+  const b = sel && shapeBox(sel);
+  return (
+    <svg ref={ref} viewBox="0 0 1 1" preserveAspectRatio="none"
+      onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={up}
+      style={{ position: "absolute", inset: 0, width: "100%", height: "100%",
+        cursor: "move", touchAction: "none" }}>
+      {b && (
+        <g>
+          <rect x={b.x0} y={1 - b.y1} width={b.x1 - b.x0} height={b.y1 - b.y0}
+            fill="none" stroke="#ffffff" strokeOpacity={0.9} strokeWidth={0.004}
+            strokeDasharray="0.012 0.008" vectorEffect="non-scaling-stroke" />
+          <rect x={b.x1 - 0.012} y={1 - b.y1 - 0.012} width={0.024} height={0.024}
+            fill="#ffffff" stroke="#0b0f14" strokeWidth={0.003} />
+        </g>
+      )}
+    </svg>
+  );
+}
+
+// The shape catalogue and the selected shape's colours. Position and size are
+// not sliders here on purpose: they are the canvas above, where you can see
+// what you are doing.
+function ShapesEditor({ content, selectedId, onSelect, onAdd, onPatch, onRemove, activeColor }) {
+  const items = content.items;
+  const sel = items.find((i) => i.id === selectedId);
+  const stamp = sel && STAMPS[sel.type];
+  return (
+    <div style={{ marginTop: 10 }}>
+      <div style={{ display: "flex", gap: 5, flexWrap: "wrap", marginBottom: 8 }}>
+        {SHAPE_KINDS.map((k) => (
+          <button key={k} onClick={() => onAdd(k)} style={{ ...miniBtnBase, flex: "1 0 28%",
+            fontSize: 10.5, padding: "6px 3px" }}>+ {k}</button>
+        ))}
+      </div>
+      {!items.length && (
+        <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5,
+          fontFamily: "ui-monospace, monospace" }}>
+          Add a shape, then drag it on the canvas. Corner handle resizes.
+        </div>
+      )}
+      {items.length > 0 && (
+        <div style={{ border: "1px solid #26313c", borderRadius: 8, overflow: "hidden" }}>
+          {items.slice().reverse().map((it) => (
+            <div key={it.id} onClick={() => onSelect(it.id)}
+              style={{ display: "flex", alignItems: "center", gap: 6, padding: "4px 6px",
+                cursor: "pointer", background: it.id === selectedId ? "#243642" : "#141c24" }}>
+              <span style={{ width: 16, height: 16, borderRadius: 4, flex: "none",
+                background: it.color, border: "1px solid #00000055" }} />
+              <span style={{ flex: 1, fontSize: 10.5, fontFamily: "ui-monospace, monospace",
+                color: it.id === selectedId ? "#dff1f6" : "#9fb0c0" }}>{shapeLabel(it)}</span>
+              <button onClick={(e) => { e.stopPropagation(); onRemove(it.id); }}
+                style={layerNudge(true)}>×</button>
+            </div>
+          ))}
+        </div>
+      )}
+      {sel && (
+        <div style={{ marginTop: 8 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <ColorWell label={stamp ? stamp.label[0] : "fill"} value={sel.color}
+              onChange={(c) => onPatch(sel.id, { color: c })} />
+            {stamp && (
+              <ColorWell label={stamp.label[1]} value={sel.color2}
+                onChange={(c) => onPatch(sel.id, { color2: c })} />
+            )}
+            <button onClick={() => onPatch(sel.id, { rim: sel.rim > 0 ? 0 : 1 })}
+              style={{ ...miniBtnBase, flex: "none", padding: "6px 10px",
+                background: sel.rim > 0 ? "#27424b" : "#1a232c",
+                color: sel.rim > 0 ? "#dff1f6" : "#9fb0c0" }}>ink rim</button>
+            <button onClick={() => onPatch(sel.id, { color: activeColor })}
+              style={{ ...miniBtnBase, flex: "none", padding: "6px 10px" }}>use swatch</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ColorWell({ label, value, onChange }) {
+  return (
+    <label style={{ display: "inline-flex", alignItems: "center", gap: 5, cursor: "pointer",
+      fontSize: 10, color: "#8fa4b5", fontFamily: "ui-monospace, monospace" }}>
+      <span style={{ width: 22, height: 22, borderRadius: 5, border: "1px solid #44525e",
+        position: "relative", overflow: "hidden", background: value, display: "inline-block" }}>
+        <input type="color" value={value} onChange={(e) => onChange(e.target.value)}
+          style={{ position: "absolute", inset: -4, opacity: 0, cursor: "pointer" }} />
+      </span>
+      {label}
+    </label>
+  );
+}
+
 // The layer stack, far at the bottom of the list to near at the top — the way
 // it is drawn, and the way it reads on the canvas.
 function LayerList({ doc, activeId, onSelect, onToggle, onMove }) {
@@ -3681,6 +3825,7 @@ export default function App() {
   const [segDoc, setSegDoc] = useState(doc);
   const docRef = useRef(doc); docRef.current = doc;
   const [activeFlat, setActiveFlat] = useState(() => doc.flats[0].id);
+  const [selectedShape, setSelectedShape] = useState(null);
   const envColorsRef = useRef(envColors); envColorsRef.current = envColors;
   const active = doc.flats[flatIndex(doc, activeFlat)] || doc.flats[doc.flats.length - 1];
   // what the canvas shows: every visible layer composited, live (the water
@@ -3895,6 +4040,36 @@ export default function App() {
   });
   const patchContent = (patch) => editDoc((d) =>
     updateFlat(d, activeFlat, { content: { ...d.flats[flatIndex(d, activeFlat)].content, ...patch } }));
+  // Shapes: add, patch and remove all go through the document, so each is one
+  // undo step. A drag is one step too — it opens on pointer-down and commits
+  // on pointer-up, like a brush stroke.
+  const addShape = (type) => {
+    // a stamp keeps its own colours; a plain shape takes the swatch in hand
+    const item = shape(type, {
+      ...(STAMPS[type] ? {} : { color: activeColor }),
+      points: type === "poly"
+        ? [[0.35, 0.1], [0.5, 0.35], [0.65, 0.1]] : undefined,
+    });
+    setSelectedShape(item.id);
+    editDoc((d) => updateFlat(d, activeFlat, {
+      content: { ...d.flats[flatIndex(d, activeFlat)].content,
+        items: [...d.flats[flatIndex(d, activeFlat)].content.items, item] },
+    }));
+  };
+  const patchShape = (id, patch, live) => {
+    const apply = (d) => updateFlat(d, activeFlat, {
+      content: { ...d.flats[flatIndex(d, activeFlat)].content,
+        items: d.flats[flatIndex(d, activeFlat)].content.items
+          .map((i) => (i.id === id ? { ...i, ...patch } : i)) },
+    });
+    if (live) setDoc(apply);            // mid-drag: the canvas follows, the water waits
+    else editDoc(apply);
+  };
+  const removeShape = (id) => editDoc((d) => updateFlat(d, activeFlat, {
+    content: { ...d.flats[flatIndex(d, activeFlat)].content,
+      items: d.flats[flatIndex(d, activeFlat)].content.items.filter((i) => i.id !== id) },
+  }));
+
   const smoothPanorama = () => editDoc((d) => {
     const f = d.flats[flatIndex(d, activeFlat)];
     if (!f || f.content.kind !== "raster") return d;
@@ -4973,6 +5148,13 @@ export default function App() {
                       onStrokeEnd={() => setSegDoc(docRef.current)}
                       onEditStart={() => { beginEdit("2d"); setDirty2d(true); }}
                       brushSize={brushSize} brushShape={brushShape} />
+                    {active.content.kind === "shapes" && (
+                      <ShapeOverlay items={active.content.items} selectedId={selectedShape}
+                        onSelect={setSelectedShape}
+                        onEditStart={() => { beginEdit("2d"); setDirty2d(true); }}
+                        onChange={(id, patch) => patchShape(id, patch, true)}
+                        onCommit={() => setSegDoc(docRef.current)} />
+                    )}
                   </ElevationScale>
                   <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9.5,
                     color: "#6d808f", marginTop: 2, paddingLeft: 40,
@@ -4992,6 +5174,9 @@ export default function App() {
                       onClick={() => addLayer(stripesContent(
                         [{ color: activeColor, size: 2 }, { color: "#ffffff", size: 1 }], true, 0),
                         "Repeat")}>+ repeat</button>
+                    <button style={miniBtn} title="A new layer of shapes you can drag"
+                      onClick={() => { setSelectedShape(null);
+                        addLayer(shapesContent([]), "Shapes"); }}>+ shapes</button>
                     <button style={miniBtn} onClick={duplicateLayer}>copy</button>
                     <button style={{ ...miniBtn, color: doc.flats.length > 1 ? "#c98a7f" : "#4a5560" }}
                       onClick={removeLayer} disabled={doc.flats.length <= 1}>delete</button>
@@ -5024,11 +5209,27 @@ export default function App() {
                       onChange={patchContent} activeColor={activeColor} />
                   )}
 
+                  {active.content.kind === "shapes" && (
+                    <ShapesEditor content={active.content} selectedId={selectedShape}
+                      onSelect={setSelectedShape} onAdd={addShape}
+                      onPatch={(id, patch) => patchShape(id, patch)}
+                      onRemove={(id) => { if (id === selectedShape) setSelectedShape(null);
+                        removeShape(id); }}
+                      activeColor={activeColor} />
+                  )}
+
                   {active.content.kind !== "raster" && (
                     <button style={{ ...miniBtn, width: "100%", marginTop: 8 }}
                       onClick={() => editDoc((d) => bakeFlat(d, activeFlat))}>
                       Bake to pixels (to paint on it)
                     </button>
+                  )}
+                  {active.content.kind === "shapes" && (
+                    <div style={{ fontSize: 9.5, color: "#6d808f", marginTop: 6, lineHeight: 1.5,
+                      fontFamily: "ui-monospace, monospace" }}>
+                      Shapes are rendered at {COMPILE_SCALE}× the paint grid, so their edges are
+                      finer than the brush can draw. Two shapes the same colour stay two regions.
+                    </div>
                   )}
                 </>
               )}
