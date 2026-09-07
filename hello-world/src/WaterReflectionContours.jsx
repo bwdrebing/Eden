@@ -3,6 +3,9 @@ import * as d3 from "d3";
 import { labelRegions, buildAdjacency, denoiseGrid, planCollapse } from "./paperStack";
 import { useUrlSync } from "./urlSettings";
 import { extractPhotoStrip } from "./photoPalette";
+import { encodeEnv2d, decodeEnv2d } from "./env2dCodec";
+import { emptyHistory, pushEdit, undo as undoHist, redo as redoHist, canUndo, canRedo }
+  from "./backdropHistory";
 import {
   VIDEO_FPS, VIDEO_MIN_SEC, VIDEO_MAX_SEC, VIDEO_DEFAULT_SEC,
   VIDEO_SCALES, VIDEO_DEFAULT_SCALE, videoSize, framePlan,
@@ -3102,7 +3105,69 @@ function Toggle({ label, value, onChange }) {
   );
 }
 
-function PaintStrip({ envColors, setEnvColors, activeColor, height, brushSize }) {
+// The paint canvases are the one place the elevation window is legible: a row
+// here IS an elevation. So the window's ends, the horizon, and the slice of the
+// window the water can actually reach belong drawn on the canvas — not as two
+// bare degree sliders three panels away, which is what made them unreadable.
+// `reach` is the reflected-elevation range this scene actually produces
+// (rng.lo/hi); rows outside it are painted but never reflected by any ripple.
+function ElevationScale({ eLo, eHi, mag, reach, children }) {
+  // same mapping the renderer uses, so the band lands where the water reads it
+  const frac = (deg) => magFrac((deg - eLo) / ((eHi - eLo) || 1), mag);
+  const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+  const pct = (deg) => (1 - clamp01(frac(deg))) * 100;
+  const tick = { position: "absolute", right: 6, fontSize: 9.5, lineHeight: 1,
+    color: "#6d808f", fontFamily: "ui-monospace, monospace" };
+  // Rows the ripples never point at are dimmed, so what is left bright is
+  // exactly the paint that can end up in the water. Dimming the dead rows
+  // rather than marking the live ones means a scene that reflects the whole
+  // window — the common case — draws no overlay at all.
+  const deadTop = reach ? pct(reach.hi) : 0;      // above the highest reflected row
+  const deadBot = reach ? 100 - pct(reach.lo) : 0; // below the lowest
+  const missed = reach && (frac(reach.hi) <= 0 || frac(reach.lo) >= 1);
+  const covers = reach && deadTop < 0.5 && deadBot < 0.5;
+  const scrim = { position: "absolute", left: 0, right: 0, pointerEvents: "none",
+    background: "rgba(7,11,16,0.62)" };
+  const span = reach && `${reach.lo.toFixed(0)}°–${reach.hi.toFixed(0)}°`;
+  return (
+    <>
+      <div style={{ display: "flex", alignItems: "stretch", gap: 6 }}>
+        <div style={{ position: "relative", width: 34, flex: "none" }}>
+          <span style={{ ...tick, top: 0 }}>{eHi}°</span>
+          {/* the horizon, when it has room to sit clear of the two end labels */}
+          {eLo < 0 && eHi > 0 && pct(0) > 8 && pct(0) < 92 && (
+            <span style={{ ...tick, top: `calc(${pct(0)}% - 5px)`, color: "#8fa4b5" }}>0°</span>
+          )}
+          <span style={{ ...tick, bottom: 0 }}>{eLo}°</span>
+        </div>
+        <div style={{ position: "relative", flex: 1, minWidth: 0 }}>
+          {children}
+          {reach && !covers && deadTop > 0.5 && (
+            <div style={{ ...scrim, top: 0, height: `${deadTop}%`,
+              borderBottom: missed ? "none" : "1px dashed rgba(255,255,255,0.6)" }} />
+          )}
+          {reach && !covers && deadBot > 0.5 && (
+            <div style={{ ...scrim, bottom: 0, height: `${deadBot}%`,
+              borderTop: missed ? "none" : "1px dashed rgba(255,255,255,0.6)" }} />
+          )}
+        </div>
+      </div>
+      {reach && (
+        <div style={{ fontSize: 9.5, color: missed ? "#c96f5f" : "#6d808f", marginTop: 5,
+          lineHeight: 1.5, fontFamily: "ui-monospace, monospace" }}>
+          {missed ? `Nothing lands — the ripples reflect ${span}, outside this window.`
+            : !covers ? `Dimmed rows never reach the water — the ripples only reflect ${span}.`
+              : (reach.lo < eLo - 1 || reach.hi > eHi + 1)
+                ? `Every row reaches the water. Ripples swing ${span}, past both ends, so the`
+                  + ` edge rows fill everything beyond.`
+                : `Every row here reaches the water (ripples swing ${span}).`}
+        </div>
+      )}
+    </>
+  );
+}
+
+function PaintStrip({ envColors, setEnvColors, activeColor, height, brushSize, onEditStart }) {
   const ref = useRef(null);
   const painting = useRef(false);
   const lastIdx = useRef(-1);
@@ -3126,6 +3191,7 @@ function PaintStrip({ envColors, setEnvColors, activeColor, height, brushSize })
   return (
     <div ref={ref}
       onPointerDown={(e) => { e.preventDefault(); painting.current = true; lastIdx.current = -1;
+        onEditStart && onEditStart();
         e.currentTarget.setPointerCapture(e.pointerId); paintAt(e.clientY); }}
       onPointerMove={(e) => { if (painting.current) paintAt(e.clientY); }}
       onPointerUp={() => { painting.current = false; lastIdx.current = -1; }}
@@ -3140,7 +3206,8 @@ function PaintStrip({ envColors, setEnvColors, activeColor, height, brushSize })
   );
 }
 
-function PaintGrid2D({ env2d, setEnv2d, activeColor, onStrokeEnd, brushSize, brushShape }) {
+function PaintGrid2D({ env2d, setEnv2d, activeColor, onStrokeEnd, onEditStart,
+  brushSize, brushShape }) {
   const cvRef = useRef(null);
   const wrapRef = useRef(null);
   const painting = useRef(false);
@@ -3186,6 +3253,7 @@ function PaintGrid2D({ env2d, setEnv2d, activeColor, onStrokeEnd, brushSize, bru
   return (
     <div ref={wrapRef}
       onPointerDown={(e) => { e.preventDefault(); painting.current = true;
+        onEditStart && onEditStart();
         e.currentTarget.setPointerCapture(e.pointerId); paintAt(e.clientX, e.clientY); }}
       onPointerMove={(e) => { if (painting.current) paintAt(e.clientX, e.clientY); }}
       onPointerUp={() => { if (painting.current) { painting.current = false; onStrokeEnd && onStrokeEnd(); } }}
@@ -3526,6 +3594,40 @@ export default function App() {
   const [env2d, setEnv2d] = useState(() => seedEnv2D("Sunset Lake", ENV2D_W, ENV2D_H));
   const [segEnv, setSegEnv] = useState(env2d);          // committed copy that drives the water
   const env2dRef = useRef(env2d); env2dRef.current = env2d;
+  const envColorsRef = useRef(envColors); envColorsRef.current = envColors;
+
+  // Painting is destructive by nature — the color under the brush is gone the
+  // moment the pointer moves — so every edit records what it is about to
+  // overwrite. One entry per committed edit: a stroke snapshots on pointer-down
+  // and undoes in one step however far it drags. See backdropHistory.js.
+  const [hist, setHist] = useState(emptyHistory);
+  const histRef = useRef(hist); histRef.current = hist;
+  const liveBuffer = useCallback(
+    (kind) => (kind === "1d" ? envColorsRef.current : env2dRef.current), []);
+  const applyBuffer = useCallback((entry) => {
+    if (entry.kind === "1d") setEnvColors(entry.value);
+    else { setEnv2d(entry.value); setSegEnv(entry.value); }
+  }, []);
+  // state updaters stay pure — the buffer is read and applied out here, so a
+  // double-invoked updater (StrictMode) can never apply an edit twice
+  const beginEdit = useCallback((kind) => {
+    const value = liveBuffer(kind);
+    setHist((h) => pushEdit(h, { kind, value }));
+  }, [liveBuffer]);
+  const stepHistory = useCallback((take) => {
+    const step = take(histRef.current, liveBuffer);
+    if (!step) return;
+    applyBuffer(step.entry);
+    setHist(step.hist);
+  }, [liveBuffer, applyBuffer]);
+  const undoBackdrop = useCallback(() => stepHistory(undoHist), [stepHistory]);
+  const redoBackdrop = useCallback(() => stepHistory(redoHist), [stepHistory]);
+
+  // Whether each paint buffer holds work. A pristine buffer is reseeded from
+  // the palette when you enter its mode (which is what makes "pick a palette,
+  // then paint on it" work); a dirty one is never silently overwritten.
+  const [dirty1d, setDirty1d] = useState(false);
+  const [dirty2d, setDirty2d] = useState(false);
   const [azSpan, setAzSpan] = useState(45);
   // 0 = no de-jitter blur of the reflected-direction fields, so the 2D path
   // keeps the same per-ripple detail as the 1D path out of the box
@@ -3557,10 +3659,41 @@ export default function App() {
   const vidCanvasRef = useRef(null);
   useEffect(() => () => { if (vidUrlRef.current) URL.revokeObjectURL(vidUrlRef.current); }, []);
 
-  // Serialize every studio setting into the URL hash (the painted 1D/2D
-  // environment buffers are excluded — they are freehand pixel data, not
-  // controls, and would blow the URL length budget). Structured config
-  // like the emitter and object lists round-trips as-is.
+  // Cmd/Ctrl+Z, Shift+Cmd/Ctrl+Z (and Ctrl+Y) while a paint canvas is up.
+  useEffect(() => {
+    if (mode === "preset") return;
+    const onKey = (e) => {
+      if (!(e.metaKey || e.ctrlKey)) return;
+      const k = e.key.toLowerCase();
+      if (k !== "z" && k !== "y") return;
+      const t = e.target;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+      e.preventDefault();
+      if (k === "y" || e.shiftKey) redoBackdrop(); else undoBackdrop();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [mode, undoBackdrop, redoBackdrop]);
+
+  // The painted panorama, run-length encoded (env2dCodec.js). It used to be
+  // left out of the URL for being too big, which meant a 2D backdrop could not
+  // survive a reload — the single worst thing about painting one. Encoded from
+  // the committed copy, so it re-encodes once per stroke rather than per move.
+  // Only carried once there is a panorama worth carrying — a preset or 1D
+  // scene should not drag a few hundred characters of seeded gradient around.
+  const env2dCode = useMemo(
+    () => (mode === "paint2d" || dirty2d ? encodeEnv2d(segEnv) : null),
+    [mode, dirty2d, segEnv]);
+  const restoreEnv2d = useCallback((code) => {
+    const env = decodeEnv2d(code);
+    if (!env) return;
+    setEnv2d(env); setSegEnv(env); setDirty2d(true);
+  }, []);
+
+  // Serialize every studio setting into the URL hash. Structured config like
+  // the emitter and object lists round-trips as-is; the painted panorama goes
+  // through the RLE codec, and is dropped (encodes to null) if it holds more
+  // colors than the codec's palette — a hand-smoothed one, say.
   useUrlSync("reflection", {
     steep: [steep, setSteep], pitchDeg: [pitchDeg, setPitchDeg], rollDeg: [rollDeg, setRollDeg],
     fresOn: [fresOn, setFresOn], fresBands: [fresBands, setFresBands],
@@ -3598,10 +3731,34 @@ export default function App() {
     envColors: [envColors, setEnvColors],
     azSpan: [azSpan, setAzSpan], coherence: [coherence, setCoherence],
     activeColor: [activeColor, setActiveColor], brushSize: [brushSize, setBrushSize],
-    brushShape: [brushShape, setBrushShape],
+    brushShape: [brushShape, setBrushShape], env2d: [env2dCode, restoreEnv2d],
   });
 
-  const enter1d = () => { setEnvColors(seedEnv(palette, ENV_N)); setMode("paint1d"); };
+  // Switching modes must never destroy work. A pristine buffer picks up the
+  // current palette on the way in — which is what makes "pick a palette, then
+  // paint over it" work — but a buffer you have painted in is left exactly as
+  // you left it. The Reset buttons are the only way to lose a painting, and
+  // they go through the history like any other edit.
+  const enter1d = () => {
+    if (!dirty1d) setEnvColors(seedEnv(palette, ENV_N));
+    setMode("paint1d");
+  };
+  const seed2d = (name) => {
+    const seeded = seedEnv2D(name, ENV2D_W, ENV2D_H);
+    setEnv2d(seeded); setSegEnv(seeded);
+  };
+  const resetStrip = () => {
+    beginEdit("1d"); setEnvColors(seedEnv(palette, ENV_N)); setDirty1d(false);
+  };
+  const resetPanorama = () => { beginEdit("2d"); seed2d(palette); setDirty2d(false); };
+  const smoothStrip = () => {
+    beginEdit("1d"); setEnvColors((p) => smoothEnv(p)); setDirty1d(true);
+  };
+  const smoothPanorama = () => {
+    beginEdit("2d");
+    const s = smoothEnv2D(env2dRef.current);
+    setEnv2d(s); setSegEnv(s); setDirty2d(true);
+  };
 
   // photo -> palette: quantize the photo to a few dominant colors and lift
   // its top-to-bottom color profile into the paint-1D strip (top of the
@@ -3609,7 +3766,9 @@ export default function App() {
   const applyPhoto = (img, k, name) => {
     const res = extractPhotoStrip(img, k, ENV_N);
     if (!res) { setPhotoInfo({ error: "Couldn't read that image." }); return; }
+    beginEdit("1d");
     setEnvColors(res.strip);
+    setDirty1d(true);
     setDeepColor(res.deep);
     setMode("paint1d");
     setPhotoInfo({ name, swatches: res.swatches });
@@ -3641,8 +3800,8 @@ export default function App() {
     im.src = url;
   };
   const enter2d = () => {
-    const seeded = seedEnv2D(palette, ENV2D_W, ENV2D_H);
-    setEnv2d(seeded); setSegEnv(seeded); setMode("paint2d");
+    if (!dirty2d) seed2d(palette);
+    setMode("paint2d");
   };
 
   // camera interaction: drag the preview to pan, scroll to zoom (anchored at
@@ -4279,6 +4438,13 @@ export default function App() {
     background: "#1a232c", color: "#9fb0c0", border: "1px solid #26313c",
     fontFamily: "ui-monospace, monospace",
   };
+  const histBtn = (on) => ({
+    width: 28, height: 26, padding: 0, borderRadius: 6, fontSize: 14, lineHeight: 1,
+    fontFamily: "ui-monospace, monospace", flex: "none",
+    cursor: on ? "pointer" : "default",
+    background: "#1a232c", color: on ? "#9fb0c0" : "#3d4a56",
+    border: "1px solid " + (on ? "#26313c" : "#1d262f"),
+  });
   const brushBtn = (on) => ({
     width: 30, height: 30, padding: 0, borderRadius: 6, cursor: "pointer", fontSize: 13,
     fontFamily: "ui-monospace, monospace", lineHeight: 1,
@@ -4578,39 +4744,43 @@ export default function App() {
                 )}
               </div>
 
-              <Slider label="Reflection detail (angular zoom)" value={reflMag} min={0.5} max={10}
-                step={0.1} onChange={setReflMag}
-                fmt={(v) => (v === 1 ? "1.0× (off)" : v.toFixed(1) + "×")} />
-              <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 10, lineHeight: 1.5,
-                fontFamily: "ui-monospace, monospace" }}>
-                Compresses the environment into a narrower reflected cone, so a small ripple
-                tilt sweeps more of the colors — the telephoto close-up look where every
-                wavelet carries the whole gradient. Pair with auto-fit for steep-down shots.
-              </div>
-
-              {mode === "paint1d" && (
-                <div>
-                  <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 7, lineHeight: 1.5,
+              {mode !== "preset" && (
+                <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 7 }}>
+                  <span style={{ flex: 1, fontSize: 9.5, color: "#6d808f", lineHeight: 1.5,
                     fontFamily: "ui-monospace, monospace" }}>
-                    Paint by elevation only — sky at the top, waterline at the bottom. Smooth, banded
-                    reflection (same shape as the presets).
-                  </div>
-                  <PaintStrip envColors={envColors} setEnvColors={setEnvColors}
-                    activeColor={activeColor} height={140} brushSize={brushSize} />
+                    {mode === "paint1d"
+                      ? "Paint by elevation only — sky at the top, waterline at the bottom."
+                      : "Left–right = looking across the lake; up = sky, down = waterline."}
+                  </span>
+                  <button onClick={undoBackdrop} disabled={!canUndo(hist)} title="Undo (⌘Z)"
+                    style={histBtn(canUndo(hist))}>↶</button>
+                  <button onClick={redoBackdrop} disabled={!canRedo(hist)} title="Redo (⇧⌘Z)"
+                    style={histBtn(canRedo(hist))}>↷</button>
                 </div>
               )}
 
+              {mode === "paint1d" && (
+                <ElevationScale eLo={eLo} eHi={eHi} mag={reflMag} reach={rng}>
+                  <PaintStrip envColors={envColors} setEnvColors={setEnvColors}
+                    activeColor={activeColor} height={160} brushSize={brushSize}
+                    onEditStart={() => { beginEdit("1d"); setDirty1d(true); }} />
+                </ElevationScale>
+              )}
+
               {mode === "paint2d" && (
-                <div>
-                  <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 7, lineHeight: 1.5,
+                <>
+                  <ElevationScale eLo={eLo} eHi={eHi} mag={reflMag} reach={rng}>
+                    <PaintGrid2D env2d={env2d} setEnv2d={setEnv2d} activeColor={activeColor}
+                      onStrokeEnd={() => setSegEnv(env2dRef.current)}
+                      onEditStart={() => { beginEdit("2d"); setDirty2d(true); }}
+                      brushSize={brushSize} brushShape={brushShape} />
+                  </ElevationScale>
+                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9.5,
+                    color: "#6d808f", marginTop: 2, paddingLeft: 40,
                     fontFamily: "ui-monospace, monospace" }}>
-                    Paint the shoreline panorama. Left–right = looking across the lake; up = sky,
-                    down = waterline. The water updates when you lift your finger.
+                    <span>−{azSpan}°</span><span>azimuth</span><span>+{azSpan}°</span>
                   </div>
-                  <PaintGrid2D env2d={env2d} setEnv2d={setEnv2d} activeColor={activeColor}
-                    onStrokeEnd={() => setSegEnv(env2dRef.current)}
-                    brushSize={brushSize} brushShape={brushShape} />
-                </div>
+                </>
               )}
 
               {mode !== "preset" && (
@@ -4659,31 +4829,19 @@ export default function App() {
                   </div>
                   <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
                     {mode === "paint1d" && <>
-                      <button style={miniBtn} onClick={() => setEnvColors((p) => smoothEnv(p))}>Smooth</button>
-                      <button style={miniBtn} onClick={() => setEnvColors(seedEnv(palette, ENV_N))}>Reset to {palette}</button>
+                      <button style={miniBtn} onClick={smoothStrip}>Smooth</button>
+                      <button style={miniBtn} onClick={resetStrip}>Reset to {palette}</button>
                     </>}
                     {mode === "paint2d" && <>
-                      <button style={miniBtn}
-                        onClick={() => { const s = smoothEnv2D(env2dRef.current); setEnv2d(s); setSegEnv(s); }}>
-                        Smooth colors
-                      </button>
-                      <button style={miniBtn}
-                        onClick={() => { const s = seedEnv2D(palette, ENV2D_W, ENV2D_H); setEnv2d(s); setSegEnv(s); }}>
-                        Reset to {palette}
-                      </button>
+                      <button style={miniBtn} onClick={smoothPanorama}>Smooth colors</button>
+                      <button style={miniBtn} onClick={resetPanorama}>Reset to {palette}</button>
                     </>}
                   </div>
-                  {mode === "paint2d" && (
-                    <div style={{ marginTop: 10 }}>
-                      <Slider label="azimuth span (panorama width)" value={azSpan} min={15} max={80} step={1}
-                        onChange={setAzSpan} fmt={(v) => "±" + v + "°"} />
-                      <Slider label="edge ripple" value={coherence} min={0} max={8} step={1}
-                        onChange={setCoherence}
-                        fmt={(v) => (v === 0 ? "sharp" : v <= 2 ? "rippled" : v <= 5 ? "smooth" : "broad")} />
-                      <div style={{ fontSize: 9.5, color: "#6d808f", marginTop: 2, lineHeight: 1.5,
-                        fontFamily: "ui-monospace, monospace" }}>
-                        Lower = edges follow every wave; higher = calmer, broader regions.
-                      </div>
+                  {mode === "paint2d" && !env2dCode && (
+                    <div style={{ fontSize: 9.5, color: "#c96f5f", marginTop: 8, lineHeight: 1.5,
+                      fontFamily: "ui-monospace, monospace" }}>
+                      Too many distinct colors to save in the link — smoothing blends a new color
+                      into every cell. This painting will not survive a reload.
                     </div>
                   )}
                 </>
@@ -4701,6 +4859,68 @@ export default function App() {
                     color: "#6d808f", marginTop: 3, fontFamily: "ui-monospace, monospace" }}>
                     <span>{eLo}° horizon</span><span>zenith {eHi}°</span>
                   </div>
+                </>
+              )}
+            </div>
+
+            {/* How the water samples the backdrop, as opposed to what the backdrop is.
+                These used to be scattered — the elevation window three panels down in
+                Advanced, the azimuth span duplicated with two different names — which is
+                most of why the elevation sliders read as unknowable. */}
+            <div style={panel}>
+              <div style={heading}>What the water sees</div>
+              <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 10, lineHeight: 1.5,
+                fontFamily: "ui-monospace, monospace" }}>
+                The window of the sky the ripples can reach. Every backdrop row maps into
+                {" "}{eLo}°–{eHi}° of reflected elevation; this scene's ripples currently swing
+                across {rng.lo.toFixed(0)}°–{rng.hi.toFixed(0)}°, the band marked on the canvas
+                above.
+              </div>
+              <Toggle label="Auto-fit elevation range" value={autoFit} onChange={setAutoFit} />
+              {autoFit ? (
+                <div style={{ fontFamily: "ui-monospace, monospace", fontSize: 11,
+                  color: "#7f93a3", margin: "2px 0 12px", lineHeight: 1.5 }}>
+                  tracking the view &amp; waves · {eLo}° – {eHi}°
+                </div>
+              ) : (
+                <>
+                  <button onClick={() => { setELo(Math.floor(rng.lo)); setEHi(Math.ceil(rng.hi)); }}
+                    style={{ width: "100%", padding: "8px", borderRadius: 7, cursor: "pointer",
+                      background: "#1a232c", color: "#9fd0d9", border: "1px solid #2f6b78",
+                      fontFamily: "ui-monospace, monospace", fontSize: 11, margin: "2px 0 12px" }}>
+                    ⤢ fit the window to the water ({rng.lo.toFixed(0)}° – {rng.hi.toFixed(0)}°)
+                  </button>
+                  <Slider label="elevation low (waterline end)" value={eLo} min={-5} max={60} step={1}
+                    onChange={setELo} fmt={(v) => v + "°"} />
+                  <Slider label="elevation high (sky end)" value={eHi} min={8} max={90} step={1}
+                    onChange={setEHi} fmt={(v) => v + "°"} />
+                </>
+              )}
+              <Slider label="azimuth span (backdrop width)" value={azSpan} min={15} max={80} step={1}
+                onChange={setAzSpan} fmt={(v) => "±" + v + "°"} />
+              <Slider label="reflection detail (angular zoom)" value={reflMag} min={0.5} max={10}
+                step={0.1} onChange={setReflMag}
+                fmt={(v) => (v === 1 ? "1.0× (off)" : v.toFixed(1) + "×")} />
+              <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 10, lineHeight: 1.5,
+                fontFamily: "ui-monospace, monospace" }}>
+                Compresses the environment into a narrower reflected cone, so a small ripple
+                tilt sweeps more of the colors — the telephoto close-up look where every
+                wavelet carries the whole gradient. Pair with auto-fit for steep-down shots.
+              </div>
+              {use2d && (
+                <>
+                  <Slider label="edge ripple" value={coherence} min={0} max={8} step={1}
+                    onChange={setCoherence}
+                    fmt={(v) => (v === 0 ? "sharp" : v <= 2 ? "rippled" : v <= 5 ? "smooth" : "broad")} />
+                  <div style={{ fontSize: 9.5, color: "#6d808f", margin: "2px 0 10px", lineHeight: 1.5,
+                    fontFamily: "ui-monospace, monospace" }}>
+                    Lower = edges follow every wave; higher = calmer, broader regions.
+                  </div>
+                  <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 6,
+                    fontFamily: "ui-monospace, monospace" }}>
+                    reflected panorama (what the water actually samples):
+                  </div>
+                  <EnvPreview env={envEffective} />
                 </>
               )}
             </div>
@@ -4757,22 +4977,11 @@ export default function App() {
                 </button>
               )}
               {objectsOn && (
-                <>
-                  {!is2d && (
-                    <>
-                      <Slider label="azimuth span (reflection width)" value={azSpan} min={15} max={80}
-                        step={1} onChange={setAzSpan} fmt={(v) => "±" + v + "°"} />
-                      <Slider label="edge ripple" value={coherence} min={0} max={8} step={1}
-                        onChange={setCoherence}
-                        fmt={(v) => (v === 0 ? "sharp" : v <= 2 ? "rippled" : v <= 5 ? "smooth" : "broad")} />
-                    </>
-                  )}
-                  <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 6,
-                    fontFamily: "ui-monospace, monospace" }}>
-                    reflected panorama (what the water sees):
-                  </div>
-                  <EnvPreview env={envEffective} />
-                </>
+                <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5,
+                  fontFamily: "ui-monospace, monospace" }}>
+                  Objects sit on the waterline and are sized in degrees of reflected elevation;
+                  the panorama they land in is in <b>What the water sees</b>, above.
+                </div>
               )}
             </div>
 
@@ -4970,24 +5179,11 @@ export default function App() {
                   </button>
                 )}
                 <div style={{ ...heading, marginTop: 10 }}>Range & quality</div>
-                <Toggle label="Auto-fit elevation range" value={autoFit} onChange={setAutoFit} />
-                {autoFit ? (
-                  <div style={{ fontFamily: "ui-monospace, monospace", fontSize: 11,
-                    color: "#7f93a3", margin: "2px 0 12px", lineHeight: 1.5 }}>
-                    tracking the view &amp; waves · {eLo}° – {eHi}°
-                  </div>
-                ) : (
-                  <>
-                    <button onClick={() => { setELo(Math.floor(rng.lo)); setEHi(Math.ceil(rng.hi)); }}
-                      style={{ width: "100%", padding: "8px", borderRadius: 7, cursor: "pointer",
-                        background: "#1a232c", color: "#9fd0d9", border: "1px solid #2f6b78",
-                        fontFamily: "ui-monospace, monospace", fontSize: 11, marginBottom: 12 }}>
-                      ⤢ fit elevation range to water ({rng.lo.toFixed(0)}° – {rng.hi.toFixed(0)}°)
-                    </button>
-                    <Slider label="elevation low" value={eLo} min={-5} max={60} step={1} onChange={setELo} fmt={(v) => v + "°"} />
-                    <Slider label="elevation high" value={eHi} min={8} max={90} step={1} onChange={setEHi} fmt={(v) => v + "°"} />
-                  </>
-                )}
+                <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 10, lineHeight: 1.5,
+                  fontFamily: "ui-monospace, monospace" }}>
+                  The elevation window moved up to <b>What the water sees</b>, beside the
+                  backdrop it frames.
+                </div>
                 <Slider label="plane near edge" value={yNear} min={1} max={15} step={0.5}
                   onChange={setYNear} fmt={(v) => v.toFixed(1)} />
                 <Slider label="plane depth (far edge)" value={yFar} min={10} max={90} step={2} onChange={setYFar} />
