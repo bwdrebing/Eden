@@ -107,3 +107,45 @@ describe("flattening a document", () => {
     expect(env.cells[(H - 1) * W]).toBe("#ffffff");
   });
 });
+
+describe("depth", () => {
+  const board = (distance, color) => ({
+    ...flat(rasterContent(envFromRows(() => color, W, H)), "board " + distance),
+    place: { kind: "plane", distance, width: 40, height: 10 },
+  });
+
+  test("a document with no boards is one group, as it always was", () => {
+    const b = compiled(banded());
+    expect(b.groups.length).toBe(1);
+    expect(b.groups[0].place.kind).toBe("sky");
+  });
+
+  test("each board is its own group, furthest first, sky behind them all", () => {
+    const doc = backdropDoc([
+      flat(rasterContent(banded()), "Sky"), board(8, "#111111"), board(40, "#222222"),
+    ], W, H);
+    const b = compileBackdrop(doc);
+    expect(b.groups.map((g) => g.place.distance)).toEqual([Infinity, 40, 8]);
+  });
+
+  test("boards at the same distance keep the order the document has them in", () => {
+    const doc = backdropDoc([board(10, "#111111"), board(10, "#222222")], W, H);
+    const b = compileBackdrop(doc);
+    expect(b.groups.map((g) => g.colorAt(0))).toEqual(["#111111", "#222222"]);
+  });
+
+  test("a board's regions are its own, not mixed into the sky's", () => {
+    const doc = backdropDoc([flat(rasterContent(banded()), "Sky"), board(8, "#ff00ff")], W, H);
+    const b = compileBackdrop(doc);
+    expect(b.groups[0].count).toBe(3);          // the three sky bands
+    expect(b.groups[1].count).toBe(1);          // the board
+    expect(b.count).toBe(4);
+  });
+
+  test("the sky is still what the single-group readers see", () => {
+    const doc = backdropDoc([flat(rasterContent(banded()), "Sky"), board(8, "#ff00ff")], W, H);
+    const b = compileBackdrop(doc);
+    expect(b.bg).toBe("#141d33");               // row 0 of the sky, not the board
+    expect(b.EW).toBe(W);
+  });
+});

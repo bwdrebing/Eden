@@ -85,6 +85,10 @@ export function encodeDoc(doc) {
   for (const f of doc.flats) {
     const c = f.content;
     const head = { n: f.name, v: f.visible ? 1 : 0 };
+    // where it stands, when it is not the sky
+    if (f.place && f.place.kind === "plane") {
+      head.q = [f.place.distance, f.place.width, f.place.height];
+    }
     if (c.kind === "ramp") flats.push({ ...head, k: "r", p: c.palette });
     else if (c.kind === "shapes") {
       // a shape is its statement: type, box, colours. Four numbers and two
@@ -147,7 +151,10 @@ export function decodeDoc(s) {
       content = { kind: "raster", w: env.w, h: env.h, cells: env.cells };
     }
     if (!content) return null;
-    flats.push({ ...flat(content, name), visible });
+    const place = Array.isArray(f.q) && f.q.length === 3 && f.q.every(Number.isFinite)
+      ? { kind: "plane", distance: f.q[0], width: f.q[1], height: f.q[2] }
+      : { kind: "sky" };
+    flats.push({ ...flat(content, name), visible, place });
   }
   const first = flats.find((f) => f.content.kind === "raster");
   return backdropDoc(flats, w || (first && first.content.w), h || (first && first.content.h));
