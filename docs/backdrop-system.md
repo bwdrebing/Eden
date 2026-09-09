@@ -1,6 +1,6 @@
 # Backdrop system: critique and rearchitecture
 
-Status: phases 0–2 landed; phases 3–6 are still proposals. What each phase
+Status: phases 0–5 landed; phase 6 is still a proposal. What each phase
 delivered is noted against it in §5.
 Scope: everything that answers the question *what does the water reflect?* —
 the `preset` / `paint1d` / `paint2d` modes, the reflected-objects catalogue, and
@@ -302,27 +302,39 @@ water's three.
 Not covered: the layered-paper export cuts water only. Pen mode draws no
 backdrop and is not reframed for one.
 
-### Phase 3 — layers and the repeater (~4–5 days)
+### Phase 3 — layers and the repeater — **landed**
 
 The layers panel: add / duplicate / delete, eye toggle, drag to reorder, per-flat
 opacity-free compositing. Document-level undo replaces the Phase 0 ring. `ramp`,
 `stripes` and `raster` content editors, with the stripes editor being the
 repeater — band list, sizes in degrees, repeat toggle, anchor.
 
-### Phase 4 — vector shapes (~5–6 days)
+### Phase 4 — vector shapes — **landed**
 
 `shapes` content: rect, ellipse, polygon, freehand path. Click to select, drag to
 move, handles to resize — the "move the thing I just placed" ask. The four
 hardcoded objects become shape presets on a flat, `stampObjects` and `tweakHex`
 are deleted, and the four-object cap goes with them.
 
-### Phase 5 — depth (~4–5 days)
+### Phase 5 — depth — **landed**
 
-`place: { kind: "plane", distance }`. Ray/plane intersection in `place.js`,
-far→near draw order, and a small top-down plan strip showing the camera, the
-water plane, and each flat's distance as a draggable tick. Sizes on a plane flat
-are in world units, so "a dock 12 units wide at 8 units out" is finally a thing
-you can type.
+`place: { kind: "plane", distance, width, height }`. Ray/plane intersection in
+`place.js`, far→near draw order, and a top-down plan strip showing the camera,
+the water, and each board's distance. Sizes are in world units.
+
+Three things the implementation turned up. Compiling has to group by placement
+rather than flatten — flattening first throws away where each layer stands,
+which is the whole of depth, and the studio was still compiling a flattened
+panorama until the browser check caught it. A board must NOT have its
+transparent cells filled the way the sky does, or every board renders as a
+solid slab. And landing past a board's edge has to stay a smooth signed
+distance rather than a binary miss, or the edge contours into a sawtooth at the
+sample grid; only a ray that never arrives (running parallel to the board, or
+away from it) is a hard boundary, and that one is a genuine fold in the
+reflection.
+
+The 3D surface path takes the ray from the lifted crest (`GZ`) rather than
+`z = 0`, which is what the risk register above called for.
 
 ### Phase 6 — polish
 
@@ -349,7 +361,10 @@ readout in the panel.
   not done until all of them take compiled regions — a partial migration would
   leave the video export or the paper export drawing a different backdrop from
   the preview.
-- **Plane flats and the 3D surface.** With `surface3d` on, the reflected ray
-  originates from the lifted wave surface, not `z = 0`. The plane intersection
-  must use the surface point, or near flats will swim against the waves. Worth a
-  targeted test in Phase 5.
+- **Plane flats and the 3D surface.** Handled in phase 5: `rasterizeSurface`
+  keeps each vertex's world height and the intersection leaves from the crest
+  the camera can actually see, not from `z = 0`.
+
+- **The objects panel is still a separate system.** It stamps into a panorama
+  rather than placing shapes, because the preset and 1D modes have no document
+  to hold shapes. Phase 6 territory, and `tweakHex` goes with it.
