@@ -26,6 +26,7 @@ import {
   VIDEO_FPS, VIDEO_MIN_SEC, VIDEO_MAX_SEC, VIDEO_DEFAULT_SEC,
   VIDEO_SCALES, VIDEO_DEFAULT_SCALE, videoSize, framePlan,
   videoSupported, encodeMp4, formatDuration, etaSeconds, PHASE_PER_SEC,
+  VIDEO_LOOP_DEFAULT_PHASE, loopSeconds, loopPhaseRange,
 } from "./videoExport";
 
 /* ------------------------------------------------------------------ *
@@ -78,6 +79,75 @@ const DISPERSION_DEFAULT = true;
 // Angular frequency of a component of wavenumber kk under the scene's rule.
 function omegaAt(kk, S) {
   return S.dispersion ? S.omega * Math.sqrt(kk / S.k) : S.omega;
+}
+
+// A clip that loops: every train back where it started, at the same instant.
+//
+// Time reaches this field in exactly one shape — a phase term -omega*t inside
+// a sine, one per component — so the whole surface is a finite sum of
+// sinusoids in t, and it is periodic only if every one of those frequencies
+// shares a period. It does not: with dispersion on omega goes as sqrt(k), and
+// the square roots of a jittered ladder of wavelengths are never commensurate.
+// So the last frame of an export lands on a picture unrelated to the first,
+// and the clip pops on repeat.
+//
+// The fix is to make them commensurate: over a loop of T phase units, round
+// each component's frequency to the nearest whole number of cycles in T.
+//
+//     omega -> round(omega*T / 2pi) * 2pi/T
+//
+// What that costs is bounded and it is all tempo. Every wavenumber, heading,
+// amplitude, decay, ring center and random seed is untouched, so the picture
+// at t = 0 is the one the scene already had, to the bit — the snap scales the
+// phase term, and at t = 0 there is no phase term. What moves is *when* a
+// crest arrives: a train completing n cycles in the loop has its frequency
+// shifted by at most 1/(2n), so the error is worst on the slowest train and
+// falls away as the loop lengthens. `loopFit` measures it for a given scene.
+//
+// A train that was already frozen (`rate` 0) stays frozen. One too slow to
+// finish half a cycle in the loop is held at one cycle rather than rounded to
+// none: a single train stopping dead while the rest of the water moves reads
+// as a broken renderer, where a swell running fast reads as a fast swell.
+//
+// Off — no loop asked for — the frequency passes through untouched, and every
+// caller below is arranged so the arithmetic is the arithmetic it always was.
+function loopOmega(om, S) {
+  const T = S.loopPhase;
+  if (!T || !om) return om;
+  const n = Math.round(Math.abs(om * T) / (2 * Math.PI));
+  return (Math.sign(om) * Math.max(1, n) * 2 * Math.PI) / T;
+}
+
+// What a loop of `T` phase units would cost this scene, measured off the baked
+// field rather than restated from the formula above: bake the emitters at two
+// instants one unit of clock apart with no loop on, read each component's
+// frequency off the phase it advanced, and report the worst snap. Measuring
+// the field is what keeps this honest if an emitter type ever changes how it
+// derives its frequency — the reading follows, where a second copy of the
+// formula would quietly drift.
+//
+// Returns the component count, the slowest frequency in the scene, and `worst`
+// — the largest relative frequency shift the loop imposes, as a fraction.
+function loopFit(S, T) {
+  const a = prepField({ ...S, t: 0, loopPhase: 0 });
+  const b = prepField({ ...S, t: 1, loopPhase: 0 });
+  const oms = [];
+  a._ems.forEach((e, i) => {
+    const B = b._ems[i];
+    if (e.type === "point") oms.push(B.wt - e.wt);
+    else if (e.type === "swell") oms.push(e.ph0 - B.ph0);
+    else if (e.type === "rings") for (let j = 0; j < e.M; j++) oms.push(e.PH[j] - B.PH[j]);
+    else if (e.type === "spectrum") for (let j = 0; j < e.N; j++) oms.push(e.PH[j] - B.PH[j]);
+    // a wake carries no phase term at all: it is already the same every frame
+  });
+  const live = oms.map(Math.abs).filter((o) => o > 1e-12);
+  if (!live.length || !(T > 0)) return { components: live.length, slowest: 0, worst: 0 };
+  let worst = 0;
+  for (const om of live) {
+    const n = (om * T) / (2 * Math.PI);
+    worst = Math.max(worst, Math.abs(Math.max(1, Math.round(n)) - n) / n);
+  }
+  return { components: live.length, slowest: Math.min(...live), worst };
 }
 
 // What the rule does to one emitter, in the terms the panel talks in: a train
@@ -340,6 +410,14 @@ function prepEmitter(em, S) {
   const t = S.t * rate;
   const q = S.sharp || 0;   // Stokes-style crest sharpening, 2nd harmonic weight
 
+  // How far one component of this train has turned by now. With no loop asked
+  // for that is the frequency against the geared clock, exactly as it has
+  // always been computed. With one, the gearing is folded into the frequency
+  // *before* it is snapped — what a loop has to land on is the rate the field
+  // actually turns at, not the rate before the trim — and the snapped
+  // frequency then runs against the scene's own clock.
+  const phase = (om) => (S.loopPhase ? loopOmega(om * rate, S) * S.t : om * t);
+
   if (em.type === "point") {
     // em.decay overrides the global reach — used by the buoy's scattered
     // ripples, which should stay local to the hull
@@ -347,13 +425,13 @@ function prepEmitter(em, S) {
     const k0 = 2 * Math.PI / baseLambda;
     // the ring expands at this train's own phase speed omega/k, not the
     // clock's — a wide ripple spreads faster than a tight one
-    return { type: "point", x: em.x, y: em.y, k0, A, decay, wt: omegaAt(k0, S) * t };
+    return { type: "point", x: em.x, y: em.y, k0, A, decay, wt: phase(omegaAt(k0, S)) };
   }
   if (em.type === "swell") {
     const a = (em.dir * Math.PI) / 180;
     const k0 = 2 * Math.PI / baseLambda;
     return { type: "swell", k0, Dx: Math.cos(a), Dy: Math.sin(a), A,
-      ph0: -omegaAt(k0, S) * t, q, aa: aaCoef(k0, S) };
+      ph0: -phase(omegaAt(k0, S)), q, aa: aaCoef(k0, S) };
   }
   if (em.type === "wake") {
     // λ₀ is the vessel's length, read straight off the control in scene units
@@ -398,7 +476,7 @@ function prepEmitter(em, S) {
       AMP.push(A * (0.6 + 0.7 * rand1(i * 7 + 3)));
       // each source spreads at the rate its own wavelength earns it, so a
       // varied field stops pulsing in unison the moment the rule is on
-      PH.push(rand1(i * 11 + 4) * Math.PI * 2 - omegaAt(ki, S) * t);
+      PH.push(rand1(i * 11 + 4) * Math.PI * 2 - phase(omegaAt(ki, S)));
     }
     return { type: "rings", M, CX, CY, K, AMP, PH, dec };
   }
@@ -429,7 +507,7 @@ function prepEmitter(em, S) {
     DX.push(Math.cos(th));
     DY.push(Math.sin(th));
     AMP.push(A * (lam / baseLambda) / N * 1.5);       // longer waves carry more energy
-    PH.push(rand1(i * 2 + 2) * Math.PI * 2 - om * t);
+    PH.push(rand1(i * 2 + 2) * Math.PI * 2 - phase(om));
     AA.push(aaCoef(ki, S));
   }
   return { type: "spectrum", K, DX, DY, AMP, PH, AA, N, q };
@@ -923,7 +1001,7 @@ function buildBuoy(S, fit, obj) {
       const a = (i / N) * Math.PI * 2;
       const py = my + mry * Math.sin(a);
       const px = mx + mrx * Math.cos(a)
-        + wAmp * Math.sin(((py - my) / wLen) * Math.PI * 2 + S.t * 1.7 + 1.3);
+        + wAmp * Math.sin(((py - my) / wLen) * Math.PI * 2 + loopOmega(1.7, S) * S.t + 1.3);
       d += (i === 0 ? "M" : "L") + px.toFixed(1) + " " + py.toFixed(1) + " ";
     }
     reflD = d + "Z";
@@ -2928,7 +3006,7 @@ export {
   EXPORT_POLISH, EXPORT_POLISH_DEFAULT, smoothField,
   PNG_SCALES, PNG_DEFAULT, PNG_MAX_PIXELS, pngSize, sizedSvg, svgToPngBlob, svgToCanvas,
   SPEED_MIN, SPEED_MAX, EMITTER_RATE_DEFAULT,
-  DISPERSION_DEFAULT, omegaAt, dispersionFor,
+  DISPERSION_DEFAULT, omegaAt, dispersionFor, loopOmega, loopFit,
 };
 
 // ---- layered-paper stack export -----------------------------------
@@ -4152,6 +4230,11 @@ export default function App() {
   const [pngBusy, setPngBusy] = useState(false);           // retrace + rasterize, same pause
   const [vidSec, setVidSec] = useState(VIDEO_DEFAULT_SEC); // video length, seconds
   const [vidQ, setVidQ] = useState(VIDEO_DEFAULT_SCALE);   // video frame size, x the SVG frame
+  // Perfect loop: make the field periodic over `vidLoopPhase` phase units and
+  // render exactly one period. Off by default, and off is the old export down
+  // to the arithmetic — see `loopOmega`.
+  const [vidLoop, setVidLoop] = useState(false);
+  const [vidLoopPhase, setVidLoopPhase] = useState(VIDEO_LOOP_DEFAULT_PHASE);
   const [vidBusy, setVidBusy] = useState(false);           // one frame at a time, for minutes
   const [vidProg, setVidProg] = useState(null);            // { done, total, startedAt }
   const [quality, setQuality] = useState(() =>
@@ -4388,6 +4471,7 @@ export default function App() {
     exportMeshQ: [exportMeshQ, setExportMeshQ],
     exportPolishQ: [exportPolishQ, setExportPolishQ], pngQ: [pngQ, setPngQ],
     vidSec: [vidSec, setVidSec], vidQ: [vidQ, setVidQ],
+    vidLoop: [vidLoop, setVidLoop], vidLoopPhase: [vidLoopPhase, setVidLoopPhase],
     advanced: [advanced, setAdvanced], emitters: [emitters, setEmitters],
     wakes: [wakes, setWakes],
     halfW: [halfW, setHalfW], yNear: [yNear, setYNear], yFar: [yFar, setYFar],
@@ -5022,8 +5106,13 @@ export default function App() {
   const buildSolidAt = (St, raster) => (builder
     ? builder.build(St, specOpts, raster)
     : Promise.resolve(buildSolid3D(St, makeFieldSpec(St), raster)));
-  const frameAt = async (t) => {
-    const St = { ...S, t };
+  // `loopPhase` is passed in rather than read off S because it is the video
+  // export's alone: the preview animates on the scene's true frequencies, and
+  // only the frames written to the file are snapped to close a loop. Frame 0
+  // is identical either way — the snap scales a phase term, and at t = 0 there
+  // is none — so the clip still starts on exactly the picture on screen.
+  const frameAt = async (t, loopPhase = 0) => {
+    const St = { ...S, t, loopPhase };
     if (penMode) {
       // pen mode has no filled regions at all: lines, the buoy, and paper
       return { ...liveFrame, penLines: makePenLines(St), buoy: makeBuoy(St) };
@@ -5234,7 +5323,18 @@ export default function App() {
   // never the frames still to come in this one.
   const vidAt = videoSize(VIDEO_SCALES[Math.max(0, Math.min(VIDEO_SCALES.length - 1, vidQ))],
     VB_W, VB_H);
-  const vidPlan = framePlan(vidSec, speed);
+  // The loop control is bounded by what the clip is allowed to be, so a loop
+  // once asked for is always one the file can actually hold; the stored value
+  // is left alone and clamped here, so moving Speed and moving it back gets
+  // the number the scene was saved with.
+  const loopRange = loopPhaseRange(speed);
+  const loopPhase = vidLoop
+    ? Math.min(loopRange.max, Math.max(loopRange.min, vidLoopPhase))
+    : 0;
+  const vidPlan = framePlan(vidSec, speed, VIDEO_FPS, loopPhase);
+  // what that loop costs this scene in tempo — measured, not predicted
+  const loopCost = useMemo(() => (loopPhase ? loopFit(waveS, loopPhase) : null),
+    [waveS, loopPhase]);
   const showVid = (blob, name, plan, out) => {
     let url = null;
     try {
@@ -5267,7 +5367,8 @@ export default function App() {
     try {
       const out = await encodeMp4({
         width: vidAt.w, height: vidAt.h, fps: plan.fps, count: plan.count,
-        renderFrame: async (i) => svgToCanvas(buildSvg(null, await frameAt(plan.phaseAt(i))),
+        renderFrame: async (i) => svgToCanvas(
+          buildSvg(null, await frameAt(plan.phaseAt(i), plan.loopPhase)),
           vidAt.w, vidAt.h, vidCanvasRef.current),
         onProgress: (done, total) => setVidProg({ done, total, startedAt }),
         cancelled: () => vidCancelRef.current,
@@ -6475,18 +6576,47 @@ export default function App() {
             )}
 
             <div style={{ marginTop: 14, marginBottom: 8 }}>
-              <Slider label="video length" value={vidSec} min={VIDEO_MIN_SEC} max={VIDEO_MAX_SEC}
-                step={0.5} onChange={setVidSec}
-                fmt={(v) => {
-                  const p = framePlan(v, speed);
-                  return `${p.seconds.toFixed(1)} s \u00b7 ${p.count} frames`;
-                }} />
+              {vidLoop ? (
+                <Slider label="loop length (phase)" value={loopPhase}
+                  min={loopRange.min} max={loopRange.max}
+                  step={0.1} onChange={setVidLoopPhase}
+                  fmt={(v) => `${v.toFixed(1)} \u00b7 ${loopSeconds(v, speed).toFixed(1)} s`} />
+              ) : (
+                <Slider label="video length" value={vidSec} min={VIDEO_MIN_SEC} max={VIDEO_MAX_SEC}
+                  step={0.5} onChange={setVidSec}
+                  fmt={(v) => {
+                    const p = framePlan(v, speed);
+                    return `${p.seconds.toFixed(1)} s \u00b7 ${p.count} frames`;
+                  }} />
+              )}
               <Slider label="video size" value={vidQ} min={0} max={VIDEO_SCALES.length - 1}
                 step={1} onChange={setVidQ}
                 fmt={(v) => {
                   const sz = videoSize(VIDEO_SCALES[v], VB_W, VB_H);
                   return `${sz.w} \u00d7 ${sz.h}`;
                 }} />
+              <Toggle label="Perfect loop" value={vidLoop} onChange={setVidLoop} />
+              <div style={{ fontSize: 10, color: "#6d808f", marginTop: -2, lineHeight: 1.5,
+                fontFamily: "ui-monospace, monospace" }}>
+                {vidLoop ? <>
+                  The clip is exactly one loop of {loopPhase.toFixed(1)} phase units, and the
+                  water is retuned to close it: every wave train is rounded to a whole number
+                  of cycles in that span, so the last frame runs back into the first with no
+                  jump. Sizes, headings and amplitudes are untouched — the first frame is the
+                  picture on screen — but the trains' tempos shift
+                  {loopCost ? <> by up to {(loopCost.worst * 100).toFixed(1)}% across
+                    the {loopCost.components} of them in this scene</> : null}, worst on the
+                  longest swell. Lengthen the loop, or raise Speed, and that falls away.
+                  {loopCost && loopCost.worst > 0.1 ? <span style={{ color: "#e0a37a" }}>
+                    {" "}Over 10%: this scene's slowest train barely turns inside the loop,
+                    so it will visibly run fast. A longer loop is the fix.</span> : null}
+                  {" "}The preview keeps the scene's true timing, so what this changes is
+                  only what is written to the file.
+                </> : <>
+                  Off, the file is the animation as it stands, which does not repeat: the last
+                  frame lands wherever the phase got to, and the clip pops when it loops.
+                </>}
+              </div>
             </div>
             <button onClick={exportVideo} disabled={vidBusy || pngBusy || exporting}
               title="Render the animation frame by frame and write it as an MP4"

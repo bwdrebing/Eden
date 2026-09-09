@@ -99,6 +99,18 @@ scaled inside a fixed-size `<div>` gives a zoomed crop to screenshot.
   export retrace), for the same reason the PNG is: fidelity to what was on
   screen. `videoExport.js` drives WebCodecs, `mp4.js` is the container.
   `frameAt` is async: its 3D-solid pass goes through the worker below.
+- **"Perfect loop" is the one thing the video does that the preview does not.**
+  `S.loopPhase` — a span in phase units, 0 for off — rounds every wave
+  component's frequency to a whole number of cycles in that span (`loopOmega`),
+  which is what makes the field periodic and the clip close. It reaches only
+  the frames written to the file: `frameAt` takes it as an argument rather than
+  reading it off `S`, so the preview keeps the scene's true timing. Off, every
+  phase term is the arithmetic it always was, down to the bit — that is what
+  `videoLoop.test.js` pins first, and any new time-dependent term has to keep
+  it, which means routing through `loopOmega` rather than multiplying `S.t` by
+  a frequency of its own. Snapping costs tempo only, worst on the slowest
+  train; `loopFit` measures it by baking the field at two instants rather than
+  restating the formula.
 - **The 3D-solid pass runs in a Web Worker in the browser** (`solidWorker.js`,
   reached through `solidBuilder.js`) and inline in tests, where jsdom has no
   workers and `package.json` maps the worker factory to a stub. The preview
