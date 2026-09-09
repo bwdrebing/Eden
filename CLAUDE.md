@@ -63,6 +63,17 @@ scaled inside a fixed-size `<div>` gives a zoomed crop to screenshot.
   geometry instead (no polish, no mesh stand-down; it keeps only the width
   multiplier, which resolves rather than smooths), so it is where fidelity to
   the preview lives. Keep it that way.
+- **A wave's speed is not a free parameter.** With "Speed follows wavelength"
+  on (`S.dispersion`, the default for a new scene), every train takes its
+  frequency from its own wavenumber through `omegaAt` — deep-water dispersion,
+  normalized so a 1.0× train runs at exactly the clock. Speed stays the scene's
+  one tempo and the per-emitter `rate` becomes a trim on the share the rule
+  gives each train. A scene that carries no `dispersion` at all is one saved
+  before the rule existed, and renders under the old timing so its author's
+  frozen moment is still the picture they saved — that is what the `legacy` map
+  on `useUrlSync` is for, and why both fixtures in `sceneFixtures.js` are
+  untouched by this (pass `dispersion: true` alongside one to see it under the
+  rule).
 - **Two different limits control how fine an edge can be.** `BW` is the raster
   the regions are contoured on — how finely an outline is *drawn*. `gN` is the
   wave mesh — how much surface there is *to* draw. They are not
