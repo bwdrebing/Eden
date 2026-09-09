@@ -45,6 +45,50 @@ const SPEED_MAX = 1.5;
 // without freezing the scene.
 const EMITTER_RATE_DEFAULT = 1;
 
+// Dispersion: how fast a train runs is not a free choice.
+//
+// A deep-water gravity wave obeys omega = sqrt(g k), so a train of wavelength
+// lambda bobs with period T proportional to sqrt(lambda) and its crests travel
+// at c = omega/k, also proportional to sqrt(lambda). Long swell rolls through
+// slowly but overtakes everything; short chop bobs fast and barely goes
+// anywhere. That ratio is most of what makes real water read as water, and it
+// is not something to dial in per emitter — it follows from the wavelength the
+// emitter already has.
+//
+// With the rule on, every train's frequency is derived from its own
+// wavelength, normalized to the scene's ripple scale lambda0 (S.k = 2 pi /
+// lambda0):
+//
+//     omega(k) = S.omega * sqrt(k / S.k)
+//
+// A train at 1.0x wavelength therefore runs at exactly the clock. That
+// normalization is a deliberate choice: it keeps the global "Ripple scale"
+// slider a size control only, and leaves Speed as the one tempo for the whole
+// scene, so what the rule decides is the trains' speeds *relative to each
+// other* — which is the part that reads as physical.
+//
+// Off, every train shares the clock's frequency whatever its wavelength: the
+// crests of a long swell then travel as lambda rather than sqrt(lambda), which
+// is far too fast against the chop. That is what this renderer did before the
+// rule existed, and a scene saved back then must still render as it did — so
+// a scene with no `dispersion` on it is an old scene, and gets the old rule.
+// DISPERSION_DEFAULT is what a *new* scene starts with.
+const DISPERSION_DEFAULT = true;
+
+// Angular frequency of a component of wavenumber kk under the scene's rule.
+function omegaAt(kk, S) {
+  return S.dispersion ? S.omega * Math.sqrt(kk / S.k) : S.omega;
+}
+
+// What the rule does to one emitter, in the terms the panel talks in: a train
+// at `size` x the scene's wavelength has its crests travel `crest` x as fast
+// as a 1.0x train, and bobs at `bob` x its frequency. Both are 1 with the rule
+// off. Display only — the field itself goes through omegaAt.
+function dispersionFor(size, on) {
+  const s = Math.max(1e-6, size);
+  return on ? { crest: Math.sqrt(s), bob: 1 / Math.sqrt(s) } : { crest: 1, bob: 1 };
+}
+
 const VB_W = 760;
 const VB_H = 500;
 // How much sky "Show backdrop" frames, as a fraction of the water's own
@@ -288,26 +332,37 @@ function prepEmitter(em, S) {
   // swell can roll while the chop on top of it races. It scales the phase only
   // — the shape, wavelength and amplitude of the train are untouched — which is
   // why a rate of 0 leaves a still wave pattern rather than a flat sheet.
+  //
+  // With dispersion on the gearing is mostly decided for you: each component
+  // takes its frequency from its own wavenumber through omegaAt, and `rate`
+  // stays as a deliberate trim on top of that.
   const rate = em.rate == null ? EMITTER_RATE_DEFAULT : em.rate;
   const t = S.t * rate;
-  const wt = S.omega * t;
   const q = S.sharp || 0;   // Stokes-style crest sharpening, 2nd harmonic weight
 
   if (em.type === "point") {
     // em.decay overrides the global reach — used by the buoy's scattered
     // ripples, which should stay local to the hull
     const decay = (em.decay ?? S.decay) / Math.max(0.6, em.size);
-    return { type: "point", x: em.x, y: em.y, k0: 2 * Math.PI / baseLambda, A, decay, wt };
+    const k0 = 2 * Math.PI / baseLambda;
+    // the ring expands at this train's own phase speed omega/k, not the
+    // clock's — a wide ripple spreads faster than a tight one
+    return { type: "point", x: em.x, y: em.y, k0, A, decay, wt: omegaAt(k0, S) * t };
   }
   if (em.type === "swell") {
     const a = (em.dir * Math.PI) / 180;
     const k0 = 2 * Math.PI / baseLambda;
-    return { type: "swell", k0, Dx: Math.cos(a), Dy: Math.sin(a), A, ph0: -wt,
-      q, aa: aaCoef(k0, S) };
+    return { type: "swell", k0, Dx: Math.cos(a), Dy: Math.sin(a), A,
+      ph0: -omegaAt(k0, S) * t, q, aa: aaCoef(k0, S) };
   }
   if (em.type === "wake") {
     // λ₀ is the vessel's length, read straight off the control in scene units
-    // instead of through S.k — that is what keeps the wake's scale its own
+    // instead of through S.k — that is what keeps the wake's scale its own.
+    //
+    // No phase term anywhere below, and dispersion adds none: a Kelvin wake is
+    // already the steady pattern a hull drags along with it, standing still in
+    // the hull's own frame. Its crests do obey the dispersion relation — that
+    // is where the 19.47deg wedge comes from — but as geometry, not as timing.
     const lam = Math.max(0.25, em.scale);
     const a = ((em.dir || 0) * Math.PI) / 180;
     const ex = Math.cos(a), ey = Math.sin(a);          // heading (way on)
@@ -338,9 +393,12 @@ function prepEmitter(em, S) {
       CX.push(S.xMin + (S.xMax - S.xMin) * rand1(i * 3 + 1));
       CY.push(S.yMin + (S.yMax - S.yMin) * rand1(i * 3 + 2));
       const lam = baseLambda * (1 + (rand1(i * 3 + 5) - 0.5) * 1.2 * rough);
-      K.push(2 * Math.PI / Math.max(0.2, lam));
+      const ki = 2 * Math.PI / Math.max(0.2, lam);
+      K.push(ki);
       AMP.push(A * (0.6 + 0.7 * rand1(i * 7 + 3)));
-      PH.push(rand1(i * 11 + 4) * Math.PI * 2 - wt);
+      // each source spreads at the rate its own wavelength earns it, so a
+      // varied field stops pulsing in unison the moment the rule is on
+      PH.push(rand1(i * 11 + 4) * Math.PI * 2 - omegaAt(ki, S) * t);
     }
     return { type: "rings", M, CX, CY, K, AMP, PH, dec };
   }
@@ -359,7 +417,14 @@ function prepEmitter(em, S) {
       * (1 + (rand1(i * 5 + 9) - 0.5) * 0.35);
     const ki = 2 * Math.PI / lam;
     const th = wind + (rand1(i * 2 + 1) - 0.5) * 2 * spread * (0.7 + 0.6 * f);
-    const om = Math.sqrt(ki) * S.omega;
+    // A spectrum has always dispersed internally — it is a ladder of octaves,
+    // and they never moved together. What the rule changes is the reference it
+    // is measured against: sqrt(ki) alone puts omega = S.omega at ki = 1, an
+    // arbitrary length that has nothing to do with this scene, so a spectrum's
+    // tempo used to drift with the global ripple scale and never matched a
+    // swell of the same wavelength. omegaAt normalizes it to lambda0, which is
+    // what puts every emitter type on one rule.
+    const om = S.dispersion ? omegaAt(ki, S) : Math.sqrt(ki) * S.omega;
     K.push(ki);
     DX.push(Math.cos(th));
     DY.push(Math.sin(th));
@@ -2863,6 +2928,7 @@ export {
   EXPORT_POLISH, EXPORT_POLISH_DEFAULT, smoothField,
   PNG_SCALES, PNG_DEFAULT, PNG_MAX_PIXELS, pngSize, sizedSvg, svgToPngBlob, svgToCanvas,
   SPEED_MIN, SPEED_MAX, EMITTER_RATE_DEFAULT,
+  DISPERSION_DEFAULT, omegaAt, dispersionFor,
 };
 
 // ---- layered-paper stack export -----------------------------------
@@ -3829,8 +3895,12 @@ const miniBtnBase = {
   fontFamily: "ui-monospace, monospace",
 };
 
-function EmitterCard({ em, idx, halfW, yFar, onChange, onRemove }) {
+function EmitterCard({ em, idx, halfW, yFar, dispersion, onChange, onRemove }) {
   const types = [["point", "Point"], ["rings", "Rings"], ["swell", "Swell"], ["spectrum", "Spectrum"]];
+  // What the wavelength slider just bought this train, in the terms the Speed
+  // panel states the rule in. For a spectrum this is its dominant component;
+  // the shorter rungs of its ladder run faster still.
+  const disp = dispersionFor(em.size, dispersion);
   return (
     <div style={{ border: "1px solid #26313c", borderRadius: 9, padding: 11,
       marginBottom: 10, background: "#121922" }}>
@@ -3888,9 +3958,16 @@ function EmitterCard({ em, idx, halfW, yFar, onChange, onRemove }) {
 
       <Slider label={em.type === "spectrum" ? "dominant wavelength" : "wavelength"} value={em.size}
         min={0.3} max={5} step={0.1} onChange={(v) => onChange({ size: v })} fmt={(v) => v.toFixed(1) + "×"} />
+      {dispersion && (
+        <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5, marginTop: -6,
+          marginBottom: 10, fontFamily: "ui-monospace, monospace" }}>
+          at that length the rule gives it crests at {disp.crest.toFixed(2)}× the
+          scene's own speed, bobbing at {disp.bob.toFixed(2)}× its rate
+        </div>
+      )}
       <Slider label="strength" value={em.amp} min={0} max={2} step={0.05}
         onChange={(v) => onChange({ amp: v })} fmt={(v) => v.toFixed(2)} />
-      <Slider label="rate (× the scene clock)"
+      <Slider label={dispersion ? "rate (trim on the above)" : "rate (× the scene clock)"}
         value={em.rate == null ? EMITTER_RATE_DEFAULT : em.rate}
         min={0} max={3} step={0.05} onChange={(v) => onChange({ rate: v })}
         fmt={(v) => (v === 0 ? "frozen" : v.toFixed(2) + "\u00d7")} />
@@ -4061,6 +4138,9 @@ export default function App() {
   const [edges, setEdges] = useState(false);
   const [animate, setAnimate] = useState(false);
   const [speed, setSpeed] = useState(0.5);
+  // On for a new scene; a link saved before the rule existed reopens with it
+  // off (see the `legacy` map on useUrlSync below) so it renders as saved.
+  const [dispersion, setDispersion] = useState(DISPERSION_DEFAULT);
   const [manualTime, setManualTime] = useState(0); // scrub the wave phase when not animating
   const [lowPower, setLowPower] = useState(false);  // cap resolution + throttle animation
   const [rasterQ, setRasterQ] = useState(RASTER_DEFAULT); // 3D surface resolution step
@@ -4301,7 +4381,8 @@ export default function App() {
     rectOutput: [rectOutput, setRectOutput], surface3d: [surface3d, setSurface3d],
     waveScale: [waveScale, setWaveScale], edges: [edges, setEdges],
     crestGap: [crestGap, setCrestGap], crestGapColor: [crestGapColor, setCrestGapColor],
-    animate: [animate, setAnimate], speed: [speed, setSpeed], quality: [quality, setQuality],
+    animate: [animate, setAnimate], speed: [speed, setSpeed],
+    dispersion: [dispersion, setDispersion], quality: [quality, setQuality],
     manualTime: [manualTime, setManualTime], lowPower: [lowPower, setLowPower],
     rasterQ: [rasterQ, setRasterQ], exportQ: [exportQ, setExportQ],
     exportMeshQ: [exportMeshQ, setExportMeshQ],
@@ -4331,6 +4412,11 @@ export default function App() {
     brushShape: [brushShape, setBrushShape], bdoc: [docCode, restoreDoc],
     env2d: [null, restoreEnv2d],                 // read-only: pre-layers links
     showBackdrop: [showBackdrop, setShowBackdrop],
+  }, {
+    // A saved link that carries no `dispersion` was written before the rule
+    // existed, and its author picked a frozen moment under the old timing.
+    // Reopen it under the old timing.
+    dispersion: false,
   });
 
   // Switching modes must never destroy work. A pristine buffer picks up the
@@ -4598,13 +4684,14 @@ export default function App() {
     sharp,
     decay: 0.18 - spread * 0.16,
     omega: 1.0,
+    dispersion,
     // waves scatter off the buoy's hull: a ring source pinned to the object,
     // with a tight decay so the disturbance stays local
     emitters: withWakes(objOn && objRipple > 0
       ? [...emitters, { id: "buoy", on: true, type: "point", x: objX, y: objY,
           size: Math.max(0.3, objSize * objRippleScale), amp: objRipple * 1.5, decay: 0.28 }]
       : emitters, wakes),
-  }), [camS, wavelength, strength, sharp, spread, emitters, wakes,
+  }), [camS, wavelength, strength, sharp, spread, dispersion, emitters, wakes,
        objOn, objX, objY, objSize, objRipple, objRippleScale]);
 
   const S = useMemo(() => ({
@@ -6042,9 +6129,21 @@ export default function App() {
                   its rate — for the animation above and for the video export alike. Turning
                   it down and the video length up is how you get the same stretch of water
                   to unfold slowly: a {vidPlan.seconds.toFixed(1)} s export covers
-                  {" "}{vidPlan.endPhase.toFixed(1)} of phase at this setting. Under advanced,
-                  each emitter has its own rate against this one, so a long swell can roll
-                  while the chop on top of it races.
+                  {" "}{vidPlan.endPhase.toFixed(1)} of phase at this setting.
+                </div>
+                <Toggle label="Speed follows wavelength" value={dispersion}
+                  onChange={setDispersion} />
+                <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5, marginTop: -4,
+                  fontFamily: "ui-monospace, monospace" }}>
+                  Real water disperses: a long wave rolls through slowly and overtakes
+                  everything, a short one bobs fast and barely travels. With this on, the
+                  clock above stays the scene's one tempo and each train's share of it is
+                  worked out from its own wavelength — crests carry as √λ, the bob as 1/√λ —
+                  so a swell at 4.0× runs its crests through twice as fast as one at 1.0×
+                  and oscillates half as often. Off, every train bobs at the clock's rate
+                  whatever its size, which sends long swell across the frame far too fast.
+                  Under advanced each emitter still keeps a rate, now a trim on the share
+                  the rule gives it.
                 </div>
               </div>
               {animate ? null : (
@@ -6074,12 +6173,18 @@ export default function App() {
                   Swell = one long straight-crested wave train. Spectrum = a wind field of many
                   straight waves (raise roughness for chop). Rings = a scattered field of radial
                   ripples — the source of the concentric color rings you see on a real lake.
-                  Point = a single spreading ripple. Each carries a rate — its gearing off
-                  the scene clock — so a long swell can roll under fast chop, or one train
-                  can be frozen while the rest of the water moves.
+                  Point = a single spreading ripple.
+                  {dispersion
+                    ? " Speed follows wavelength is on, so each card shows the share of the"
+                      + " clock its wavelength earns it; the rate below that is a trim on"
+                      + " top, and 0 still freezes one train while the rest of the water moves."
+                    : " Each carries a rate — its gearing off the scene clock — so a long"
+                      + " swell can roll under fast chop, or one train can be frozen while"
+                      + " the rest of the water moves."}
                 </div>
                 {emitters.map((em, i) => (
                   <EmitterCard key={em.id} em={em} idx={i} halfW={halfW} yFar={yFar}
+                    dispersion={dispersion}
                     onChange={(patch) => updateEmitter(em.id, patch)}
                     onRemove={() => removeEmitter(em.id)} />
                 ))}

@@ -447,6 +447,12 @@ export function buildScene(settings) {
     sharp: g.sharp,
     decay: 0.18 - g.spread * 0.16,
     omega: 1.0, t: g.manualTime,
+    // Both fixtures were saved before "speed follows wavelength" existed, and
+    // neither carries the key — so, exactly as the studio does with a link
+    // that predates it, they render under the old timing and stay the
+    // before/after reference they were. Pass `dispersion: true` alongside a
+    // fixture to see the same scene under the rule.
+    dispersion: !!g.dispersion,
     bands: g.bands, perspective: g.perspective, eLo: g.eLo, eHi: g.eHi,
     zoom: g.zoom, panX: g.panX, panY: g.panY, smooth: g.smooth,
     coherence: g.coherence, rectOutput: g.rectOutput,
