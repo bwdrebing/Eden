@@ -32,27 +32,110 @@
 // ------------------------------------------------------------------ //
 import * as d3 from "d3";
 import { distTransform, blurField } from "./field";
-import { flattenDoc } from "./document";
+import { renderContent, docHasShapes } from "./document";
+import { rasterizeShapes } from "./shapes";
+import { makePlanePlace } from "./place";
 
 export const MAX_REGIONS = 160;
+// A shape layer is stated, not painted, so it can be rendered onto a finer
+// grid than the brush works at — which is the whole reason a stated edge beats
+// a painted one. The distance transform is linear in the cell count and runs
+// once per document, so paying 16x for it buys edges the brush could not draw.
+export const COMPILE_SCALE = 4;
 
-// Distinct colors of a raster, stacked bottom-up by the mean row of their
-// painted cells — the 2D generalization of the 1D band order.
-function rasterRegions(env) {
-  const { w: EW, h: EH, cells } = env;
-  const colorId = new Map(), colorOf = [], areas = [];
-  const labels = new Int32Array(EW * EH);
-  for (let p = 0; p < EW * EH; p++) {
-    const c = cells[p];
-    let id = colorId.get(c);
-    if (id === undefined) { id = colorOf.length; colorId.set(c, id); colorOf.push(c); areas.push(0); }
-    labels[p] = id; areas[id]++;
+/**
+ * Composite a document into cells plus a label per cell saying WHICH REGION
+ * painted it — which is the thing the old model could not say. It keyed a
+ * region on its hex colour, so two shapes of one colour fused into one region
+ * and an object's colour had to be nudged a few bits to stop it happening.
+ *
+ * Painted, ramp and repeat layers still key on colour, per layer: that is what
+ * "a colour is a band" means for them, and it keeps a one-layer document
+ * identical to what it compiled to before. Shape layers key per shape.
+ */
+function flattenKeyed(doc, EW, EH, flats, fillHoles) {
+  const rowScale = EH / doc.h, colScale = EW / doc.w;
+  const cells = new Array(EW * EH).fill(null);
+  const labels = new Int32Array(EW * EH).fill(-1);
+  const info = [];                              // label -> { color, layer, item }
+  const seen = new Map();
+  const keyFor = (name, color, layer, item) => {
+    let k = seen.get(name);
+    if (k === undefined) { k = info.length; seen.set(name, k); info.push({ color, layer, item }); }
+    return k;
+  };
+
+  flats.forEach((f, li) => {
+    if (!f.visible) return;
+    if (f.content.kind === "shapes") {
+      const items = f.content.items;
+      const { cells: sc, keys: sk } = rasterizeShapes(items, EW, EH, (item, role) => {
+        const color = role === "accent" ? item.color2
+          : role === "rim" ? (item.rimColor || "#070a0e") : item.color;
+        return keyFor(`${li}:${item.id}:${role}`, color, li, items.indexOf(item));
+      });
+      for (let p = 0; p < EW * EH; p++) {
+        if (sc[p] != null) { cells[p] = sc[p]; labels[p] = sk[p]; }
+      }
+    } else {
+      // Colour-keyed layers are authored at the document's own resolution —
+      // the brush paints there, and a ramp's colours are its rows. Rendering
+      // one onto the finer grid would not add detail, it would subdivide the
+      // ramp into four times as many colours, and a smooth palette would blow
+      // the region budget on its own. So render at the document's size and
+      // repeat each cell.
+      const src = renderContent(f.content, doc.w, doc.h, 1);
+      for (let r = 0; r < EH; r++) {
+        const sr = Math.min(doc.h - 1, Math.floor(r / rowScale));
+        for (let c = 0; c < EW; c++) {
+          const v = src[sr * doc.w + Math.min(doc.w - 1, Math.floor(c / colScale))];
+          if (v == null) continue;
+          const p = r * EW + c;
+          cells[p] = v;
+          labels[p] = keyFor(`${li}:c:${v}`, v, li, -1);
+        }
+      }
+    }
+  });
+
+  let fill = -1;
+  for (let p = 0; p < EW * EH; p++) if (labels[p] >= 0) { fill = labels[p]; break; }
+  if (fill < 0) return null;
+  // The furthest flat is what the water falls back on, so it may not have a
+  // hole in it: a null cell has no colour to contour, and anything still
+  // uncovered takes the lowest colour it can see. A board is the opposite —
+  // its transparent cells are where the sky behind it shows through, and
+  // filling them would turn every board into a solid slab.
+  if (fillHoles) {
+    for (let p = 0; p < EW * EH; p++) {
+      if (labels[p] < 0) { labels[p] = fill; cells[p] = info[fill].color; }
+    }
   }
-  const K = colorOf.length;
-  const rowSum = new Float64Array(K);
-  for (let p = 0; p < EW * EH; p++) rowSum[labels[p]] += (p / EW) | 0;
-  const order = d3.range(K).sort((a, b) => rowSum[a] / areas[a] - rowSum[b] / areas[b]);
-  return { EW, EH, cells, labels, colorOf, areas, order, K };
+  return { cells, labels, info };
+}
+
+// Stack the regions bottom-up. Within a colour-keyed layer that is the mean
+// row of the region's cells, as it has always been; a shape layer keeps the
+// order the shapes are in, which is the order they were drawn in and the order
+// the panel shows. Layers themselves stack in their own order.
+function stackRegions(doc, EW, EH, flats, fillHoles) {
+  const flat = flattenKeyed(doc, EW, EH, flats, fillHoles);
+  if (!flat) return null;
+  const { cells, labels, info } = flat;
+  const K = info.length;
+  const areas = new Float64Array(K), rowSum = new Float64Array(K);
+  for (let p = 0; p < EW * EH; p++) {
+    const k = labels[p];
+    if (k < 0) continue;                        // a hole in a board
+    areas[k]++; rowSum[k] += (p / EW) | 0;
+  }
+  const meanRow = (k) => (areas[k] ? rowSum[k] / areas[k] : 0);
+  const order = d3.range(K).sort((a, b) => {
+    if (info[a].layer !== info[b].layer) return info[a].layer - info[b].layer;
+    if (info[a].item >= 0 && info[b].item >= 0) return info[a].item - info[b].item;
+    return meanRow(a) - meanRow(b);
+  });
+  return { EW, EH, cells, labels, colorOf: info.map((i) => i.color), areas, order, K };
 }
 
 // Walk the stack from the top down, handing each region its signed distance
@@ -104,17 +187,65 @@ function eachStackField(stack, visit) {
  *   overflow   true when there are more regions than the smooth path can take
  *   eachField  hand each region its signed distance field, top down
  */
-export function compileBackdrop(doc) {
-  const env = flattenDoc(doc);
-  if (!env) return null;
-  const stack = rasterRegions(env);
+function groupOf(stack, place) {
   const { colorOf, order, K } = stack;
   return {
+    place,
     EW: stack.EW, EH: stack.EH, cells: stack.cells,
-    bg: stack.cells[0],
     count: K,
-    overflow: K > MAX_REGIONS,
     colorAt: (k) => colorOf[order[k]],
     eachField: (visit) => eachStackField(stack, visit),
+  };
+}
+
+/**
+ * Compile a document into what the renderer needs.
+ *
+ * The result is a list of GROUPS, furthest first. Every flat on the sky is one
+ * group — they share a coordinate space, so they composite into one grid the
+ * way they always have. A flat standing at a distance is its own group,
+ * because it has its own space: its own ray query, its own hit and miss.
+ *
+ * Across groups the renderer paints far to near with each group drawn whole,
+ * so no group cuts a hole in the one behind it and there is no seam to open.
+ * Within a group the union construction is unchanged, which is what keeps
+ * neighbours from parting. A document with no boards compiles to exactly one
+ * group, which is exactly what it compiled to before there were boards.
+ */
+export function compileBackdrop(doc, opts = {}) {
+  // shapes render onto a finer grid than the brush paints on; everything else
+  // compiles at the resolution it was authored at
+  const scale = opts.scale || (docHasShapes(doc) ? COMPILE_SCALE : 1);
+  const EW = doc.w * scale, EH = doc.h * scale;
+
+  const sky = doc.flats.filter((f) => !f.place || f.place.kind !== "plane");
+  const boards = doc.flats.filter((f) => f.place && f.place.kind === "plane");
+
+  const groups = [];
+  const skyStack = sky.length ? stackRegions(doc, EW, EH, sky, true) : null;
+  // the sky is a flat at infinity, and saying so keeps the group list
+  // self-describing: every group has a distance, and they come out sorted
+  if (skyStack) groups.push(groupOf(skyStack, { kind: "sky", distance: Infinity }));
+  // furthest board first; boards at the same distance keep the document's order
+  boards
+    .map((f, i) => ({ f, i }))
+    .sort((a, b) => (b.f.place.distance - a.f.place.distance) || (a.i - b.i))
+    .forEach(({ f }) => {
+      const st = stackRegions(doc, EW, EH, [f], false);
+      if (st) groups.push(groupOf(st, makePlanePlace(f.place)));
+    });
+  if (!groups.length) return null;
+
+  const count = groups.reduce((n, g) => n + g.count, 0);
+  const base = groups[0];
+  return {
+    groups, scale, count,
+    overflow: count > MAX_REGIONS,
+    // the furthest group is the one the water falls back on, and the one the
+    // single-group paths (the panorama preview, the paper export) still read
+    EW: base.EW, EH: base.EH, cells: base.cells,
+    bg: base.cells[0],
+    colorAt: (k) => base.colorAt(k),
+    eachField: (visit) => base.eachField(visit),
   };
 }
