@@ -3,6 +3,11 @@ import {
   paletteStops, paletteColorAt, DERIVED_ENV_H, ENV2D_W, DEFAULT_EMITTERS,
   computeFit, cell2ground, heightAt, clampLift, penProject,
 } from "./WaterReflectionContours";
+import { compileBackdrop } from "./backdrop/compile";
+import { docFromPanorama } from "./backdrop/document";
+
+// the renderer takes a compiled backdrop document, not a raw grid of cells
+const bd = (env) => compileBackdrop(docFromPanorama(env));
 
 /* ------------------------------------------------------------------ *
  * 1D vs 2D fidelity parity
@@ -59,7 +64,7 @@ test("striped 2D panorama keeps the 1D path's ring detail", () => {
   const n1 = subpaths(geom1d().ds);
   expect(n1).toBeGreaterThan(50); // sanity: the scene is genuinely detailed
 
-  const seg = buildSegmentation(baseS(), stripedEnv(), AZ);
+  const seg = buildSegmentation(baseS(), bd(stripedEnv()), AZ);
   expect(seg.layers).toBeTruthy(); // union path, not the >160-color fallback
   const n2 = subpaths(seg.layers.map((l) => l.d));
   expect(n2).toBeGreaterThanOrEqual(0.8 * n1);
@@ -71,7 +76,7 @@ test("adding a reflected object does not collapse scene detail", () => {
     { id: 1, on: true, type: "sailboat", az: 14, size: 8, color: "#c2521f", color2: "#efe9d9" },
   ];
   const env = stampObjects(stripedEnv(), objects, AZ, 0, 20);
-  const seg = buildSegmentation(baseS(), env, AZ);
+  const seg = buildSegmentation(baseS(), bd(env), AZ);
   expect(seg.layers).toBeTruthy();
   const n2 = subpaths(seg.layers.map((l) => l.d));
   expect(n2).toBeGreaterThanOrEqual(0.8 * n1);
@@ -84,7 +89,7 @@ test("3D waves: 2D layers hug the lifted water edge (no container walls)", () =>
   // the lifted water edge; if they hang outside it, every layer grows a
   // colored apron below the near edge ("sides like a container").
   const S = { ...baseS(), surface3d: true, waveScale: 8 };
-  const seg = buildSegmentation(S, stripedEnv(), AZ); // also preps S._ems
+  const seg = buildSegmentation(S, bd(stripedEnv()), AZ); // also preps S._ems
 
   let maxY = -Infinity; // bottom-most vertex across all layers
   for (const l of seg.layers) {
@@ -107,8 +112,8 @@ test("3D waves: 2D layers hug the lifted water edge (no container walls)", () =>
 test("the de-jitter blur is opt-in: coherence 0 must not smooth", () => {
   // raising coherence should strictly reduce detail; at 0 the segmentation
   // must sit at (or above) the smoothed count — i.e. the blur is not baked in
-  const sharp = buildSegmentation(baseS(), stripedEnv(), AZ);
-  const calm = buildSegmentation({ ...baseS(), coherence: 4 }, stripedEnv(), AZ);
+  const sharp = buildSegmentation(baseS(), bd(stripedEnv()), AZ);
+  const calm = buildSegmentation({ ...baseS(), coherence: 4 }, bd(stripedEnv()), AZ);
   const nSharp = subpaths(sharp.layers.map((l) => l.d));
   const nCalm = subpaths(calm.layers.map((l) => l.d));
   expect(nSharp).toBeGreaterThan(nCalm);
@@ -137,7 +142,7 @@ test("adding an object does not change the reflection where it isn't", () => {
     { id: 1, on: true, type: "sailboat", az: 14, size: 8, color: "#c2521f", color2: "#efe9d9" },
   ];
   const env = stampObjects(stripedEnv(), objects, AZ, 0, 20);
-  const withObj = buildSegmentation({ ...baseS(), coherence: COH }, env, AZ);
+  const withObj = buildSegmentation({ ...baseS(), coherence: COH }, bd(env), AZ);
   const n1 = subpaths(noObj.ds);
   const n2 = subpaths(withObj.layers.map((l) => l.d));
   // the object adds a little (its own silhouette + ink rim) but must not

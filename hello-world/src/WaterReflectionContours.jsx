@@ -3,6 +3,24 @@ import * as d3 from "d3";
 import { labelRegions, buildAdjacency, denoiseGrid, planCollapse } from "./paperStack";
 import { useUrlSync } from "./urlSettings";
 import { extractPhotoStrip } from "./photoPalette";
+import { decodeEnv2d } from "./env2dCodec";
+import { emptyHistory, pushEdit, undo as undoHist, redo as redoHist, canUndo, canRedo }
+  from "./backdropHistory";
+import { distTransform, blurField } from "./backdrop/field";
+import { magFrac, rayAngles, makeSkyPlace } from "./backdrop/place";
+import {
+  envFromRows, smoothEnv2D, docFromPanorama, docFromPalette, stripesContent,
+  emptyRaster, renderContent, flattenDoc, updateFlat, addFlat, duplicateFlat,
+  removeFlat, moveFlat, bakeFlat, paintFlat, flatIndex, kindLabel, stripesPeriod,
+  backdropDoc, flat, rasterContent,
+} from "./backdrop/document";
+import { encodeDoc, decodeDoc } from "./backdrop/codec";
+import {
+  STAMPS, SHAPE_KINDS, shape, shapesContent, shapeAt, shapeBox, shapeLabel,
+} from "./backdrop/shapes";
+import { compileBackdrop, COMPILE_SCALE } from "./backdrop/compile";
+import { PALETTES, BANDED_PALETTES, paletteStops, paletteColorAt, paletteNames }
+  from "./backdrop/palettes";
 import { createSolidBuilder } from "./solidBuilder";
 import {
   VIDEO_FPS, VIDEO_MIN_SEC, VIDEO_MAX_SEC, VIDEO_DEFAULT_SEC,
@@ -16,59 +34,6 @@ import {
  *  Color blobs = isobands of φ. Contour the scalar field, fill between
  *  thresholds, project to a grazing camera. No raster, no ray tracer.
  * ------------------------------------------------------------------ */
-
-const PALETTES = {
-  "Sunset Lake": ["#1b1640", "#4a2273", "#8e2f72", "#d04e5d", "#f0913f", "#f7d774", "#fbf0cf"],
-  "Tunic Glass": ["#0a2b30", "#0f5454", "#1c8a80", "#56bda3", "#bfe2bd", "#eccd83", "#f6ead0"],
-  "Treeline":    ["#0a130d", "#10301d", "#2c5736", "#6a8a64", "#b6b08e", "#e3a974", "#b9d6ed"],
-  "Obra Dinn":   ["#0b0b0b", "#262626", "#565656", "#8f8f8f", "#c7c7c7", "#f2f2f2"],
-};
-
-// Banded palettes: piecewise-constant elevation strips [color, weight] from
-// horizon (first) to zenith (last), instead of a smooth ramp. The thin dark
-// strips are the key: the reflected-elevation field is continuous, so every
-// boundary between the bands on either side must pass THROUGH the strip —
-// it draws itself as a closed hairline outline around each color region,
-// the "ink line" look of real harbor-water reflections.
-const BANDED_PALETTES = {
-  // each ink strip gets a visually identical but UNIQUE hex: a repeated color
-  // fuses into one multi-strip region in the 2D segmentation, whose union
-  // layer grows hairline protrusions that the sliver blur then eats. Unique
-  // strips keep every union a clean upper set of elevation.
-  "Harbor Ink": [
-    ["#eef7fb", 0.15], ["#06090d", 0.022], ["#9fd2e2", 0.15], ["#070a0e", 0.022],
-    ["#4b93bd", 0.16], ["#05080c", 0.022], ["#20608a", 0.15], ["#060a0e", 0.022],
-    ["#143b58", 0.14], ["#07090d", 0.026], ["#0d2334", 0.126],
-  ],
-  "Sunset Buoy": [
-    ["#f6edc9", 0.13], ["#e5a94b", 0.05], ["#cd5a28", 0.028], ["#f2d98a", 0.07],
-    ["#8c9cc8", 0.12], ["#c8551f", 0.024], ["#46689e", 0.14], ["#2b1710", 0.024],
-    ["#31518a", 0.13], ["#15101e", 0.05], ["#101c38", 0.12], ["#7e2d12", 0.022],
-    ["#060a14", 0.09],
-  ],
-  "Black Water": [
-    ["#d9f0f4", 0.12], ["#f6fbfb", 0.02], ["#a7c4ef", 0.13], ["#8e959d", 0.024],
-    ["#7e97dd", 0.14], ["#494f58", 0.024], ["#0b0e13", 0.22], ["#b9c8ee", 0.028],
-    ["#05070b", 0.294],
-  ],
-};
-
-// cumulative stops of a banded palette: [{c, f0, f1}] with f = fraction of the
-// elevation range, horizon (0) -> zenith (1). null for smooth palettes.
-function paletteStops(name) {
-  const b = BANDED_PALETTES[name];
-  if (!b) return null;
-  const total = b.reduce((s, [, w]) => s + w, 0);
-  let acc = 0;
-  return b.map(([c, w]) => { const f0 = acc / total; acc += w; return { c, f0, f1: acc / total }; });
-}
-
-function paletteColorAt(name, f) {
-  const stops = paletteStops(name);
-  if (!stops) return d3.interpolateRgbBasis(PALETTES[name])(f);
-  for (const s of stops) if (f < s.f1) return s.c;
-  return stops[stops.length - 1].c;
-}
 
 // How fast the one clock runs. The floor is low enough that ten seconds of
 // video can cover a couple of phase — a long slow swell rather than a loop —
@@ -90,8 +55,64 @@ const EMITTER_RATE_DEFAULT = 1;
 // only the scaling either side of it changes.
 const SPECTRUM_N_REF = 16;
 
+// Dispersion: how fast a train runs is not a free choice.
+//
+// A deep-water gravity wave obeys omega = sqrt(g k), so a train of wavelength
+// lambda bobs with period T proportional to sqrt(lambda) and its crests travel
+// at c = omega/k, also proportional to sqrt(lambda). Long swell rolls through
+// slowly but overtakes everything; short chop bobs fast and barely goes
+// anywhere. That ratio is most of what makes real water read as water, and it
+// is not something to dial in per emitter — it follows from the wavelength the
+// emitter already has.
+//
+// With the rule on, every train's frequency is derived from its own
+// wavelength, normalized to the scene's ripple scale lambda0 (S.k = 2 pi /
+// lambda0):
+//
+//     omega(k) = S.omega * sqrt(k / S.k)
+//
+// A train at 1.0x wavelength therefore runs at exactly the clock. That
+// normalization is a deliberate choice: it keeps the global "Ripple scale"
+// slider a size control only, and leaves Speed as the one tempo for the whole
+// scene, so what the rule decides is the trains' speeds *relative to each
+// other* — which is the part that reads as physical.
+//
+// Off, every train shares the clock's frequency whatever its wavelength: the
+// crests of a long swell then travel as lambda rather than sqrt(lambda), which
+// is far too fast against the chop. That is what this renderer did before the
+// rule existed, and a scene saved back then must still render as it did — so
+// a scene with no `dispersion` on it is an old scene, and gets the old rule.
+// DISPERSION_DEFAULT is what a *new* scene starts with.
+const DISPERSION_DEFAULT = true;
+
+// Angular frequency of a component of wavenumber kk under the scene's rule.
+function omegaAt(kk, S) {
+  return S.dispersion ? S.omega * Math.sqrt(kk / S.k) : S.omega;
+}
+
+// What the rule does to one emitter, in the terms the panel talks in: a train
+// at `size` x the scene's wavelength has its crests travel `crest` x as fast
+// as a 1.0x train, and bobs at `bob` x its frequency. Both are 1 with the rule
+// off. Display only — the field itself goes through omegaAt.
+function dispersionFor(size, on) {
+  const s = Math.max(1e-6, size);
+  return on ? { crest: Math.sqrt(s), bob: 1 / Math.sqrt(s) } : { crest: 1, bob: 1 };
+}
+
 const VB_W = 760;
 const VB_H = 500;
+// How much sky "Show backdrop" frames, as a fraction of the water's own
+// projected height above the horizon.
+const SKY_PAD = 0.55;
+// Raster the drawn backdrop is contoured on. It carries no ripple detail — its
+// edges are the backdrop's own, and on a pinhole camera they are conics — so
+// it needs far less grid than the water, and one round of corner-cutting
+// rather than the water's three. Both matter: a smooth 1D ramp draws sixty-odd
+// bands up here, and cost is per band.
+const SKY_BW = 300;
+const SKY_SMOOTH = 1;
+// what a composed field reads where its flat is not there at all
+const OFF_FLAT = -1e3;
 
 const DEFAULT_EMITTERS = [
   { id: 1, on: true, type: "swell",    x: 0, y: 20, dir: 65,  size: 3.2, amp: 1.85, spread: 25, roughness: 0.4,  detail: 14 },
@@ -505,7 +526,10 @@ function prepSea(em, S, A, t) {
     // unit variance, so the heading distribution has shoulders like a real one
     const tri = (rand1(i * 3 + 11) + rand1(i * 3 + 12) - 1) * 2.449;
     const th = wind + sig * Math.max(-2.6, Math.min(2.6, tri));
-    const om = Math.sqrt(k) * S.omega;
+    // one rule for every train in the scene: this component's own wavenumber
+    // through omegaAt, so a sea's ladder keeps step with a swell of the same
+    // wavelength instead of measuring itself against an arbitrary k = 1
+    const om = omegaAt(k, S);
     K.push(k); DX.push(Math.cos(th)); DY.push(Math.sin(th)); AMP.push(a);
     PH.push(rand1(i * 2 + 2) * Math.PI * 2 - om * t);
     AA.push(aaCoef(k, S));
@@ -518,9 +542,11 @@ function prepSea(em, S, A, t) {
   const patch = Math.max(0, Math.min(1, em.patch == null ? SEA_PATCH_DEFAULT : em.patch));
   const group = Math.max(0, Math.min(1, em.group == null ? SEA_GROUP_DEFAULT : em.group));
   const chop = Math.max(0, Math.min(1, em.chop == null ? SEA_CHOP_DEFAULT : em.chop));
-  // Peak phase speed; groups travel at half of it (deep water), and the gust
+  // Peak phase speed, c = omega/k, taken through the scene's own dispersion
+  // rule so the envelopes travel with the waves they are riding on rather than
+  // at a speed of their own. Groups go at half of it (deep water), and the gust
   // field is carried downwind at about the same rate.
-  const cp = S.omega / Math.sqrt(kp);
+  const cp = omegaAt(kp, S) / kp;
   const wx = Math.cos(wind), wy = Math.sin(wind);
   const ns = 1 / Math.max(SEA_PATCH_MIN_LAM * lamP,
     SEA_PATCH_FRAC * Math.max(S.xMax - S.xMin, S.yMax - S.yMin));
@@ -652,28 +678,39 @@ function prepEmitter(em, S) {
   // swell can roll while the chop on top of it races. It scales the phase only
   // — the shape, wavelength and amplitude of the train are untouched — which is
   // why a rate of 0 leaves a still wave pattern rather than a flat sheet.
+  //
+  // With dispersion on the gearing is mostly decided for you: each component
+  // takes its frequency from its own wavenumber through omegaAt, and `rate`
+  // stays as a deliberate trim on top of that.
   const rate = em.rate == null ? EMITTER_RATE_DEFAULT : em.rate;
   const t = S.t * rate;
-  const wt = S.omega * t;
   const q = S.sharp || 0;   // Stokes-style crest sharpening, 2nd harmonic weight
 
   if (em.type === "point") {
     // em.decay overrides the global reach — used by the buoy's scattered
     // ripples, which should stay local to the hull
     const decay = (em.decay ?? S.decay) / Math.max(0.6, em.size);
-    return { type: "point", x: em.x, y: em.y, k0: 2 * Math.PI / baseLambda, A, decay, wt,
+    const k0 = 2 * Math.PI / baseLambda;
+    // the ring expands at this train's own phase speed omega/k, not the
+    // clock's — a wide ripple spreads faster than a tight one
+    return { type: "point", x: em.x, y: em.y, k0, A, decay, wt: omegaAt(k0, S) * t,
       e2: Math.pow(RIPPLE_EPS * baseLambda, 2) };
   }
   if (em.type === "sea") return prepSea(em, S, A, t);
   if (em.type === "swell") {
     const a = (em.dir * Math.PI) / 180;
     const k0 = 2 * Math.PI / baseLambda;
-    return { type: "swell", k0, Dx: Math.cos(a), Dy: Math.sin(a), A, ph0: -wt,
-      q, aa: aaCoef(k0, S) };
+    return { type: "swell", k0, Dx: Math.cos(a), Dy: Math.sin(a), A,
+      ph0: -omegaAt(k0, S) * t, q, aa: aaCoef(k0, S) };
   }
   if (em.type === "wake") {
     // λ₀ is the vessel's length, read straight off the control in scene units
-    // instead of through S.k — that is what keeps the wake's scale its own
+    // instead of through S.k — that is what keeps the wake's scale its own.
+    //
+    // No phase term anywhere below, and dispersion adds none: a Kelvin wake is
+    // already the steady pattern a hull drags along with it, standing still in
+    // the hull's own frame. Its crests do obey the dispersion relation — that
+    // is where the 19.47deg wedge comes from — but as geometry, not as timing.
     const lam = Math.max(0.25, em.scale);
     const a = ((em.dir || 0) * Math.PI) / 180;
     const ex = Math.cos(a), ey = Math.sin(a);          // heading (way on)
@@ -704,9 +741,12 @@ function prepEmitter(em, S) {
       CX.push(S.xMin + (S.xMax - S.xMin) * rand1(i * 3 + 1));
       CY.push(S.yMin + (S.yMax - S.yMin) * rand1(i * 3 + 2));
       const lam = Math.max(0.2, baseLambda * (1 + (rand1(i * 3 + 5) - 0.5) * 1.2 * rough));
-      K.push(2 * Math.PI / lam);
+      const ki = 2 * Math.PI / lam;
+      K.push(ki);
       AMP.push(A * (0.6 + 0.7 * rand1(i * 7 + 3)));
-      PH.push(rand1(i * 11 + 4) * Math.PI * 2 - wt);
+      // each source spreads at the rate its own wavelength earns it, so a
+      // varied field stops pulsing in unison the moment the rule is on
+      PH.push(rand1(i * 11 + 4) * Math.PI * 2 - omegaAt(ki, S) * t);
       E2.push(Math.pow(RIPPLE_EPS * lam, 2));    // rounds off the cone tip
     }
     return { type: "rings", M, CX, CY, K, AMP, PH, E2, dec };
@@ -726,7 +766,14 @@ function prepEmitter(em, S) {
       * (1 + (rand1(i * 5 + 9) - 0.5) * 0.35);
     const ki = 2 * Math.PI / lam;
     const th = wind + (rand1(i * 2 + 1) - 0.5) * 2 * spread * (0.7 + 0.6 * f);
-    const om = Math.sqrt(ki) * S.omega;
+    // A spectrum has always dispersed internally — it is a ladder of octaves,
+    // and they never moved together. What the rule changes is the reference it
+    // is measured against: sqrt(ki) alone puts omega = S.omega at ki = 1, an
+    // arbitrary length that has nothing to do with this scene, so a spectrum's
+    // tempo used to drift with the global ripple scale and never matched a
+    // swell of the same wavelength. omegaAt normalizes it to lambda0, which is
+    // what puts every emitter type on one rule.
+    const om = S.dispersion ? omegaAt(ki, S) : Math.sqrt(ki) * S.omega;
     K.push(ki);
     DX.push(Math.cos(th));
     DY.push(Math.sin(th));
@@ -865,16 +912,6 @@ function fresnelDeepW(cosI) {
   return 1 - (0.02 + 0.98 * m * m * m * m * m);
 }
 
-// Reflection detail ("angular zoom"): stretch the reflected-direction
-// mapping about the middle of the environment window. At mag = 1 the window
-// [eLo, eHi] spans the environment exactly as painted; at mag > 1 the same
-// environment is compressed into a 1/mag-narrower cone about the window
-// center, so a small ripple tilt sweeps a larger fraction of the colors —
-// the telephoto close-up look where every wavelet carries the whole gradient.
-function magFrac(f, mag) {
-  return mag === 1 ? f : 0.5 + (f - 0.5) * mag;
-}
-
 // quantized Lab mix toward the deep-water color: band b of K, b = 0 pure
 // reflection, b = K-1 fully "deep". Cached — called per region per band.
 function makeDeepMixer(deep, strength, K) {
@@ -925,6 +962,12 @@ function rawProject(gx, gy, S) {
   return [Xc / Zc, -Yc / Zc];
 }
 
+// The horizon in raw projected coordinates. A view ray at elevation e above
+// the horizon lands at -tan(pitch + e), so e = 0 gives this; it sits ABOVE the
+// water plane's far edge (which is a finite distance out) and, normally, just
+// off the top of the frame.
+function horizonRaw(S) { return -Math.tan(S.pitch); }
+
 function computeFit(S) {
   const corners = [
     [S.xMin, S.yMin], [S.xMax, S.yMin],
@@ -935,6 +978,14 @@ function computeFit(S) {
     const [rx, ry] = rawProject(gx, gy, S);
     minX = Math.min(minX, rx); maxX = Math.max(maxX, rx);
     minY = Math.min(minY, ry); maxY = Math.max(maxY, ry);
+  }
+  // Showing the backdrop means framing sky as well as water: pull the top of
+  // the fitted box up past the horizon by a fraction of the water's own
+  // height. A fraction rather than an elevation, because elevation runs to
+  // infinity on a perspective camera — framing to eHi would squash the water
+  // to a sliver at any normal pitch.
+  if (S.skyPad && S.perspective) {
+    minY = Math.min(minY, horizonRaw(S) - S.skyPad * (maxY - minY));
   }
   const m = 14;
   const baseScale = Math.min((VB_W - 2 * m) / (maxX - minX), (VB_H - 2 * m) / (maxY - minY));
@@ -1347,29 +1398,6 @@ function buildPenLines(S, fit, colorAt, opts) {
 }
 
 // ---- concentric / "wood-knot" pen style ---------------------------
-// chamfer distance transform: 0 outside the region, growing inward
-function distTransform(mask, nx, ny) {
-  const INF = 1e9, D = new Float64Array(nx * ny), s2 = Math.SQRT2;
-  for (let p = 0; p < nx * ny; p++) D[p] = mask[p] ? INF : 0;
-  for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
-    const p = j * nx + i; if (D[p] === 0) continue; let m = D[p];
-    if (i > 0) m = Math.min(m, D[p - 1] + 1);
-    if (j > 0) m = Math.min(m, D[p - nx] + 1);
-    if (i > 0 && j > 0) m = Math.min(m, D[p - nx - 1] + s2);
-    if (i < nx - 1 && j > 0) m = Math.min(m, D[p - nx + 1] + s2);
-    D[p] = m;
-  }
-  for (let j = ny - 1; j >= 0; j--) for (let i = nx - 1; i >= 0; i--) {
-    const p = j * nx + i; if (D[p] === 0) continue; let m = D[p];
-    if (i < nx - 1) m = Math.min(m, D[p + 1] + 1);
-    if (j < ny - 1) m = Math.min(m, D[p + nx] + 1);
-    if (i < nx - 1 && j < ny - 1) m = Math.min(m, D[p + nx + 1] + s2);
-    if (i > 0 && j < ny - 1) m = Math.min(m, D[p + nx - 1] + s2);
-    D[p] = m;
-  }
-  return D;
-}
-
 // scan-convert a triangle into a min-depth buffer
 function rasterTri(buf, BW, BH, x0, y0, z0, x1, y1, z1, x2, y2, z2) {
   const minX = Math.max(0, Math.floor(Math.min(x0, x1, x2))), maxX = Math.min(BW - 1, Math.ceil(Math.max(x0, x1, x2)));
@@ -1497,14 +1525,16 @@ function cr4(a, b, c, d, t) {
 function rasterizeSurface(S, fit, gN, BW, lift = true, gapVB = 0) {
   const BH = Math.max(2, Math.round(BW * VB_H / VB_W));
   const stride = gN + 1, NV = stride * stride, NP = BW * BH;
-  const GX = new Float64Array(NV), GY = new Float64Array(NV);
+  const GX = new Float64Array(NV), GY = new Float64Array(NV), GZ = new Float64Array(NV);
   const SX = new Float64Array(NV), SY = new Float64Array(NV), QW = new Float64Array(NV);
   for (let j = 0; j <= gN; j++) for (let i = 0; i <= gN; i++) {
     const [gx, gy] = cell2ground((i / gN) * S.nx, (j / gN) * S.ny, S);
     const gz = lift ? clampLift(heightAt(gx, gy, S) * S.waveScale, S, fit) : 0;
     const [sx, sy, dp] = penProject(gx, gy, gz, S, fit);
     const q = j * stride + i;
-    GX[q] = gx; GY[q] = gy;
+    // the height matters to a board at a finite distance: the ray leaves the
+    // crest, not the flat water it would have been on
+    GX[q] = gx; GY[q] = gy; GZ[q] = gz;
     SX[q] = (sx / VB_W) * BW; SY[q] = (sy / VB_H) * BH;
     QW[q] = dp > 1e-6 ? 1 / dp : 0;      // 1/depth: the perspective divide
   }
@@ -1575,7 +1605,7 @@ function rasterizeSurface(S, fit, gN, BW, lift = true, gapVB = 0) {
   const gap = occluding && gapVB > 0
     ? crestGapField(SX, SY, QW, gN, stride, zb, BW, BH, (gapVB * BW) / VB_W, tmp)
     : null;
-  return { BW, BH, NP, stride, GX, GY, GI, GJ, cov, sil, crest, gap };
+  return { BW, BH, NP, stride, GX, GY, GZ, GI, GJ, cov, sil, crest, gap };
 }
 
 // ---- crest seams ---------------------------------------------------
@@ -1980,43 +2010,65 @@ function buildSurface3D(S, fit, opts) {
   return { layers, fres, gap: gapRegion(R, iters, buf) };
 }
 
-// 2D panorama path: no single scalar exists, so take the flat path's stack of
-// per-color signed distance fields (panoramaStack / eachPanoramaLayer) and
-// compose each one through the reflection at the visible surface point — the
-// same construction buildSegmentation uses, evaluated on the occluded raster
-// instead of the flat water grid. `uvAt` returns the reflected panorama
-// coordinate in cells, matching buildSegmentation's fG/fF.
+// 2D panorama path: no single scalar exists, so take the compiled backdrop's
+// per-region signed distance fields and compose each one through the
+// reflection at the visible surface point — the same construction
+// buildSegmentation uses, evaluated on the occluded raster instead of the flat
+// water grid. `uvAt` returns the reflected panorama coordinate in cells,
+// matching buildSegmentation's fG/fF.
 function buildSurface3DPanorama(S, fit, opts) {
-  const { uvAt, env2d, fresAt, fresThresholds,
+  const { uvAt, rayAt, backdrop, fresAt, fresThresholds,
           gN = 140, BW = 420, polish = 0, gap = 0 } = opts;
   const R = rasterizeSurface(S, fit, gN, BW, true, gap);
   const { NP, BH, cov, sil, crest } = R;
   const iters = S.smooth || 0;
-  const stack = panoramaStack(env2d);
-  const { EW, EH, colorOf, order, K } = stack;
-
-  const nv = R.GX.length;
-  const su = new Float64Array(nv), sv = new Float64Array(nv);
-  for (let q = 0; q < nv; q++) {
-    const uv = uvAt(R.GX[q], R.GY[q]); su[q] = uv[0]; sv[q] = uv[1];
-  }
+  const groups = backdrop.groups || [backdrop];
   const coh = coherencePasses(S, gN);
   const cbuf = coh ? new Float64Array(R.stride * R.stride) : null;
-  meshBlur(R, su, coh, cbuf); meshBlur(R, sv, coh, cbuf);
-  const fu = rasterField(R, su), fv = rasterField(R, sv);
+  const nv = R.GX.length;
 
-  // bilinear taps into panorama space, shared by every layer
-  const tap = new Int32Array(NP), tx = new Float32Array(NP), ty = new Float32Array(NP);
-  for (let p = 0; p < NP; p++) {
-    if (!cov[p]) continue;
-    let x = fu[p] - 0.5; x = x < 0 ? 0 : x > EW - 1 ? EW - 1 : x;
-    let y = fv[p] - 0.5; y = y < 0 ? 0 : y > EH - 1 ? EH - 1 : y;
-    const i0 = Math.min(EW - 2, Math.floor(x)), j0 = Math.min(EH - 2, Math.floor(y));
-    tap[p] = j0 * EW + i0; tx[p] = x - i0; ty[p] = y - j0;
-  }
+  // Where each visible surface point lands on one flat. The sky is a
+  // direction, so the same answer everywhere; a board at a distance is a
+  // point, so the ray has to leave from the crest the camera can actually see
+  // — GZ, not zero, or a near board swims against the waves.
+  const groupTaps = (g) => {
+    const su = new Float64Array(nv), sv = new Float64Array(nv);
+    const sh = new Float64Array(nv), se = new Float64Array(nv);
+    const plane = g.place && g.place.kind === "plane";
+    for (let q = 0; q < nv; q++) {
+      if (!plane) {
+        const uv = uvAt(R.GX[q], R.GY[q]);
+        su[q] = uv[0]; sv[q] = uv[1]; sh[q] = 1;
+        continue;
+      }
+      const ray = rayAt(R.GX[q], R.GY[q]);
+      const uv = g.place.hit(R.GX[q], R.GY[q], R.GZ[q], ray);
+      if (uv) {
+        su[q] = uv[0] * g.EW; sv[q] = uv[1] * g.EH;
+        se[q] = g.place.edge(uv[0], uv[1]) * Math.min(g.EW, g.EH);
+        sh[q] = 1;
+      } else { se[q] = OFF_FLAT; }
+    }
+    meshBlur(R, su, coh, cbuf); meshBlur(R, sv, coh, cbuf);
+    if (plane) meshBlur(R, se, coh, cbuf);
+    const fu = rasterField(R, su), fv = rasterField(R, sv);
+    const fh = plane ? rasterField(R, sh) : null;
+    const fe = plane ? rasterField(R, se) : null;
+    const tap = new Int32Array(NP), tx = new Float32Array(NP), ty = new Float32Array(NP);
+    const on = new Uint8Array(NP);
+    for (let p = 0; p < NP; p++) {
+      if (!cov[p]) continue;
+      if (fh && fh[p] < 0.5) continue;          // this board is not there
+      let x = fu[p] - 0.5; x = x < 0 ? 0 : x > g.EW - 1 ? g.EW - 1 : x;
+      let y = fv[p] - 0.5; y = y < 0 ? 0 : y > g.EH - 1 ? g.EH - 1 : y;
+      const i0 = Math.min(g.EW - 2, Math.floor(x)), j0 = Math.min(g.EH - 2, Math.floor(y));
+      tap[p] = j0 * g.EW + i0; tx[p] = x - i0; ty[p] = y - j0; on[p] = 1;
+    }
+    return { tap, tx, ty, on, edge: fe, EW: g.EW };
+  };
 
   const buf = new Float64Array(NP);
-  const layers = new Array(K);
+  const drawn = [];
   // Polishing here works per layer, because a painted panorama has no single
   // scalar to polish — each color carries its own distance field. Adjacent
   // bands still hold together: where two of them share a boundary their fields
@@ -2024,36 +2076,43 @@ function buildSurface3DPanorama(S, fit, opts) {
   // smoothed fields keep crossing zero in the same place.
   const scratch = polishScratch(NP, polish);
   const fld = polish ? new Float32Array(NP) : null;
-  eachPanoramaLayer(stack, (k, D) => {
-    if (polish) {
+  for (const g of groups) {
+    const { tap, tx, ty, on, edge, EW } = groupTaps(g);
+    const layers = new Array(g.count);
+    g.eachField((k, D) => {
+      if (polish) {
+        for (let p = 0; p < NP; p++) {
+          if (!on[p]) { fld[p] = 0; continue; }
+          const q = tap[p], fx = tx[p], fy = ty[p];
+          fld[p] = (D[q] * (1 - fx) + D[q + 1] * fx) * (1 - fy)
+                 + (D[q + EW] * (1 - fx) + D[q + EW + 1] * fx) * fy;
+        }
+        smoothField(fld, cov, BW, BH, polish, scratch);
+      }
       for (let p = 0; p < NP; p++) {
-        if (!cov[p]) { fld[p] = 0; continue; }
-        const q = tap[p], fx = tx[p], fy = ty[p];
-        fld[p] = (D[q] * (1 - fx) + D[q + 1] * fx) * (1 - fy)
-               + (D[q + EW] * (1 - fx) + D[q + EW + 1] * fx) * fy;
+        const s = sil[p];
+        if (!cov[p]) { buf[p] = s; continue; }
+        if (!on[p]) { buf[p] = OFF_FLAT; continue; }
+        let d;
+        if (polish) d = fld[p];
+        else {
+          const q = tap[p], fx = tx[p], fy = ty[p];
+          d = (D[q] * (1 - fx) + D[q + 1] * fx) * (1 - fy)
+            + (D[q + EW] * (1 - fx) + D[q + EW + 1] * fx) * fy;
+        }
+        if (edge && edge[p] < d) d = edge[p];   // the board's own edge
+        let b = d < s ? d : s;
+        if (crest) {                            // snap seam crossings to the crest
+          const c = crest[p];
+          if (c) b = b < 0 ? -Math.abs(c) : Math.abs(c);
+        }
+        buf[p] = b;
       }
-      smoothField(fld, cov, BW, BH, polish, scratch);
-    }
-    for (let p = 0; p < NP; p++) {
-      const s = sil[p];
-      if (!cov[p]) { buf[p] = s; continue; }
-      let d;
-      if (polish) d = fld[p];
-      else {
-        const q = tap[p], fx = tx[p], fy = ty[p];
-        d = (D[q] * (1 - fx) + D[q + 1] * fx) * (1 - fy)
-          + (D[q + EW] * (1 - fx) + D[q + EW + 1] * fx) * fy;
-      }
-      let b = d < s ? d : s;
-      if (crest) {                            // snap seam crossings to the crest
-        const c = crest[p];
-        if (c) b = b < 0 ? -Math.abs(c) : Math.abs(c);
-      }
-      buf[p] = b;
-    }
-    const multi = d3.contours().size([BW, BH]).thresholds([0])(buf)[0];
-    layers[k] = { d: contourToScreenPath(multi, BW, BH, iters), color: colorOf[order[k]] };
-  });
+      const multi = d3.contours().size([BW, BH]).thresholds([0])(buf)[0];
+      layers[k] = { d: contourToScreenPath(multi, BW, BH, iters), color: g.colorAt(k) };
+    });
+    for (const l of layers) if (l && l.d) drawn.push(l);
+  }
 
   let fres = null;
   if (fresAt) {
@@ -2061,7 +2120,7 @@ function buildSurface3DPanorama(S, fit, opts) {
     smoothField(ff, cov, BW, BH, polish, scratch);
     fres = fresThresholds.map((t) => contourRegion(R, ff, t, iters, buf));
   }
-  return { bg: colorOf[order[0]], layers: layers.filter((l) => l.d), fres,
+  return { bg: backdrop.colorAt(0), layers: drawn, fres,
            gap: gapRegion(R, iters, buf) };
 }
 
@@ -2077,34 +2136,36 @@ function buildSurface3DPanorama(S, fit, opts) {
 // closures over S and cannot cross into a worker, but this can — the render
 // worker stands the same spec up on its side from the same inputs.
 function fieldSpecFor(S, opts) {
-  const { use2d, env2d, azSpan, cols, fresOn, fresBands } = opts;
+  const { use2d, doc, azSpan, cols, fresOn, fresBands } = opts;
   const mag = S.reflMag || 1;
   // occluded Fresnel: the deep-water weight at the front-most surface point,
   // contoured into the same bands the flat path clips with
   const fresAt = fresOn ? (gx, gy) => fresnelDeepW(reflectAt(gx, gy, S)[3]) : null;
   const fresThresholds = fresOn ? d3.range(1, fresBands).map((k) => k / fresBands) : null;
   if (use2d) {
-    // arbitrary panorama colors have no single scalar to contour, so the
-    // reflected panorama coordinate is the field: the flat path's per-color
-    // signed distance fields get composed through it.
-    const { w: EW, h: EH } = env2d, az = azSpan;
+    // arbitrary backdrop colors have no single scalar to contour, so the
+    // reflected coordinate on each flat is the field: the flat path's
+    // per-region signed distance fields get composed through it.
+    //
+    // The document is compiled HERE rather than handed in already compiled,
+    // because this runs on either thread: the studio calls it, and so does the
+    // render worker, which can only be given data. Compiling is ~1ms against
+    // the seconds of contouring that follow it.
+    const backdrop = compileBackdrop(doc);
+    const place = makeSkyPlace({ eLo: S.eLo, eHi: S.eHi, azSpan, mag,
+      EW: backdrop.EW, EH: backdrop.EH });
     const uvAt = (gx, gy) => {
-      const R = reflectAt(gx, gy, S);
-      const phi = Math.asin(Math.max(-1, Math.min(1, R[2]))) * 180 / Math.PI;
-      let psi = Math.atan2(R[0], R[1]) * 180 / Math.PI; psi = psi < -az ? -az : psi > az ? az : psi;
-      let v = magFrac((phi - S.eLo) / ((S.eHi - S.eLo) || 1), mag); v = v < 0 ? 0 : v > 1 ? 1 : v;
-      let u = magFrac((psi + az) / (2 * az), mag); u = u < 0 ? 0 : u > 1 ? 1 : u;
-      return [u * EW, v * EH];
+      const [phi, psi] = rayAngles(reflectAt(gx, gy, S));
+      return [place.col(place.clampAz(psi)), place.row(phi)];
     };
-    return { uvAt, env2d, fresAt, fresThresholds };
+    // a flat standing at a distance needs the ray, not just where the sky
+    // mapping sends it, so hand that through as well
+    const rayAt = (gx, gy) => reflectAt(gx, gy, S);
+    return { uvAt, rayAt, backdrop, fresAt, fresThresholds };
   }
-  const NB = cols.length;
-  const mid = (S.eLo + S.eHi) / 2, magSpan = (S.eHi - S.eLo) / mag;
-  const bnd = (f) => mid + (f - 0.5) * magSpan;
-  const thresholds = S.bandFractions ? S.bandFractions.map(bnd) : d3.range(1, NB).map((k) => bnd(k / NB));
   const scalarAt = (gx, gy) =>
     Math.asin(Math.max(-1, Math.min(1, reflectAt(gx, gy, S)[2]))) * 180 / Math.PI;
-  return { scalarAt, thresholds, cols, fresAt, fresThresholds };
+  return { scalarAt, thresholds: bandThresholds(S, cols.length), cols, fresAt, fresThresholds };
 }
 
 // The range of reflected elevation over the sample grid — the two numbers
@@ -2135,10 +2196,11 @@ function elevationRange(S) {
 function buildSolid3D(S, fieldSpec, raster) {
   const fit = computeFit(S);
   prepField(S);
-  const { uvAt, env2d, scalarAt, thresholds, cols, fresAt, fresThresholds } = fieldSpec;
+  const { uvAt, backdrop, scalarAt, thresholds, cols, fresAt, fresThresholds } = fieldSpec;
   // painted panorama: same outlines as the flat 2D render, now stopping at
   // the wave crests in front of them
-  if (uvAt) return buildSurface3DPanorama(S, fit, { uvAt, env2d, fresAt, fresThresholds, ...raster });
+  if (uvAt) return buildSurface3DPanorama(S, fit,
+    { uvAt, rayAt: fieldSpec.rayAt, backdrop, fresAt, fresThresholds, ...raster });
   // preset / paint1d: the wave silhouette does the occlusion. Lowest band
   // shows the background, exactly like the flat render, so no base layer.
   const { layers, fres, gap } = buildSurface3D(S, fit, { scalarAt, thresholds, fresAt, fresThresholds, ...raster });
@@ -2661,7 +2723,7 @@ function svgToPngBlob(svg, w, h) {
 // ---- color environment --------------------------------------------
 // 2D environment panorama: width = azimuth (looking across the lake),
 // height = elevation (waterline at the bottom, sky at the top).
-const ENV2D_W = 84, ENV2D_H = 52;
+const ENV2D_W = 84;
 // taller row count for panoramas derived from presets / the 1D strip when
 // reflected objects force the 2D path — keeps hairline bands ≥ 2 rows
 const DERIVED_ENV_H = 96;
@@ -2693,34 +2755,6 @@ function smoothEnv(arr) {
     const e = d3.rgb(arr[Math.min(arr.length - 1, i + 1)]);
     return d3.rgb((a.r + b.r + e.r) / 3, (a.g + b.g + e.g) / 3, (a.b + b.b + e.b) / 3).formatHex();
   });
-}
-// separable box blur on a continuous field (used to de-jitter the reflected
-// direction fields before quantizing them into panorama cells)
-function blurField(src, nx, ny, tmp, passes) {
-  for (let it = 0; it < passes; it++) {
-    for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
-      const a = src[j * nx + (i > 0 ? i - 1 : i)], b = src[j * nx + i], c = src[j * nx + (i < nx - 1 ? i + 1 : i)];
-      tmp[j * nx + i] = (a + b + c) / 3;
-    }
-    for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
-      const a = tmp[(j > 0 ? j - 1 : j) * nx + i], b = tmp[j * nx + i], c = tmp[(j < ny - 1 ? j + 1 : j) * nx + i];
-      src[j * nx + i] = (a + b + c) / 3;
-    }
-  }
-}
-
-// horizontal-stripe panorama from any elevation->color function
-function envFromRows(colorAtF, w, h) {
-  const cells = new Array(w * h);
-  for (let r = 0; r < h; r++) {                 // r = 0 is the waterline
-    const c = d3.color(colorAtF(r / (h - 1))).formatHex();
-    for (let col = 0; col < w; col++) cells[r * w + col] = c;
-  }
-  return { w, h, cells };
-}
-
-function seedEnv2D(name, w, h) {
-  return envFromRows((f) => paletteColorAt(name, f), w, h);
 }
 
 // ---- reflected scene objects ---------------------------------------
@@ -2823,23 +2857,13 @@ function stampObjects(env, objects, azSpan, eLo, eHi) {
   return { w, h, cells };
 }
 
-// soften the painted panorama: 3x3 RGB box blur of the cells, so neighbouring
-// colors melt into each other instead of meeting at hard seams
-function smoothEnv2D(env) {
-  const { w, h, cells } = env;
-  const out = new Array(w * h);
-  for (let r = 0; r < h; r++) {
-    for (let c = 0; c < w; c++) {
-      let R = 0, G = 0, B = 0, n = 0;
-      for (let dr = -1; dr <= 1; dr++) for (let dc = -1; dc <= 1; dc++) {
-        const rr = r + dr, cc = c + dc;
-        if (rr < 0 || rr >= h || cc < 0 || cc >= w) continue;
-        const col = d3.rgb(cells[rr * w + cc]); R += col.r; G += col.g; B += col.b; n++;
-      }
-      out[r * w + c] = d3.rgb(R / n, G / n, B / n).formatHex();
-    }
-  }
-  return { w, h, cells: out };
+// Band boundaries in degrees: the palette's fractions through the
+// reflection-detail window. Shared by the water's own field spec and by the
+// drawn backdrop, so both band at the same elevations.
+function bandThresholds(S, NB) {
+  const mid = (S.eLo + S.eHi) / 2, magSpan = (S.eHi - S.eLo) / (S.reflMag || 1);
+  const bnd = (f) => mid + (f - 0.5) * magSpan;
+  return S.bandFractions ? S.bandFractions.map(bnd) : d3.range(1, NB).map((k) => bnd(k / NB));
 }
 
 // preset palette as ordered elevation bands (for the non-custom path)
@@ -2900,6 +2924,137 @@ function buildGeometry(S) {
   return { ds: contours.map((c) => multiToPath(c, S, fit)), fres, lo, hi };
 }
 
+// ---- the backdrop itself, drawn -----------------------------------
+// Everywhere else in this file the backdrop is only ever seen through its
+// reflection, which is why the elevation window is so hard to read: you are
+// tuning a mapping whose input you cannot see. The picture already contains
+// the answer, though — above the horizon the camera looks straight AT the
+// backdrop, and "straight at" is the same query as "reflected onto", with a
+// different ray.
+//
+// So this is the segmentation with one substitution: instead of the reflected
+// direction at a water sample, the view direction at a screen point. Same
+// mapping (backdrop/place.js), same regions, same contour at zero, so the sky
+// comes out as flat vector regions in the same idiom as the water rather than
+// a bitmap pasted behind it.
+//
+// Rays at or below the horizon are marked BELOW_HORIZON, so every contour
+// closes along the horizon line by construction — no separate mask, and the
+// horizon lands exactly where the geometry says it does.
+const BELOW_HORIZON = -1e3;
+// above every marked ray, below every real elevation (which cannot pass -90)
+const SKY_FLOOR = -500;
+
+// Invert the projection over a raster of the frame: screen point -> view ray
+// -> the two angles the backdrop is indexed by.
+function skyRayField(S, fit, BW) {
+  const BH = Math.max(1, Math.round((BW * VB_H) / VB_W));
+  const NP = BW * BH;
+  const phi = new Float64Array(NP), psi = new Float64Array(NP);
+  const dir = new Float64Array(NP * 3);       // the view ray itself, for boards
+  const sky = new Uint8Array(NP);
+  const sp = Math.sin(S.pitch), cp = Math.cos(S.pitch);
+  const scaleY = fit.scaleY || fit.scale;
+  let any = false;
+  for (let j = 0; j < BH; j++) {
+    const ry = (((j + 0.5) * VB_H) / BH - fit.oy) / scaleY;
+    for (let i = 0; i < BW; i++) {
+      const p = j * BW + i;
+      const rx = (((i + 0.5) * VB_W) / BW - fit.ox) / fit.scale;
+      // camera-space direction (rx, -ry, 1), rotated back out of the camera's
+      // pitch onto world axes
+      const dx = rx, dy = -ry * sp + cp, dz = -ry * cp - sp;
+      if (dz <= 0) { phi[p] = BELOW_HORIZON; continue; }   // the water's half
+      const len = Math.hypot(dx, dy, dz);
+      const ux = dx / len, uy = dy / len, uz = dz / len;
+      const a = rayAngles([ux, uy, uz]);
+      phi[p] = a[0]; psi[p] = a[1];
+      dir[p * 3] = ux; dir[p * 3 + 1] = uy; dir[p * 3 + 2] = uz;
+      sky[p] = 1; any = true;
+    }
+  }
+  return any ? { BW, BH, NP, phi, psi, dir, sky } : null;
+}
+
+// Painted backdrops: one contour per region, through its distance field —
+// the buildSegmentation construction, on view rays.
+function buildSkyRegions(S, fit, backdrop, azSpan, opts = {}) {
+  if (!S.perspective || !backdrop || backdrop.overflow) return null;
+  const R = skyRayField(S, fit, opts.BW || SKY_BW);
+  if (!R) return null;                        // horizon off the top of the frame
+  const { BW, BH, NP, phi, psi, dir, sky } = R;
+  const groups = backdrop.groups || [backdrop];
+  const iters = Math.min(S.smooth || 0, SKY_SMOOTH);
+
+  // Where each screen point lands on one flat. The plane intersection is the
+  // same function the water uses — only the ray changes, from one leaving the
+  // surface to one leaving the camera — so a board drawn above the horizon and
+  // the same board reflected below it cannot disagree.
+  const groupTaps = (g) => {
+    const plane = g.place && g.place.kind === "plane";
+    const place = plane ? null : makeSkyPlace({ eLo: S.eLo, eHi: S.eHi, azSpan,
+      mag: S.reflMag || 1, EW: g.EW, EH: g.EH });
+    const tap = new Int32Array(NP), tx = new Float32Array(NP), ty = new Float32Array(NP);
+    const on = new Uint8Array(NP);
+    const edge = plane ? new Float64Array(NP) : null;
+    for (let p = 0; p < NP; p++) {
+      if (!sky[p]) continue;
+      let u, v;
+      if (plane) {
+        const h = g.place.hit(0, 0, S.H, [dir[p * 3], dir[p * 3 + 1], dir[p * 3 + 2]]);
+        if (!h) continue;
+        u = h[0] * g.EW; v = h[1] * g.EH;
+        edge[p] = g.place.edge(h[0], h[1]) * Math.min(g.EW, g.EH);
+      } else {
+        u = place.col(place.clampAz(psi[p])); v = place.row(phi[p]);
+      }
+      let x = u - 0.5; x = x < 0 ? 0 : x > g.EW - 1 ? g.EW - 1 : x;
+      let y = v - 0.5; y = y < 0 ? 0 : y > g.EH - 1 ? g.EH - 1 : y;
+      const i0 = Math.min(g.EW - 2, Math.floor(x)), j0 = Math.min(g.EH - 2, Math.floor(y));
+      tap[p] = j0 * g.EW + i0; tx[p] = x - i0; ty[p] = y - j0; on[p] = 1;
+    }
+    return { tap, tx, ty, on, edge };
+  };
+
+  const F = new Float64Array(NP);
+  const drawn = [];
+  for (const g of groups) {
+    const { tap, tx, ty, on, edge } = groupTaps(g);
+    const layers = new Array(g.count);
+    g.eachField((k, D) => {
+      for (let p = 0; p < NP; p++) {
+        if (!on[p]) { F[p] = BELOW_HORIZON; continue; }
+        const q = tap[p], fx = tx[p], fy = ty[p];
+        const d = (D[q] * (1 - fx) + D[q + 1] * fx) * (1 - fy)
+                + (D[q + g.EW] * (1 - fx) + D[q + g.EW + 1] * fx) * fy;
+        F[p] = edge && edge[p] < d ? edge[p] : d;
+      }
+      const multi = d3.contours().size([BW, BH]).thresholds([0])(F)[0];
+      layers[k] = { d: contourToScreenPath(multi, BW, BH, iters), color: g.colorAt(k) };
+    });
+    for (const l of layers) if (l && l.d) drawn.push(l);
+  }
+  return drawn;
+}
+
+// Preset and 1D backdrops: colour depends on elevation alone, so — exactly as
+// buildGeometry does for the water — there is one scalar to contour at the
+// band boundaries, in a single pass. Taking the SDF path here instead would
+// mean one contour per distinct colour, and a smooth palette has one per row:
+// ~60 passes for a picture with a dozen visible edges in it.
+function buildSkyBands(S, fit, thresholds, cols, opts = {}) {
+  if (!S.perspective || !cols || !cols.length) return null;
+  const R = skyRayField(S, fit, opts.BW || SKY_BW);
+  if (!R) return null;
+  const { BW, BH, phi } = R;
+  const iters = Math.min(S.smooth || 0, SKY_SMOOTH);
+  // the first threshold cuts sky from water, so band 0 is the whole sky and
+  // every later contour lands on top of it, upper sets all the way up
+  return d3.contours().size([BW, BH]).thresholds([SKY_FLOOR, ...thresholds])(phi)
+    .map((c, k) => ({ d: contourToScreenPath(c, BW, BH, iters), color: cols[k] }))
+    .filter((l) => l.d && l.color);
+}
+
 // ---- geometry build, custom 2D path ------------------------------
 // The failure mode to avoid: any compositing that follows the panorama's
 // *cell grid* (elevation rows × azimuth columns) turns a painted region's
@@ -2918,91 +3073,46 @@ function buildGeometry(S) {
 // A hand-smoothed ("melted") panorama can have thousands of distinct colors;
 // past a sanity cap we fall back to row/column compositing, where the
 // per-cell structure is invisible because neighbouring colors are near-equal.
-const SEG_MAX_COLORS = 160;
-
-// Distinct panorama colors, stacked bottom-up by the mean elevation row of
-// their painted cells — the 2D generalization of the 1D band order.
-function panoramaStack(env2d) {
-  const { w: EW, h: EH, cells } = env2d;
-  const colorId = new Map(), colorOf = [], areas = [];
-  const labels = new Int32Array(EW * EH);
-  for (let p = 0; p < EW * EH; p++) {
-    const c = cells[p];
-    let id = colorId.get(c);
-    if (id === undefined) { id = colorOf.length; colorId.set(c, id); colorOf.push(c); areas.push(0); }
-    labels[p] = id; areas[id]++;
-  }
-  const K = colorOf.length;
-  const rowSum = new Float64Array(K);
-  for (let p = 0; p < EW * EH; p++) rowSum[labels[p]] += (p / EW) | 0;
-  const order = d3.range(K).sort((a, b) => rowSum[a] / areas[a] - rowSum[b] / areas[b]);
-  return { EW, EH, cells, labels, colorOf, areas, order, K };
-}
-
-// Walk the stack from the top down, handing each layer its signed distance
-// field in panorama cells: >0 inside, <0 outside, zero crossing on the painted
-// boundary. Layer k is the UNION of color k and every color above it, so like
-// the 1D upper sets each layer solidly contains the next — smoothing can shift
-// a shared edge but can never open a background seam between neighbours.
-// Composing this field through the reflection and contouring it at zero is
-// what keeps a painted region's boundary a smooth curve rather than a trace of
-// the panorama's cell grid; both the flat path and the 3D surface use it.
-function eachPanoramaLayer(stack, visit) {
-  const { EW, EH, labels, order, K } = stack;
-  const N = EW * EH;
-  const union = new Float64Array(N), inv = new Float64Array(N);
-  const D0 = new Float64Array(N), tmpP = new Float64Array(N);
-  for (let k = K - 1; k >= 0; k--) {   // top of the stack down, growing the union
-    for (let p = 0; p < N; p++) {
-      if (labels[p] === order[k]) union[p] = 1;
-      inv[p] = 1 - union[p];
-    }
-    const D = distTransform(union, EW, EH), Dout = distTransform(inv, EW, EH);
-    let thick = 0;
-    for (let p = 0; p < N; p++) { D[p] -= Dout[p]; if (D[p] > thick) thick = D[p]; }
-    // a light blur rounds the pixel-corner bevels of the painted boundary —
-    // in PANORAMA space, where the corners live. (Blurring the composed
-    // field in water space instead flattens every small ripple's φ
-    // excursion, erasing the fine reflection rings the 1D path keeps.)
-    // For a stripe boundary the SDF is linear across it, so the blur is a
-    // no-op there and stripes stay in exact 1D parity. Skip thin unions
-    // (the topmost gradient rows): nothing to round, and the blur would
-    // erase them. The sign clamp keeps solidly-inside/outside cells on
-    // their own side, so 1-cell features (object ink rims) survive.
-    if (thick >= 2) {
-      for (let p = 0; p < N; p++) D0[p] = D[p];
-      blurField(D, EW, EH, tmpP, 1);
-      for (let p = 0; p < N; p++) {
-        if (D0[p] >= 1 && D[p] < 0.25) D[p] = 0.25;
-        else if (D0[p] <= -1 && D[p] > -0.25) D[p] = -0.25;
-      }
-    }
-    visit(k, D);
-  }
-}
-
-function buildSegmentation(S, env2d, azSpan) {
+//
+// `backdrop` is a compiled document (backdrop/compile.js), which is where the
+// region list and its distance fields now come from. It is compiled once per
+// document rather than once per frame: nothing here depends on the wave phase
+// or the camera, so panning a 2D scene no longer redoes a distance transform
+// per region.
+function buildSegmentation(S, backdrop, azSpan) {
   const { nx, ny } = S;
   prepField(S);
-  const { w: EW, h: EH, cells } = env2d;
-  const eLo = S.eLo, eHi = S.eHi, az = azSpan;
-  const span = (eHi - eLo) || 1;
+  const { EW, EH, cells } = backdrop;
+  const groups = backdrop.groups || [backdrop];
+  // a board at a finite distance needs the ray itself, not just its direction:
+  // where it lands depends on where on the water it left from
+  const needRay = groups.some((g) => g.place && g.place.kind === "plane");
+  const place = makeSkyPlace({ eLo: S.eLo, eHi: S.eHi, azSpan,
+    mag: S.reflMag || 1, EW, EH });
 
   // continuous reflected-direction fields, in panorama-cell units
   const fF = new Float64Array(nx * ny); // elevation, 0..EH (row units)
   const fG = new Float64Array(nx * ny); // azimuth,   0..EW (col units)
   const fW = S.fresOn ? new Float64Array(nx * ny) : null; // deep-water weight 0..1
+  const N = nx * ny;
+  const rGX = needRay ? new Float64Array(N) : null;
+  const rGY = needRay ? new Float64Array(N) : null;
+  const rRX = needRay ? new Float64Array(N) : null;
+  const rRY = needRay ? new Float64Array(N) : null;
+  const rRZ = needRay ? new Float64Array(N) : null;
   let lo = Infinity, hi = -Infinity;
   for (let j = 0; j < ny; j++) {
     for (let i = 0; i < nx; i++) {
+      const p = j * nx + i;
       const [gx, gy] = cell2ground(i + 0.5, j + 0.5, S);
       const R = reflectAt(gx, gy, S);
-      const phi = Math.asin(Math.max(-1, Math.min(1, R[2]))) * 180 / Math.PI;
-      let psi = Math.atan2(R[0], R[1]) * 180 / Math.PI;
-      psi = psi < -az ? -az : psi > az ? az : psi;
-      fF[j * nx + i] = phi;
-      fG[j * nx + i] = psi;
-      if (fW) fW[j * nx + i] = fresnelDeepW(R[3]);
+      const [phi, psi0] = rayAngles(R);
+      fF[p] = phi;
+      fG[p] = place.clampAz(psi0);
+      if (fW) fW[p] = fresnelDeepW(R[3]);
+      if (needRay) {
+        rGX[p] = gx; rGY[p] = gy; rRX[p] = R[0]; rRY[p] = R[1]; rRZ[p] = R[2];
+      }
       if (phi < lo) lo = phi; if (phi > hi) hi = phi;
     }
   }
@@ -3018,10 +3128,9 @@ function buildSegmentation(S, env2d, azSpan) {
     if (fW) blurField(fW, nx, ny, tmp, passes);
   }
   // convert to cell units (through the reflection-detail magnification)
-  const mag = S.reflMag || 1;
   for (let p = 0; p < nx * ny; p++) {
-    let v = magFrac((fF[p] - eLo) / span, mag); v = v < 0 ? 0 : v > 1 ? 1 : v; fF[p] = v * EH;
-    let u = magFrac((fG[p] + az) / (2 * az), mag); u = u < 0 ? 0 : u > 1 ? 1 : u; fG[p] = u * EW;
+    fF[p] = place.row(fF[p]);
+    fG[p] = place.col(fG[p]);
   }
 
   const fit = computeFit(S);
@@ -3036,11 +3145,36 @@ function buildSegmentation(S, env2d, azSpan) {
       .map((c) => multiToPath(c, S, fit));
   }
 
-  // distinct panorama colors, stacked bottom-up by painted elevation
-  const stack = panoramaStack(env2d);
-  const { colorOf, order, K } = stack;
+  // the coordinate fields for one group, in its own cell units, plus which
+  // samples reach it at all (a board is simply absent from water that cannot
+  // see it — the sky is everywhere)
+  const groupFields = (g) => {
+    if (!g.place || g.place.kind !== "plane") return { U: fG, V: fF, hit: null, edge: null };
+    const U = new Float64Array(N), V = new Float64Array(N);
+    const hit = new Uint8Array(N);
+    // how far inside the board's own rectangle each sample lands, in its
+    // cells. Composed as a floor under the region's field, this is what keeps
+    // the board's edge a curve: a binary in-or-out would contour into a
+    // sawtooth at the sample grid.
+    const edge = new Float64Array(N);
+    const cellScale = Math.min(g.EW, g.EH);
+    for (let p = 0; p < N; p++) {
+      const uv = g.place.hit(rGX[p], rGY[p], 0, [rRX[p], rRY[p], rRZ[p]]);
+      if (!uv) { edge[p] = OFF_FLAT; continue; }
+      U[p] = uv[0] * g.EW; V[p] = uv[1] * g.EH;
+      edge[p] = g.place.edge(uv[0], uv[1]) * cellScale;
+      hit[p] = 1;
+    }
+    if (passes) {                             // "edge ripple", as for the sky
+      const tmp2 = new Float64Array(N);
+      blurField(U, nx, ny, tmp2, passes);
+      blurField(V, nx, ny, tmp2, passes);
+      blurField(edge, nx, ny, tmp2, passes);
+    }
+    return { U, V, hit, edge };
+  };
 
-  if (K <= SEG_MAX_COLORS) {
+  if (!backdrop.overflow) {
     const F = new Float64Array(nx * ny);
     // fields are contoured on a one-cell-padded grid (edge values replicated)
     // so every region overshoots the water's edge instead of tracing it; the
@@ -3059,30 +3193,42 @@ function buildSegmentation(S, env2d, azSpan) {
     const clip = "M" + cs.map((c) => c[0].toFixed(1) + " " + c[1].toFixed(1)).join(" L") + " Z";
     const ex = { cx: (cs[0][0] + cs[1][0] + cs[2][0] + cs[3][0]) / 4,
                  cy: (cs[0][1] + cs[1][1] + cs[2][1] + cs[3][1]) / 4, s: 1.05 };
-    const layers = new Array(K);
-    eachPanoramaLayer(stack, (k, D) => {
-      // compose through the reflection: bilinear sample at each water
-      // sample's continuous (azimuth, elevation) panorama coordinate
-      for (let p = 0; p < nx * ny; p++) {
-        const x = Math.min(EW - 1, Math.max(0, fG[p] - 0.5));
-        const y = Math.min(EH - 1, Math.max(0, fF[p] - 0.5));
-        const i0 = Math.min(EW - 2, Math.floor(x)), j0 = Math.min(EH - 2, Math.floor(y));
-        const fx = x - i0, fy = y - j0, q = j0 * EW + i0;
-        F[p] = (D[q] * (1 - fx) + D[q + 1] * fx) * (1 - fy)
-             + (D[q + EW] * (1 - fx) + D[q + EW + 1] * fx) * fy;
-      }
-      for (let j = 0; j < py; j++) {
-        const jj = Math.min(ny - 1, Math.max(0, j - 1));
-        for (let i = 0; i < px; i++) {
-          const ii = Math.min(nx - 1, Math.max(0, i - 1));
-          FP[j * px + i] = F[jj * nx + ii];
+    const drawn = [];
+    // furthest group first, each drawn whole: a nearer board covers what is
+    // behind it by being painted over it, so nothing has to cut a hole and no
+    // seam can open between them
+    for (const g of groups) {
+      const { U, V, hit, edge } = groupFields(g);
+      const GW = g.EW, GH = g.EH;
+      const layers = new Array(g.count);
+      g.eachField((k, D) => {
+        // compose through the reflection: bilinear sample at each water
+        // sample's continuous coordinate on this flat
+        for (let p = 0; p < N; p++) {
+          if (hit && !hit[p]) { F[p] = OFF_FLAT; continue; }
+          const x = Math.min(GW - 1, Math.max(0, U[p] - 0.5));
+          const y = Math.min(GH - 1, Math.max(0, V[p] - 0.5));
+          const i0 = Math.min(GW - 2, Math.floor(x)), j0 = Math.min(GH - 2, Math.floor(y));
+          const fx = x - i0, fy = y - j0, q = j0 * GW + i0;
+          const d = (D[q] * (1 - fx) + D[q + 1] * fx) * (1 - fy)
+                  + (D[q + GW] * (1 - fx) + D[q + GW + 1] * fx) * fy;
+          // the board's own edge is a floor under every region on it
+          F[p] = edge && edge[p] < d ? edge[p] : d;
         }
-      }
-      const cont = d3.contours().size([px, py]).thresholds([0])(FP)[0];
-      layers[k] = { d: multiToPath(cont, S, fit, -1, ex), color: colorOf[order[k]] };
-    });
-    const drawn = layers.filter((l) => l.d);
-    return { bg: cells[0], layers: drawn, clip, fres, lo, hi, count: drawn.length, twoD: true };
+        for (let j = 0; j < py; j++) {
+          const jj = Math.min(ny - 1, Math.max(0, j - 1));
+          for (let i = 0; i < px; i++) {
+            const ii = Math.min(nx - 1, Math.max(0, i - 1));
+            FP[j * px + i] = F[jj * nx + ii];
+          }
+        }
+        const cont = d3.contours().size([px, py]).thresholds([0])(FP)[0];
+        layers[k] = { d: multiToPath(cont, S, fit, -1, ex), color: g.colorAt(k) };
+      });
+      for (const l of layers) if (l && l.d) drawn.push(l);
+    }
+    return { bg: backdrop.bg, layers: drawn, clip, fres, lo, hi,
+             count: drawn.length, twoD: true };
   }
 
   // upper-set contours of each field (smooth, sub-cell boundaries)
@@ -3123,9 +3269,14 @@ function buildSegmentation(S, env2d, azSpan) {
 // exported for tests: the two render paths plus the helpers needed to feed
 // them, so 1D/2D fidelity parity can be checked without mounting the UI
 export {
-  buildGeometry, buildSegmentation, envFromRows, stampObjects,
-  paletteStops, paletteColorAt, DERIVED_ENV_H, ENV2D_W, DEFAULT_EMITTERS,
-  computeFit, cell2ground, heightAt, clampLift, penProject, reflectAt, magFrac,
+  buildGeometry, buildSegmentation, buildSkyRegions, buildSkyBands, skyRayField,
+  horizonRaw, SKY_PAD, SKY_BW, VB_W, VB_H, stampObjects,
+  // moved into src/backdrop/, re-exported so the tests that feed the renderer
+  // keep one import site
+  envFromRows, magFrac,
+  paletteStops, paletteColorAt, PALETTES, BANDED_PALETTES,
+  DERIVED_ENV_H, ENV2D_W, DEFAULT_EMITTERS,
+  computeFit, cell2ground, heightAt, clampLift, penProject, reflectAt,
   withWakes, newWake, WAKE_ANGLE_DEG, prepField, slopeAt,
   WATER_MOODS, SEA_N_DEFAULT, SPECTRUM_N_REF,
   buildSurface3D, buildSurface3DPanorama, buildSolid3D, fieldSpecFor, crestField,
@@ -3135,6 +3286,7 @@ export {
   EXPORT_POLISH, EXPORT_POLISH_DEFAULT, smoothField,
   PNG_SCALES, PNG_DEFAULT, PNG_MAX_PIXELS, pngSize, sizedSvg, svgToPngBlob, svgToCanvas,
   SPEED_MIN, SPEED_MAX, EMITTER_RATE_DEFAULT,
+  DISPERSION_DEFAULT, omegaAt, dispersionFor,
 };
 
 // ---- layered-paper stack export -----------------------------------
@@ -3292,7 +3444,7 @@ function buildPaperImage(S, fit, opts) {
   const { gN = 150, BW = 440, lift = true, bgColor,
           maxColors = PAPER_MAX_COLORS,
           scalarAt, thresholds, cols,      // preset / 1D palettes: one scalar
-          uvAt, env2d,                     // painted panorama: reflected u,v
+          uvAt, rayAt, backdrop,           // painted panorama: reflected u,v
           gap = 0, gapColor,               // crest gaps, as in the SVG
           fresAt, fresBands, deepMix } = opts;
   const R = rasterizeSurface(S, fit, gN, BW, lift, gap);
@@ -3314,18 +3466,32 @@ function buildPaperImage(S, fit, opts) {
   const cbuf = coh ? new Float64Array(R.stride * R.stride) : null;
   let colorOf;
   if (uvAt) {
-    const { w: EW, h: EH, cells } = env2d;
+    // one sampler per flat, near to far: the first one this point actually
+    // reaches is the colour it reflects
     const nv = R.GX.length;
-    const su = new Float64Array(nv), sv = new Float64Array(nv);
-    for (let q = 0; q < nv; q++) {
-      const uv = uvAt(R.GX[q], R.GY[q]); su[q] = uv[0]; sv[q] = uv[1];
-    }
-    meshBlur(R, su, coh, cbuf); meshBlur(R, sv, coh, cbuf);
-    const fu = rasterField(R, su), fv = rasterField(R, sv);
+    const samplers = (backdrop.groups || [backdrop]).map((g) => {
+      const su = new Float64Array(nv), sv = new Float64Array(nv), sh = new Float64Array(nv);
+      const plane = g.place && g.place.kind === "plane";
+      for (let q = 0; q < nv; q++) {
+        if (!plane) {
+          const uv = uvAt(R.GX[q], R.GY[q]); su[q] = uv[0]; sv[q] = uv[1]; sh[q] = 1;
+          continue;
+        }
+        const uv = g.place.hit(R.GX[q], R.GY[q], R.GZ[q], rayAt(R.GX[q], R.GY[q]));
+        if (uv) { su[q] = uv[0] * g.EW; sv[q] = uv[1] * g.EH; sh[q] = 1; }
+      }
+      meshBlur(R, su, coh, cbuf); meshBlur(R, sv, coh, cbuf);
+      return { fu: rasterField(R, su), fv: rasterField(R, sv),
+               fh: plane ? rasterField(R, sh) : null, g };
+    }).reverse();
     colorOf = (p) => {
-      const u = fu[p] < 0 ? 0 : fu[p] > EW - 1 ? EW - 1 : fu[p] | 0;
-      const v = fv[p] < 0 ? 0 : fv[p] > EH - 1 ? EH - 1 : fv[p] | 0;
-      return cells[v * EW + u];
+      for (const { fu, fv, fh, g } of samplers) {
+        if (fh && fh[p] < 0.5) continue;
+        const u = fu[p] < 0 ? 0 : fu[p] > g.EW - 1 ? g.EW - 1 : fu[p] | 0;
+        const v = fv[p] < 0 ? 0 : fv[p] > g.EH - 1 ? g.EH - 1 : fv[p] | 0;
+        return g.cells[v * g.EW + u];
+      }
+      return backdrop.bg;
     };
   } else {
     const fs = rasterField(R, meshBlur(R, gridSamples(R, scalarAt), coh, cbuf));
@@ -3573,7 +3739,69 @@ function Toggle({ label, value, onChange }) {
   );
 }
 
-function PaintStrip({ envColors, setEnvColors, activeColor, height, brushSize }) {
+// The paint canvases are the one place the elevation window is legible: a row
+// here IS an elevation. So the window's ends, the horizon, and the slice of the
+// window the water can actually reach belong drawn on the canvas — not as two
+// bare degree sliders three panels away, which is what made them unreadable.
+// `reach` is the reflected-elevation range this scene actually produces
+// (rng.lo/hi); rows outside it are painted but never reflected by any ripple.
+function ElevationScale({ eLo, eHi, mag, reach, children }) {
+  // same mapping the renderer uses, so the band lands where the water reads it
+  const frac = (deg) => magFrac((deg - eLo) / ((eHi - eLo) || 1), mag);
+  const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+  const pct = (deg) => (1 - clamp01(frac(deg))) * 100;
+  const tick = { position: "absolute", right: 6, fontSize: 9.5, lineHeight: 1,
+    color: "#6d808f", fontFamily: "ui-monospace, monospace" };
+  // Rows the ripples never point at are dimmed, so what is left bright is
+  // exactly the paint that can end up in the water. Dimming the dead rows
+  // rather than marking the live ones means a scene that reflects the whole
+  // window — the common case — draws no overlay at all.
+  const deadTop = reach ? pct(reach.hi) : 0;      // above the highest reflected row
+  const deadBot = reach ? 100 - pct(reach.lo) : 0; // below the lowest
+  const missed = reach && (frac(reach.hi) <= 0 || frac(reach.lo) >= 1);
+  const covers = reach && deadTop < 0.5 && deadBot < 0.5;
+  const scrim = { position: "absolute", left: 0, right: 0, pointerEvents: "none",
+    background: "rgba(7,11,16,0.62)" };
+  const span = reach && `${reach.lo.toFixed(0)}°–${reach.hi.toFixed(0)}°`;
+  return (
+    <>
+      <div style={{ display: "flex", alignItems: "stretch", gap: 6 }}>
+        <div style={{ position: "relative", width: 34, flex: "none" }}>
+          <span style={{ ...tick, top: 0 }}>{eHi}°</span>
+          {/* the horizon, when it has room to sit clear of the two end labels */}
+          {eLo < 0 && eHi > 0 && pct(0) > 8 && pct(0) < 92 && (
+            <span style={{ ...tick, top: `calc(${pct(0)}% - 5px)`, color: "#8fa4b5" }}>0°</span>
+          )}
+          <span style={{ ...tick, bottom: 0 }}>{eLo}°</span>
+        </div>
+        <div style={{ position: "relative", flex: 1, minWidth: 0 }}>
+          {children}
+          {reach && !covers && deadTop > 0.5 && (
+            <div style={{ ...scrim, top: 0, height: `${deadTop}%`,
+              borderBottom: missed ? "none" : "1px dashed rgba(255,255,255,0.6)" }} />
+          )}
+          {reach && !covers && deadBot > 0.5 && (
+            <div style={{ ...scrim, bottom: 0, height: `${deadBot}%`,
+              borderTop: missed ? "none" : "1px dashed rgba(255,255,255,0.6)" }} />
+          )}
+        </div>
+      </div>
+      {reach && (
+        <div style={{ fontSize: 9.5, color: missed ? "#c96f5f" : "#6d808f", marginTop: 5,
+          lineHeight: 1.5, fontFamily: "ui-monospace, monospace" }}>
+          {missed ? `Nothing lands — the ripples reflect ${span}, outside this window.`
+            : !covers ? `Dimmed rows never reach the water — the ripples only reflect ${span}.`
+              : (reach.lo < eLo - 1 || reach.hi > eHi + 1)
+                ? `Every row reaches the water. Ripples swing ${span}, past both ends, so the`
+                  + ` edge rows fill everything beyond.`
+                : `Every row here reaches the water (ripples swing ${span}).`}
+        </div>
+      )}
+    </>
+  );
+}
+
+function PaintStrip({ envColors, setEnvColors, activeColor, height, brushSize, onEditStart }) {
   const ref = useRef(null);
   const painting = useRef(false);
   const lastIdx = useRef(-1);
@@ -3597,6 +3825,7 @@ function PaintStrip({ envColors, setEnvColors, activeColor, height, brushSize })
   return (
     <div ref={ref}
       onPointerDown={(e) => { e.preventDefault(); painting.current = true; lastIdx.current = -1;
+        onEditStart && onEditStart();
         e.currentTarget.setPointerCapture(e.pointerId); paintAt(e.clientY); }}
       onPointerMove={(e) => { if (painting.current) paintAt(e.clientY); }}
       onPointerUp={() => { painting.current = false; lastIdx.current = -1; }}
@@ -3611,11 +3840,14 @@ function PaintStrip({ envColors, setEnvColors, activeColor, height, brushSize })
   );
 }
 
-function PaintGrid2D({ env2d, setEnv2d, activeColor, onStrokeEnd, brushSize, brushShape }) {
+// Shows the whole backdrop — every visible layer composited — and paints into
+// one of them. Which is the ordinary layer-editor arrangement: you draw on the
+// picture you can see, and the strokes land in the layer you have selected.
+function PaintGrid2D({ view, w, h, onPaint, activeColor, onStrokeEnd, onEditStart,
+  brushSize, brushShape, disabled }) {
   const cvRef = useRef(null);
   const wrapRef = useRef(null);
   const painting = useRef(false);
-  const { w, h } = env2d;
   const R = [1, 4, 8, 14][brushSize] ?? 4; // brush radius in cells
 
   // paint the cells onto the backing canvas (1 px per cell, CSS scales it up)
@@ -3627,13 +3859,15 @@ function PaintGrid2D({ env2d, setEnv2d, activeColor, onStrokeEnd, brushSize, bru
     for (let r = 0; r < h; r++) {
       const drow = h - 1 - r;                 // canvas top = sky (row h-1)
       for (let c = 0; c < w; c++) {
-        const col = d3.rgb(env2d.cells[r * w + c]);
+        const v = view[r * w + c];
         const p = (drow * w + c) * 4;
+        if (v == null) { img.data[p + 3] = 0; continue; }   // nothing painted here
+        const col = d3.rgb(v);
         img.data[p] = col.r; img.data[p + 1] = col.g; img.data[p + 2] = col.b; img.data[p + 3] = 255;
       }
     }
     ctx.putImageData(img, 0, 0);
-  }, [env2d, w, h]);
+  }, [view, w, h]);
 
   const paintAt = (cx, cy) => {
     const el = wrapRef.current; if (!el) return;
@@ -3642,38 +3876,392 @@ function PaintGrid2D({ env2d, setEnv2d, activeColor, onStrokeEnd, brushSize, bru
     const row = Math.floor((1 - (cy - r.top) / r.height) * h); // 0 = waterline
     if (col < -R - 1 || col > w + R || row < -R - 1 || row > h + R) return;
     const rr2 = (R + 0.5) * (R + 0.5);
-    setEnv2d((prev) => {
-      const nc = prev.cells.slice();
+    onPaint((cells) => {
       for (let dy = -R; dy <= R; dy++) for (let dx = -R; dx <= R; dx++) {
         if (brushShape === "round" && dx * dx + dy * dy > rr2) continue;
         if (brushShape === "diamond" && Math.abs(dx) + Math.abs(dy) > R) continue;
         const c = col + dx, rw = row + dy;
-        if (c >= 0 && c < w && rw >= 0 && rw < h) nc[rw * w + c] = activeColor;
+        if (c >= 0 && c < w && rw >= 0 && rw < h) cells[rw * w + c] = activeColor;
       }
-      return { ...prev, cells: nc };
     });
   };
 
   return (
     <div ref={wrapRef}
-      onPointerDown={(e) => { e.preventDefault(); painting.current = true;
+      onPointerDown={(e) => { if (disabled) return;
+        e.preventDefault(); painting.current = true;
+        onEditStart && onEditStart();
         e.currentTarget.setPointerCapture(e.pointerId); paintAt(e.clientX, e.clientY); }}
       onPointerMove={(e) => { if (painting.current) paintAt(e.clientX, e.clientY); }}
       onPointerUp={() => { if (painting.current) { painting.current = false; onStrokeEnd && onStrokeEnd(); } }}
       onPointerCancel={() => { painting.current = false; }}
       style={{ width: "100%", aspectRatio: `${w} / ${h}`, borderRadius: 8, overflow: "hidden",
-        border: "1px solid #26313c", cursor: "crosshair", touchAction: "none", lineHeight: 0 }}>
+        border: "1px solid #26313c", cursor: disabled ? "not-allowed" : "crosshair",
+        touchAction: "none", lineHeight: 0,
+        // a checker behind the canvas, so a layer's transparent cells read as
+        // transparent rather than as black paint
+        backgroundColor: "#10161d",
+        backgroundImage: "linear-gradient(45deg,#161f28 25%,transparent 25%,transparent 75%,#161f28 75%),"
+          + "linear-gradient(45deg,#161f28 25%,transparent 25%,transparent 75%,#161f28 75%)",
+        backgroundSize: "14px 14px", backgroundPosition: "0 0, 7px 7px" }}>
       <canvas ref={cvRef}
         style={{ width: "100%", height: "100%", display: "block", imageRendering: "auto" }} />
     </div>
   );
 }
 
-function EmitterCard({ em, idx, halfW, yFar, onChange, onRemove }) {
+// Sky or board. The sky is a direction, the same from everywhere on the water;
+// a board is a thing at a distance, so it has parallax, it can be missed, and
+// its size is in world units rather than degrees.
+function PlaceEditor({ flat, yFar, onChange }) {
+  const plane = flat.place && flat.place.kind === "plane";
+  const pl = plane ? flat.place : { distance: Math.round(yFar * 0.4), width: 40, height: 12 };
+  const set = (patch) => onChange({ kind: "plane", ...pl, ...patch });
+  return (
+    <div style={{ marginTop: 10 }}>
+      <div style={{ display: "flex", gap: 6 }}>
+        <button onClick={() => onChange({ kind: "sky" })} style={{ ...miniBtnBase,
+          background: plane ? "#1a232c" : "#27424b", color: plane ? "#9fb0c0" : "#dff1f6",
+          border: "1px solid " + (plane ? "#26313c" : "#3f7e8f") }}>at the sky</button>
+        <button onClick={() => set({})} style={{ ...miniBtnBase,
+          background: plane ? "#27424b" : "#1a232c", color: plane ? "#dff1f6" : "#9fb0c0",
+          border: "1px solid " + (plane ? "#3f7e8f" : "#26313c") }}>standing at</button>
+      </div>
+      {plane ? (
+        <div style={{ marginTop: 8 }}>
+          <Slider label="distance out" value={pl.distance} min={2} max={Math.max(20, yFar)}
+            step={1} onChange={(v) => set({ distance: v })} fmt={(v) => v + " units"} />
+          <Slider label="board width" value={pl.width} min={4} max={160} step={2}
+            onChange={(v) => set({ width: v })} fmt={(v) => v + " units"} />
+          <Slider label="board height" value={pl.height} min={1} max={60} step={1}
+            onChange={(v) => set({ height: v })} fmt={(v) => v + " units"} />
+          <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5,
+            fontFamily: "ui-monospace, monospace" }}>
+            Water further out than {pl.distance} units reflects rays that leave without ever
+            reaching this board, so it simply is not there — which is what makes it read as
+            near. Distance decides what covers what; the layer order settles ties.
+          </div>
+        </div>
+      ) : (
+        <div style={{ fontSize: 9.5, color: "#6d808f", marginTop: 6, lineHeight: 1.5,
+          fontFamily: "ui-monospace, monospace" }}>
+          At infinity: the same from every point on the water, which is what a sky is.
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Where the flats stand, seen from above: the camera at the bottom, the water
+// running away from it, and a tick for each board. It is a small drawing, but
+// it is the only place the scene's depth is a picture rather than a number —
+// and depth is the one thing about a backdrop you cannot see by looking at it
+// from the front.
+function PlanView({ doc, activeId, yFar, onSelect }) {
+  const boards = doc.flats
+    .map((f, i) => ({ f, i }))
+    .filter(({ f }) => f.place && f.place.kind === "plane");
+  const far = Math.max(yFar, ...boards.map(({ f }) => f.place.distance), 1);
+  const at = (d) => 100 - (d / far) * 100;          // % from the top
+  return (
+    <div style={{ marginTop: 10 }}>
+      <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 5,
+        fontFamily: "ui-monospace, monospace" }}>
+        from above · water runs {yFar} units out
+      </div>
+      <div style={{ position: "relative", height: 74, borderRadius: 8,
+        border: "1px solid #26313c", background: "#10161d", overflow: "hidden" }}>
+        {/* the water, near at the bottom */}
+        <div style={{ position: "absolute", left: 0, right: 0, bottom: 0,
+          height: `${(yFar / far) * 100}%`,
+          background: "linear-gradient(to top, #1a3040, #131d26)" }} />
+        <div style={{ position: "absolute", left: 6, right: 6, bottom: 3, height: 2,
+          borderRadius: 1, background: "#5fb6c9" }} title="the camera" />
+        {boards.map(({ f }) => (
+          <button key={f.id} onClick={() => onSelect(f.id)}
+            title={`${f.name} · ${f.place.distance} units`}
+            style={{ position: "absolute", left: "8%", right: "8%",
+              top: `calc(${at(f.place.distance)}% - 4px)`, height: 8, padding: 0,
+              cursor: "pointer", borderRadius: 2,
+              background: f.id === activeId ? "#f6e2b0" : "#7f93a3",
+              border: "none", opacity: f.visible ? 1 : 0.35 }} />
+        ))}
+        {!boards.length && (
+          <div style={{ position: "absolute", inset: 0, display: "flex",
+            alignItems: "center", justifyContent: "center", fontSize: 9.5,
+            color: "#4a5560", fontFamily: "ui-monospace, monospace" }}>
+            every layer is sky · nothing stands in front of it
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Shapes are moved, not repainted, so the canvas grows a selection: click one,
+// drag it, drag a corner to resize. The overlay sits over the same canvas the
+// brush uses and works in flat coordinates (0..1 across, 0..1 up from the
+// waterline), which is what the shapes themselves are stored in.
+function ShapeOverlay({ items, selectedId, onSelect, onChange, onEditStart, onCommit }) {
+  const ref = useRef(null);
+  const drag = useRef(null);
+  const at = (e) => {
+    const r = ref.current.getBoundingClientRect();
+    return [(e.clientX - r.left) / r.width, 1 - (e.clientY - r.top) / r.height];
+  };
+  const HANDLE = 0.022;
+
+  const down = (e) => {
+    e.preventDefault();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    const [fx, fy] = at(e);
+    const sel = items.find((i) => i.id === selectedId);
+    // a corner of the selected shape takes priority over anything under it
+    if (sel) {
+      const b = shapeBox(sel);
+      if (Math.abs(fx - b.x1) < HANDLE && Math.abs(fy - b.y1) < HANDLE) {
+        onEditStart();
+        drag.current = { id: sel.id, mode: "size", fx, fy, w: sel.w, h: sel.h };
+        return;
+      }
+    }
+    // topmost shape under the pointer
+    for (let k = items.length - 1; k >= 0; k--) {
+      if (shapeAt(items[k], fx, fy)) {
+        onSelect(items[k].id);
+        onEditStart();
+        drag.current = { id: items[k].id, mode: "move", fx, fy, x: items[k].x, y: items[k].y };
+        return;
+      }
+    }
+    onSelect(null);
+  };
+  const move = (e) => {
+    const d = drag.current;
+    if (!d) return;
+    const [fx, fy] = at(e);
+    if (d.mode === "move") onChange(d.id, { x: d.x + (fx - d.fx), y: d.y + (fy - d.fy) });
+    else onChange(d.id, { w: Math.max(0.02, d.w + 2 * (fx - d.fx)),
+                          h: Math.max(0.02, d.h + (fy - d.fy)) });
+  };
+  const up = () => { if (drag.current) { drag.current = null; onCommit(); } };
+
+  const sel = items.find((i) => i.id === selectedId);
+  const b = sel && shapeBox(sel);
+  return (
+    <svg ref={ref} viewBox="0 0 1 1" preserveAspectRatio="none"
+      onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={up}
+      style={{ position: "absolute", inset: 0, width: "100%", height: "100%",
+        cursor: "move", touchAction: "none" }}>
+      {b && (
+        <g>
+          <rect x={b.x0} y={1 - b.y1} width={b.x1 - b.x0} height={b.y1 - b.y0}
+            fill="none" stroke="#ffffff" strokeOpacity={0.9} strokeWidth={0.004}
+            strokeDasharray="0.012 0.008" vectorEffect="non-scaling-stroke" />
+          <rect x={b.x1 - 0.012} y={1 - b.y1 - 0.012} width={0.024} height={0.024}
+            fill="#ffffff" stroke="#0b0f14" strokeWidth={0.003} />
+        </g>
+      )}
+    </svg>
+  );
+}
+
+// The shape catalogue and the selected shape's colours. Position and size are
+// not sliders here on purpose: they are the canvas above, where you can see
+// what you are doing.
+function ShapesEditor({ content, selectedId, onSelect, onAdd, onPatch, onRemove, activeColor }) {
+  const items = content.items;
+  const sel = items.find((i) => i.id === selectedId);
+  const stamp = sel && STAMPS[sel.type];
+  return (
+    <div style={{ marginTop: 10 }}>
+      <div style={{ display: "flex", gap: 5, flexWrap: "wrap", marginBottom: 8 }}>
+        {SHAPE_KINDS.map((k) => (
+          <button key={k} onClick={() => onAdd(k)} style={{ ...miniBtnBase, flex: "1 0 28%",
+            fontSize: 10.5, padding: "6px 3px" }}>+ {k}</button>
+        ))}
+      </div>
+      {!items.length && (
+        <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5,
+          fontFamily: "ui-monospace, monospace" }}>
+          Add a shape, then drag it on the canvas. Corner handle resizes.
+        </div>
+      )}
+      {items.length > 0 && (
+        <div style={{ border: "1px solid #26313c", borderRadius: 8, overflow: "hidden" }}>
+          {items.slice().reverse().map((it) => (
+            <div key={it.id} onClick={() => onSelect(it.id)}
+              style={{ display: "flex", alignItems: "center", gap: 6, padding: "4px 6px",
+                cursor: "pointer", background: it.id === selectedId ? "#243642" : "#141c24" }}>
+              <span style={{ width: 16, height: 16, borderRadius: 4, flex: "none",
+                background: it.color, border: "1px solid #00000055" }} />
+              <span style={{ flex: 1, fontSize: 10.5, fontFamily: "ui-monospace, monospace",
+                color: it.id === selectedId ? "#dff1f6" : "#9fb0c0" }}>{shapeLabel(it)}</span>
+              <button onClick={(e) => { e.stopPropagation(); onRemove(it.id); }}
+                style={layerNudge(true)}>×</button>
+            </div>
+          ))}
+        </div>
+      )}
+      {sel && (
+        <div style={{ marginTop: 8 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <ColorWell label={stamp ? stamp.label[0] : "fill"} value={sel.color}
+              onChange={(c) => onPatch(sel.id, { color: c })} />
+            {stamp && (
+              <ColorWell label={stamp.label[1]} value={sel.color2}
+                onChange={(c) => onPatch(sel.id, { color2: c })} />
+            )}
+            <button onClick={() => onPatch(sel.id, { rim: sel.rim > 0 ? 0 : 1 })}
+              style={{ ...miniBtnBase, flex: "none", padding: "6px 10px",
+                background: sel.rim > 0 ? "#27424b" : "#1a232c",
+                color: sel.rim > 0 ? "#dff1f6" : "#9fb0c0" }}>ink rim</button>
+            <button onClick={() => onPatch(sel.id, { color: activeColor })}
+              style={{ ...miniBtnBase, flex: "none", padding: "6px 10px" }}>use swatch</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ColorWell({ label, value, onChange }) {
+  return (
+    <label style={{ display: "inline-flex", alignItems: "center", gap: 5, cursor: "pointer",
+      fontSize: 10, color: "#8fa4b5", fontFamily: "ui-monospace, monospace" }}>
+      <span style={{ width: 22, height: 22, borderRadius: 5, border: "1px solid #44525e",
+        position: "relative", overflow: "hidden", background: value, display: "inline-block" }}>
+        <input type="color" value={value} onChange={(e) => onChange(e.target.value)}
+          style={{ position: "absolute", inset: -4, opacity: 0, cursor: "pointer" }} />
+      </span>
+      {label}
+    </label>
+  );
+}
+
+// The layer stack, far at the bottom of the list to near at the top — the way
+// it is drawn, and the way it reads on the canvas.
+function LayerList({ doc, activeId, onSelect, onToggle, onMove }) {
+  const rows = doc.flats.map((f, i) => ({ f, i })).reverse();
+  return (
+    <div style={{ marginTop: 10, border: "1px solid #26313c", borderRadius: 8,
+      overflow: "hidden" }}>
+      {rows.map(({ f, i }) => {
+        const on = f.id === activeId;
+        return (
+          <div key={f.id}
+            style={{ display: "flex", alignItems: "center", gap: 6, padding: "5px 6px",
+              background: on ? "#243642" : "#141c24",
+              borderBottom: i > 0 ? "1px solid #1e2831" : "none" }}>
+            <button onClick={() => onToggle(f.id)} title={f.visible ? "Hide" : "Show"}
+              style={{ width: 22, height: 22, flex: "none", padding: 0, borderRadius: 5,
+                cursor: "pointer", fontSize: 11, lineHeight: 1, background: "#10171e",
+                color: f.visible ? "#9fd0d9" : "#4a5560", border: "1px solid #26313c" }}>
+              {f.visible ? "●" : "○"}
+            </button>
+            <button onClick={() => onSelect(f.id)}
+              style={{ flex: 1, minWidth: 0, textAlign: "left", padding: "2px 4px",
+                background: "transparent", border: "none", cursor: "pointer",
+                fontFamily: "ui-monospace, monospace", fontSize: 11,
+                color: f.visible ? (on ? "#dff1f6" : "#9fb0c0") : "#5d6b78",
+                overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {f.name}
+              <span style={{ color: "#5f7384", fontSize: 9.5 }}> · {kindLabel(f.content)}</span>
+            </button>
+            <button onClick={() => onMove(f.id, 1)} disabled={i === doc.flats.length - 1}
+              title="Nearer" style={layerNudge(i < doc.flats.length - 1)}>↑</button>
+            <button onClick={() => onMove(f.id, -1)} disabled={i === 0}
+              title="Further" style={layerNudge(i > 0)}>↓</button>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+const layerNudge = (on) => ({
+  width: 20, height: 22, flex: "none", padding: 0, borderRadius: 5, fontSize: 10,
+  lineHeight: 1, fontFamily: "ui-monospace, monospace", background: "#10171e",
+  cursor: on ? "pointer" : "default", color: on ? "#9fb0c0" : "#39434e",
+  border: "1px solid #26313c",
+});
+
+// The repeater. A band list and a switch: with repeat on, the list tiles the
+// whole backdrop ("two blue rows, one white row, all the way up"); with it off
+// the list runs once from the anchor and the layer below shows through the
+// rest. Sizes are in rows, because rows are what the pattern is made of and
+// they do not move when the elevation window does — the degrees beside each
+// one are what those rows currently come to.
+function StripesEditor({ content, rowsPerDeg, onChange, activeColor }) {
+  const { bands, repeat, anchor } = content;
+  const setBands = (b) => onChange({ bands: b });
+  const period = stripesPeriod(content);
+  const deg = (rows) => (rows / (rowsPerDeg || 1)).toFixed(1);
+  return (
+    <div style={{ marginTop: 10 }}>
+      <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 8, lineHeight: 1.5,
+        fontFamily: "ui-monospace, monospace" }}>
+        {repeat
+          ? `${period} rows (${deg(period)}°) of pattern, repeating up the backdrop.`
+          : `${period} rows (${deg(period)}°) from row ${anchor}, once. The layer below shows`
+            + " through above and beneath it."}
+      </div>
+      {bands.map((b, i) => (
+        <div key={i} style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 5 }}>
+          <label style={{ width: 26, height: 26, flex: "none", borderRadius: 5, cursor: "pointer",
+            border: "1px solid #44525e", position: "relative", overflow: "hidden",
+            background: b.color, display: "inline-block" }}>
+            <input type="color" value={b.color}
+              onChange={(e) => setBands(bands.map((x, j) =>
+                (j === i ? { ...x, color: e.target.value } : x)))}
+              style={{ position: "absolute", inset: -4, opacity: 0, cursor: "pointer" }} />
+          </label>
+          <input type="range" min={1} max={24} step={1} value={b.size}
+            onChange={(e) => setBands(bands.map((x, j) =>
+              (j === i ? { ...x, size: parseInt(e.target.value, 10) } : x)))}
+            style={{ flex: 1, height: 22, cursor: "pointer" }} />
+          <span style={{ width: 62, textAlign: "right", fontSize: 10,
+            color: "#8fa4b5", fontFamily: "ui-monospace, monospace",
+            fontVariantNumeric: "tabular-nums" }}>
+            {b.size}r · {deg(b.size)}°
+          </span>
+          <button onClick={() => setBands(bands.filter((x, j) => j !== i))}
+            disabled={bands.length <= 1} title="Remove this band"
+            style={layerNudge(bands.length > 1)}>×</button>
+        </div>
+      ))}
+      <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+        <button style={miniBtnBase}
+          onClick={() => setBands([...bands, { color: activeColor, size: 1 }])}>+ band</button>
+        <button style={{ ...miniBtnBase, background: repeat ? "#27424b" : "#1a232c",
+          color: repeat ? "#dff1f6" : "#9fb0c0",
+          border: "1px solid " + (repeat ? "#3f7e8f" : "#26313c") }}
+          onClick={() => onChange({ repeat: !repeat })}>
+          repeat {repeat ? "on" : "off"}
+        </button>
+      </div>
+      <div style={{ marginTop: 8 }}>
+        <Slider label="start row" value={anchor} min={0} max={51} step={1}
+          onChange={(v) => onChange({ anchor: v })}
+          fmt={(v) => v + " · " + deg(v) + "°"} />
+      </div>
+    </div>
+  );
+}
+const miniBtnBase = {
+  flex: 1, padding: "8px 4px", fontSize: 11, borderRadius: 6, cursor: "pointer",
+  background: "#1a232c", color: "#9fb0c0", border: "1px solid #26313c",
+  fontFamily: "ui-monospace, monospace",
+};
+
+function EmitterCard({ em, idx, halfW, yFar, dispersion, onChange, onRemove }) {
   // Sea leads: it is the one that makes open water read, and the one a new
   // emitter starts as. Spectrum stays for the scenes that were built on it.
   const types = [["sea", "Sea"], ["swell", "Swell"], ["spectrum", "Spectrum"],
     ["rings", "Rings"], ["point", "Point"]];
+  // What the wavelength slider just bought this train, in the terms the Speed
+  // panel states the rule in. For a sea or a spectrum this is its dominant
+  // component; the shorter rungs of the ladder run faster still.
+  const disp = dispersionFor(em.size, dispersion);
   return (
     <div style={{ border: "1px solid #26313c", borderRadius: 9, padding: 11,
       marginBottom: 10, background: "#121922" }}>
@@ -3751,9 +4339,16 @@ function EmitterCard({ em, idx, halfW, yFar, onChange, onRemove }) {
       <Slider label={em.type === "swell" || em.type === "point" || em.type === "rings"
         ? "wavelength" : "dominant wavelength"} value={em.size}
         min={0.3} max={5} step={0.1} onChange={(v) => onChange({ size: v })} fmt={(v) => v.toFixed(1) + "×"} />
+      {dispersion && (
+        <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5, marginTop: -6,
+          marginBottom: 10, fontFamily: "ui-monospace, monospace" }}>
+          at that length the rule gives it crests at {disp.crest.toFixed(2)}× the
+          scene's own speed, bobbing at {disp.bob.toFixed(2)}× its rate
+        </div>
+      )}
       <Slider label="strength" value={em.amp} min={0} max={2} step={0.05}
         onChange={(v) => onChange({ amp: v })} fmt={(v) => v.toFixed(2)} />
-      <Slider label="rate (× the scene clock)"
+      <Slider label={dispersion ? "rate (trim on the above)" : "rate (× the scene clock)"}
         value={em.rate == null ? EMITTER_RATE_DEFAULT : em.rate}
         min={0} max={3} step={0.05} onChange={(v) => onChange({ rate: v })}
         fmt={(v) => (v === 0 ? "frozen" : v.toFixed(2) + "\u00d7")} />
@@ -3924,6 +4519,9 @@ export default function App() {
   const [edges, setEdges] = useState(false);
   const [animate, setAnimate] = useState(false);
   const [speed, setSpeed] = useState(0.5);
+  // On for a new scene; a link saved before the rule existed reopens with it
+  // off (see the `legacy` map on useUrlSync below) so it renders as saved.
+  const [dispersion, setDispersion] = useState(DISPERSION_DEFAULT);
   const [manualTime, setManualTime] = useState(0); // scrub the wave phase when not animating
   const [lowPower, setLowPower] = useState(false);  // cap resolution + throttle animation
   const [rasterQ, setRasterQ] = useState(RASTER_DEFAULT); // 3D surface resolution step
@@ -4018,14 +4616,70 @@ export default function App() {
   const photoFileRef = useRef(null);
   const [photoK, setPhotoK] = useState(5);
   const [photoInfo, setPhotoInfo] = useState(null); // { name, swatches } | { error }
-  const [env2d, setEnv2d] = useState(() => seedEnv2D("Sunset Lake", ENV2D_W, ENV2D_H));
-  const [segEnv, setSegEnv] = useState(env2d);          // committed copy that drives the water
-  const env2dRef = useRef(env2d); env2dRef.current = env2d;
+  // The layered backdrop. `doc` is what the panel edits; `segDoc` is the copy
+  // the water is built from, committed when a stroke ends, so the renderer is
+  // not rebuilt on every pointer move.
+  const [doc, setDoc] = useState(() => docFromPalette("Sunset Lake"));
+  const [segDoc, setSegDoc] = useState(doc);
+  const docRef = useRef(doc); docRef.current = doc;
+  const [activeFlat, setActiveFlat] = useState(() => doc.flats[0].id);
+  const [selectedShape, setSelectedShape] = useState(null);
+  const envColorsRef = useRef(envColors); envColorsRef.current = envColors;
+  const active = doc.flats[flatIndex(doc, activeFlat)] || doc.flats[doc.flats.length - 1];
+  // what the canvas shows: every visible layer composited, live (the water
+  // waits for the stroke to end, the canvas under the brush does not)
+  const docView = useMemo(() => {
+    const w = doc.w, h = doc.h;
+    const cells = new Array(w * h).fill(null);
+    for (const f of doc.flats) {
+      if (!f.visible) continue;
+      const src = renderContent(f.content, w, h);
+      for (let p = 0; p < w * h; p++) if (src[p] != null) cells[p] = src[p];
+    }
+    return cells;
+  }, [doc]);
+  // every edit that is not a brush stroke commits straight through
+  const commitDoc = useCallback((next) => { setDoc(next); setSegDoc(next); }, []);
+
+  // Painting is destructive by nature — the color under the brush is gone the
+  // moment the pointer moves — so every edit records what it is about to
+  // overwrite. One entry per committed edit: a stroke snapshots on pointer-down
+  // and undoes in one step however far it drags. See backdropHistory.js.
+  const [hist, setHist] = useState(emptyHistory);
+  const histRef = useRef(hist); histRef.current = hist;
+  const liveBuffer = useCallback(
+    (kind) => (kind === "1d" ? envColorsRef.current : docRef.current), []);
+  const applyBuffer = useCallback((entry) => {
+    if (entry.kind === "1d") setEnvColors(entry.value);
+    else { setDoc(entry.value); setSegDoc(entry.value); }
+  }, []);
+  // state updaters stay pure — the buffer is read and applied out here, so a
+  // double-invoked updater (StrictMode) can never apply an edit twice
+  const beginEdit = useCallback((kind) => {
+    const value = liveBuffer(kind);
+    setHist((h) => pushEdit(h, { kind, value }));
+  }, [liveBuffer]);
+  const stepHistory = useCallback((take) => {
+    const step = take(histRef.current, liveBuffer);
+    if (!step) return;
+    applyBuffer(step.entry);
+    setHist(step.hist);
+  }, [liveBuffer, applyBuffer]);
+  const undoBackdrop = useCallback(() => stepHistory(undoHist), [stepHistory]);
+  const redoBackdrop = useCallback(() => stepHistory(redoHist), [stepHistory]);
+
+  // Whether each paint buffer holds work. A pristine buffer is reseeded from
+  // the palette when you enter its mode (which is what makes "pick a palette,
+  // then paint on it" work); a dirty one is never silently overwritten.
+  const [dirty1d, setDirty1d] = useState(false);
+  const [dirty2d, setDirty2d] = useState(false);
   const [azSpan, setAzSpan] = useState(45);
   // 0 = no de-jitter blur of the reflected-direction fields, so the 2D path
   // keeps the same per-ripple detail as the 1D path out of the box
   const [coherence, setCoherence] = useState(0);
   const [activeColor, setActiveColor] = useState("#11324a");
+  // draw the backdrop itself above the horizon, not only its reflection
+  const [showBackdrop, setShowBackdrop] = useState(false);
   // Custom paint chits — extra swatches pinned by hand or lifted from a photo
   // palette. Session-lived (not serialized), deduped against the built-in
   // SWATCHES and each other so a chit stays easy to re-select all session.
@@ -4052,10 +4706,53 @@ export default function App() {
   const vidCanvasRef = useRef(null);
   useEffect(() => () => { if (vidUrlRef.current) URL.revokeObjectURL(vidUrlRef.current); }, []);
 
-  // Serialize every studio setting into the URL hash (the painted 1D/2D
-  // environment buffers are excluded — they are freehand pixel data, not
-  // controls, and would blow the URL length budget). Structured config
-  // like the emitter and object lists round-trips as-is.
+  // Cmd/Ctrl+Z, Shift+Cmd/Ctrl+Z (and Ctrl+Y) while a paint canvas is up.
+  useEffect(() => {
+    if (mode === "preset") return;
+    const onKey = (e) => {
+      if (!(e.metaKey || e.ctrlKey)) return;
+      const k = e.key.toLowerCase();
+      if (k !== "z" && k !== "y") return;
+      const t = e.target;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+      e.preventDefault();
+      if (k === "y" || e.shiftKey) redoBackdrop(); else undoBackdrop();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [mode, undoBackdrop, redoBackdrop]);
+
+  // The backdrop document in the URL (backdrop/codec.js). Generated layers cost
+  // almost nothing to carry — a repeating stripe layer is its band list — and
+  // painted ones go through the same run-length encoding the single panorama
+  // used. Encoded from the committed copy, so it re-encodes once per stroke
+  // rather than per pointer move, and only for scenes that have a backdrop
+  // worth carrying.
+  const docCode = useMemo(
+    () => (mode === "paint2d" || dirty2d ? encodeDoc(segDoc) : null),
+    [mode, dirty2d, segDoc]);
+  const restoreDoc = useCallback((code) => {
+    const d = decodeDoc(code);
+    if (!d) return;
+    setDoc(d); setSegDoc(d); setActiveFlat(d.flats[d.flats.length - 1].id); setDirty2d(true);
+  }, []);
+  // Links written before layers carry a single painted panorama instead; it
+  // opens as a one-layer document.
+  const restoreEnv2d = useCallback((code) => {
+    const env = decodeEnv2d(code);
+    if (!env) return;
+    setDoc((d) => {
+      if (d.flats.length > 1 || d.flats[0].content.kind === "raster") return d;  // a doc won
+      const next = docFromPanorama(env);
+      setSegDoc(next); setActiveFlat(next.flats[0].id); setDirty2d(true);
+      return next;
+    });
+  }, []);
+
+  // Serialize every studio setting into the URL hash. Structured config like
+  // the emitter and object lists round-trips as-is; the painted panorama goes
+  // through the RLE codec, and is dropped (encodes to null) if it holds more
+  // colors than the codec's palette — a hand-smoothed one, say.
   useUrlSync("reflection", {
     steep: [steep, setSteep], pitchDeg: [pitchDeg, setPitchDeg], rollDeg: [rollDeg, setRollDeg],
     fresOn: [fresOn, setFresOn], fresBands: [fresBands, setFresBands],
@@ -4066,7 +4763,8 @@ export default function App() {
     rectOutput: [rectOutput, setRectOutput], surface3d: [surface3d, setSurface3d],
     waveScale: [waveScale, setWaveScale], edges: [edges, setEdges],
     crestGap: [crestGap, setCrestGap], crestGapColor: [crestGapColor, setCrestGapColor],
-    animate: [animate, setAnimate], speed: [speed, setSpeed], quality: [quality, setQuality],
+    animate: [animate, setAnimate], speed: [speed, setSpeed],
+    dispersion: [dispersion, setDispersion], quality: [quality, setQuality],
     manualTime: [manualTime, setManualTime], lowPower: [lowPower, setLowPower],
     rasterQ: [rasterQ, setRasterQ], exportQ: [exportQ, setExportQ],
     exportMeshQ: [exportMeshQ, setExportMeshQ],
@@ -4093,10 +4791,96 @@ export default function App() {
     envColors: [envColors, setEnvColors],
     azSpan: [azSpan, setAzSpan], coherence: [coherence, setCoherence],
     activeColor: [activeColor, setActiveColor], brushSize: [brushSize, setBrushSize],
-    brushShape: [brushShape, setBrushShape],
+    brushShape: [brushShape, setBrushShape], bdoc: [docCode, restoreDoc],
+    env2d: [null, restoreEnv2d],                 // read-only: pre-layers links
+    showBackdrop: [showBackdrop, setShowBackdrop],
+  }, {
+    // A saved link that carries no `dispersion` was written before the rule
+    // existed, and its author picked a frozen moment under the old timing.
+    // Reopen it under the old timing.
+    dispersion: false,
   });
 
-  const enter1d = () => { setEnvColors(seedEnv(palette, ENV_N)); setMode("paint1d"); };
+  // Switching modes must never destroy work. A pristine buffer picks up the
+  // current palette on the way in — which is what makes "pick a palette, then
+  // paint over it" work — but a buffer you have painted in is left exactly as
+  // you left it. The Reset buttons are the only way to lose a painting, and
+  // they go through the history like any other edit.
+  const enter1d = () => {
+    if (!dirty1d) setEnvColors(seedEnv(palette, ENV_N));
+    setMode("paint1d");
+  };
+  const resetStrip = () => {
+    beginEdit("1d"); setEnvColors(seedEnv(palette, ENV_N)); setDirty1d(false);
+  };
+  const smoothStrip = () => {
+    beginEdit("1d"); setEnvColors((p) => smoothEnv(p)); setDirty1d(true);
+  };
+
+  // Every layer edit is one undo step and commits straight to the water; only
+  // brush strokes wait for the pointer to come up.
+  const editDoc = useCallback((fn) => {
+    beginEdit("2d");
+    setDirty2d(true);
+    const next = fn(docRef.current);
+    commitDoc(next);
+    return next;
+  }, [beginEdit, commitDoc]);
+
+  const addLayer = (content, name) => editDoc((d) => {
+    const { doc: next, id } = addFlat(d, content, name, activeFlat);
+    setActiveFlat(id);
+    return next;
+  });
+  const duplicateLayer = () => editDoc((d) => {
+    const { doc: next, id } = duplicateFlat(d, activeFlat);
+    setActiveFlat(id);
+    return next;
+  });
+  const removeLayer = () => editDoc((d) => {
+    const next = removeFlat(d, activeFlat);
+    if (next !== d) setActiveFlat(next.flats[Math.max(0, flatIndex(d, activeFlat) - 1)].id);
+    return next;
+  });
+  const patchActive = (patch) => editDoc((d) => updateFlat(d, activeFlat, patch));
+  const patchContent = (patch) => editDoc((d) =>
+    updateFlat(d, activeFlat, { content: { ...d.flats[flatIndex(d, activeFlat)].content, ...patch } }));
+  // Shapes: add, patch and remove all go through the document, so each is one
+  // undo step. A drag is one step too — it opens on pointer-down and commits
+  // on pointer-up, like a brush stroke.
+  const addShape = (type) => {
+    // a stamp keeps its own colours; a plain shape takes the swatch in hand
+    const item = shape(type, {
+      ...(STAMPS[type] ? {} : { color: activeColor }),
+      points: type === "poly"
+        ? [[0.35, 0.1], [0.5, 0.35], [0.65, 0.1]] : undefined,
+    });
+    setSelectedShape(item.id);
+    editDoc((d) => updateFlat(d, activeFlat, {
+      content: { ...d.flats[flatIndex(d, activeFlat)].content,
+        items: [...d.flats[flatIndex(d, activeFlat)].content.items, item] },
+    }));
+  };
+  const patchShape = (id, patch, live) => {
+    const apply = (d) => updateFlat(d, activeFlat, {
+      content: { ...d.flats[flatIndex(d, activeFlat)].content,
+        items: d.flats[flatIndex(d, activeFlat)].content.items
+          .map((i) => (i.id === id ? { ...i, ...patch } : i)) },
+    });
+    if (live) setDoc(apply);            // mid-drag: the canvas follows, the water waits
+    else editDoc(apply);
+  };
+  const removeShape = (id) => editDoc((d) => updateFlat(d, activeFlat, {
+    content: { ...d.flats[flatIndex(d, activeFlat)].content,
+      items: d.flats[flatIndex(d, activeFlat)].content.items.filter((i) => i.id !== id) },
+  }));
+
+  const smoothPanorama = () => editDoc((d) => {
+    const f = d.flats[flatIndex(d, activeFlat)];
+    if (!f || f.content.kind !== "raster") return d;
+    const sm = smoothEnv2D({ w: f.content.w, h: f.content.h, cells: f.content.cells });
+    return updateFlat(d, activeFlat, { content: { ...f.content, cells: sm.cells } });
+  });
 
   // photo -> palette: quantize the photo to a few dominant colors and lift
   // its top-to-bottom color profile into the paint-1D strip (top of the
@@ -4104,7 +4888,9 @@ export default function App() {
   const applyPhoto = (img, k, name) => {
     const res = extractPhotoStrip(img, k, ENV_N);
     if (!res) { setPhotoInfo({ error: "Couldn't read that image." }); return; }
+    beginEdit("1d");
     setEnvColors(res.strip);
+    setDirty1d(true);
     setDeepColor(res.deep);
     setMode("paint1d");
     setPhotoInfo({ name, swatches: res.swatches });
@@ -4136,8 +4922,11 @@ export default function App() {
     im.src = url;
   };
   const enter2d = () => {
-    const seeded = seedEnv2D(palette, ENV2D_W, ENV2D_H);
-    setEnv2d(seeded); setSegEnv(seeded); setMode("paint2d");
+    if (!dirty2d) {
+      const seeded = docFromPalette(palette);
+      commitDoc(seeded); setActiveFlat(seeded.flats[0].id);
+    }
+    setMode("paint2d");
   };
 
   // camera interaction: drag the preview to pan, scroll to zoom (anchored at
@@ -4246,30 +5035,51 @@ export default function App() {
   const rasterLevel = RASTER_LEVELS[
     Math.max(0, Math.min(RASTER_LEVELS.length - 1, lowPower ? 0 : rasterQ))];
 
-  const S = useMemo(() => ({
+  // The half of the scene that has nothing to do with the waves: where the
+  // camera is, how the picture is framed, and how the backdrop maps into it.
+  // Split out because the drawn backdrop depends on exactly this and not on
+  // the wave phase, so it can be built once per camera move instead of once
+  // per animation frame.
+  const camS = useMemo(() => ({
     nx: effQuality, ny: effQuality,
     xMin: -halfW, xMax: halfW, yMin: Math.min(yNear, yFar - 2), yMax: yFar,
     H: 0.4 * Math.pow(22.5, steep),
     pitch: (pitchDeg * Math.PI) / 180,
+    bands, perspective, eLo, eHi, zoom, panX, panY, smooth, coherence, rectOutput,
+    surface3d, waveScale, bandFractions, fresOn, fresBands, reflMag,
+    // showing the backdrop reframes the picture to include sky, so it belongs
+    // here: every path that fits the water reads it from S. Pen mode draws no
+    // backdrop, so it must not be reframed for one either.
+    skyPad: showBackdrop && !penMode ? SKY_PAD : 0,
+  }), [effQuality, steep, pitchDeg, bands, perspective,
+       halfW, yNear, yFar, eLo, eHi, zoom, panX, panY, smooth, coherence, rectOutput,
+       surface3d, waveScale, bandFractions, fresOn, fresBands, reflMag,
+       showBackdrop, penMode]);
+
+  // The scene minus the instant: everything about the water except what phase
+  // the waves are at. Split out for the same reason camS was — something wants
+  // the scene without paying for it once per frame (see `reach`).
+  const waveS = useMemo(() => ({
+    ...camS,
     k: (2 * Math.PI) / wavelength,
     amp: strength * 0.06,
     sharp,
     decay: 0.18 - spread * 0.16,
     omega: 1.0,
-    t: animate ? tRef.current : manualTime,
-    bands, perspective, eLo, eHi, zoom, panX, panY, smooth, coherence, rectOutput,
-    surface3d, waveScale, bandFractions, fresOn, fresBands, reflMag,
+    dispersion,
     // waves scatter off the buoy's hull: a ring source pinned to the object,
     // with a tight decay so the disturbance stays local
     emitters: withWakes(objOn && objRipple > 0
       ? [...emitters, { id: "buoy", on: true, type: "point", x: objX, y: objY,
           size: Math.max(0.3, objSize * objRippleScale), amp: objRipple * 1.5, decay: 0.28 }]
       : emitters, wakes),
-  }), [effQuality, steep, pitchDeg, wavelength, strength, sharp, spread, bands, perspective,
-       halfW, yNear, yFar, eLo, eHi, zoom, panX, panY, smooth, coherence, rectOutput, surface3d, waveScale,
-       bandFractions, fresOn, fresBands, reflMag,
-       emitters, wakes, animate, speed, tRef.current, manualTime,
+  }), [camS, wavelength, strength, sharp, spread, dispersion, emitters, wakes,
        objOn, objX, objY, objSize, objRipple, objRippleScale]);
+
+  const S = useMemo(() => ({
+    ...waveS,
+    t: animate ? tRef.current : manualTime,
+  }), [waveS, animate, speed, tRef.current, manualTime]);
 
   const is2d = mode === "paint2d";
   const presetColors = useMemo(
@@ -4282,8 +5092,11 @@ export default function App() {
   // the preset / 1D strip, with the objects stamped on top
   const objectsOn = objects.some((o) => o.on);
   const use2d = is2d || objectsOn;
+  // The panorama the water samples. In 2D it is what you painted; in the
+  // preset and 1D modes it is the same colors as rows, which is what an object
+  // stamp and the drawn backdrop both need to sample.
   const baseEnv2d = useMemo(() => {
-    if (is2d) return segEnv;
+    if (is2d) return flattenDoc(segDoc);
     if (!objectsOn) return null;
     if (mode === "paint1d")
       return envFromRows((f) => envColors[Math.min(ENV_N - 1, Math.floor(f * ENV_N))],
@@ -4292,10 +5105,40 @@ export default function App() {
     const NB = presetColors.length;
     return envFromRows((f) => presetColors[Math.min(NB - 1, Math.floor(f * NB))],
       ENV2D_W, DERIVED_ENV_H);
-  }, [is2d, segEnv, objectsOn, mode, envColors, stops, palette, presetColors]);
+  }, [is2d, segDoc, objectsOn, mode, envColors, stops, palette, presetColors]);
   const envEffective = useMemo(
     () => (use2d ? stampObjects(baseEnv2d, objects, azSpan, eLo, eHi) : null),
     [use2d, baseEnv2d, objects, azSpan, eLo, eHi]);
+
+  // The backdrop as a DOCUMENT — plain data, no closures — because this is
+  // what crosses to the render worker, which compiles its own copy on the far
+  // side (fieldSpecFor). Keeping the document and its compiled form separate
+  // is what makes that possible at all.
+  const backdropSource = useMemo(() => {
+    if (!use2d) return null;
+    // In layers mode the document itself is used — flattening it first would
+    // throw away where each layer stands, which is the whole of depth. The
+    // preset and 1D modes have no document, so they wrap the panorama their
+    // palette or strip derives.
+    if (!is2d) return docFromPanorama(envEffective);
+    if (!objectsOn) return segDoc;
+    // objects are still stamped rather than placed; they ride on top as their
+    // own transparent layer instead of being baked into everything below
+    const blank = { w: segDoc.w, h: segDoc.h,
+      cells: new Array(segDoc.w * segDoc.h).fill(null) };
+    const stamped = stampObjects(blank, objects, azSpan, eLo, eHi);
+    return backdropDoc(
+      [...segDoc.flats, flat(rasterContent(stamped), "Objects")], segDoc.w, segDoc.h);
+  }, [use2d, is2d, segDoc, objectsOn, objects, azSpan, eLo, eHi, envEffective]);
+
+  // The compiled form, for this thread: the region list and its distance
+  // fields depend on what is painted, not on where the camera is or what the
+  // waves are doing. Compiling is ~1ms against ~1200ms of contouring, so this
+  // is not a speedup worth quoting — it is what lets the compiler grow (finer
+  // grids, vector content rasterized up, several flats) without that growth
+  // landing on every animation frame.
+  const backdrop = useMemo(
+    () => (backdropSource ? compileBackdrop(backdropSource) : null), [backdropSource]);
 
   // 3D "solid" surface: the lifted color layers have no depth ordering, so a
   // tall wave's far side used to show through the crest in front of it. In this
@@ -4303,6 +5146,19 @@ export default function App() {
   // surf3d) — smooth regions like the flat modes, but occlusion-correct. Pen
   // mode has its own hidden-line path, so this only covers filled regions.
   const solid3d = !penMode && surface3d && perspective;
+
+  // The backdrop as the camera sees it, above the horizon. Keyed on camS, so it
+  // survives every animation frame and rebuilds only when the camera, the
+  // window or the painting moves. Painted backdrops go through their regions;
+  // preset and 1D ones band a single scalar, exactly as the water does.
+  const skyLayers = useMemo(() => {
+    if (!showBackdrop || penMode) return null;
+    const fit = computeFit(camS);
+    if (use2d) return buildSkyRegions(camS, fit, backdrop, azSpan);
+    const cols = mode === "paint1d" ? colors1d : presetColors;
+    if (!cols || !cols.length) return null;
+    return buildSkyBands(camS, fit, bandThresholds(camS, cols.length), cols);
+  }, [showBackdrop, penMode, use2d, backdrop, camS, azSpan, mode, colors1d, presetColors]);
 
   // The flat builders draw the picture only in the flat modes. In 3D solid the
   // occluded raster pass (surf3d) replaces every one of their outputs, and pen
@@ -4314,8 +5170,8 @@ export default function App() {
   const geom = useMemo(() => (flatNeeded && !use2d ? buildGeometry(S) : null),
     [flatNeeded, use2d, S]);
   const seg = useMemo(
-    () => (flatNeeded && use2d ? buildSegmentation(S, envEffective, azSpan) : null),
-    [flatNeeded, use2d, S, envEffective, azSpan]);
+    () => (flatNeeded && use2d ? buildSegmentation(S, backdrop, azSpan) : null),
+    [flatNeeded, use2d, S, backdrop, azSpan]);
   // …and those two numbers from the sample pass alone, only while something
   // is looking at them
   const rangeNeeded = !flatNeeded && (autoFit || advanced);
@@ -4323,9 +5179,20 @@ export default function App() {
   const rng = flatNeeded ? (use2d ? seg : geom) : range;
   const rngLo = rng ? rng.lo : null, rngHi = rng ? rng.hi : null;
 
+  // The swing the ripples actually reach, for the backdrop panel's ruler and
+  // the dimmed rows on its canvas. Taken at a fixed phase rather than the live
+  // one: it is a property of the scene rather than of the instant, it is read
+  // to the degree, and computing it per animation frame would spend a whole
+  // sample pass on two numbers that barely move — which is the cost the flat
+  // build was taken off the 3D path to avoid. It also stops the readout
+  // flickering while the water runs.
+  const reach = useMemo(
+    () => elevationRange({ ...waveS, t: manualTime }), [waveS, manualTime]);
+
   const isobandColors = mode === "paint1d" ? colors1d : presetColors;
-  // a painted panorama's first cell is its background (as buildSegmentation has it)
-  const bg = use2d ? envEffective.cells[0] : isobandColors[0];
+  // the furthest flat's first cell is the background (as buildSegmentation has
+  // it), and the compiled backdrop has it whether or not the flat build ran
+  const bg = use2d ? backdrop.bg : isobandColors[0];
   const autoBg = penMode ? "#0a0d12" : bg;
   const bgFill = bgColor || autoBg;
   const gapFill = crestGapColor || bgFill;
@@ -4410,12 +5277,15 @@ export default function App() {
   const penLines = useMemo(() => makePenLines(S), [makePenLines, S]);
 
   // The fields the surface-raster passes contour (fieldSpecFor), from the
-  // slice of studio state they depend on — kept as plain data so the same
-  // spec can be stood up inside the render worker.
+  // slice of studio state they depend on — kept as plain data so the same spec
+  // can be stood up inside the render worker. The backdrop travels as its
+  // DOCUMENT rather than its compiled form: compiling produces distance fields
+  // and closures, which cannot cross to a worker, but a document is data all
+  // the way down and the far side compiles its own.
   const specOpts = useMemo(() => ({
-    use2d, env2d: envEffective, azSpan,
+    use2d, doc: backdropSource, azSpan,
     cols: mode === "paint1d" ? colors1d : presetColors, fresOn, fresBands,
-  }), [use2d, envEffective, azSpan, mode, colors1d, presetColors, fresOn, fresBands]);
+  }), [use2d, backdropSource, azSpan, mode, colors1d, presetColors, fresOn, fresBands]);
   const makeFieldSpec = useCallback((S) => fieldSpecFor(S, specOpts), [specOpts]);
   const fieldSpec = useMemo(() => makeFieldSpec(S), [makeFieldSpec, S]);
 
@@ -4542,8 +5412,8 @@ export default function App() {
     }
     // the flat build only where it is what gets drawn (see flatNeeded)
     const geomT = !solid3d && !use2d ? buildGeometry(St) : null;
-    const segT = !solid3d && use2d ? buildSegmentation(St, envEffective, azSpan) : null;
-    const bgT = use2d ? envEffective.cells[0] : isobandColors[0];
+    const segT = !solid3d && use2d ? buildSegmentation(St, backdrop, azSpan) : null;
+    const bgT = use2d ? backdrop.bg : isobandColors[0];
     const bgFillT = bgColor || bgT;
     const layersT = solid3d ? null : use2d ? (segT.layers || null)
       : geomT.ds.map((d, k) => ({ d, color: isobandColors[k + 1] }));
@@ -4569,6 +5439,9 @@ export default function App() {
   const buildSvg = (over, frame) => {
     const F = frame || liveFrame;
     const { seg, fresPaths, penLines, buoy, bgFill, gapFill } = F;
+    // the drawn backdrop does not move with the waves, so every frame of a
+    // video export shares the one the preview built
+    const svgSky = penMode ? null : skyLayers;
     const svgLayers = over ? over.layers : F.drawLayers;
     const svgFres = over ? over.fres : F.drawFres;
     const svgBg = over ? over.bg : F.drawBg;
@@ -4585,6 +5458,11 @@ export default function App() {
     }
     let body = `<rect width="${VB_W}" height="${VB_H}" fill="${bgFill}"/>` + rollOpen;
     const stroke = edges ? ` stroke="#000" stroke-opacity="0.25" stroke-width="0.6"` : "";
+    // the backdrop first: the water is drawn over it, so the horizon is
+    // wherever the water's own outline ends
+    if (svgSky) svgSky.forEach((l) => {
+      body += `<path d="${l.d}" fill="${l.color}" fill-rule="evenodd"${stroke}/>`;
+    });
     let defs = "";
     if (fresOn && svgFres) svgFres.forEach((d, i) => {
       if (d) defs += `<clipPath id="fres${i + 1}"><path d="${d}"/></clipPath>`;
@@ -4830,6 +5708,13 @@ export default function App() {
     background: "#1a232c", color: "#9fb0c0", border: "1px solid #26313c",
     fontFamily: "ui-monospace, monospace",
   };
+  const histBtn = (on) => ({
+    width: 28, height: 26, padding: 0, borderRadius: 6, fontSize: 14, lineHeight: 1,
+    fontFamily: "ui-monospace, monospace", flex: "none",
+    cursor: on ? "pointer" : "default",
+    background: "#1a232c", color: on ? "#9fb0c0" : "#3d4a56",
+    border: "1px solid " + (on ? "#26313c" : "#1d262f"),
+  });
   const brushBtn = (on) => ({
     width: 30, height: 30, padding: 0, borderRadius: 6, cursor: "pointer", fontSize: 13,
     fontFamily: "ui-monospace, monospace", lineHeight: 1,
@@ -4881,6 +5766,14 @@ export default function App() {
             <svg viewBox={`0 0 ${VB_W} ${VB_H}`} style={{ width: "100%", display: "block" }}>
               <rect width={VB_W} height={VB_H} fill={bgFill} />
               <g transform={rollTf || undefined}>
+              {/* the backdrop itself, drawn where the camera looks straight at
+                  it. First, so the water covers it: the horizon in the picture
+                  is wherever the water's own outline ends. */}
+              {!penMode && skyLayers && skyLayers.map((l, i) => (
+                <path key={`sky${i}`} d={l.d} fill={l.color} fillRule="evenodd"
+                  stroke={edges ? "#000" : "none"} strokeOpacity={edges ? 0.28 : 0}
+                  strokeWidth={edges ? 0.6 : 0} />
+              ))}
               {penMode ? (
                 penLines.map((l, i) => (
                   <path key={i} d={l.d} fill="none" stroke={l.color}
@@ -5068,7 +5961,7 @@ export default function App() {
               {mode === "preset" && !stops &&
                 <Slider label="Color regions" value={bands} min={3} max={16} step={1} onChange={setBands} />}
               <div style={{ display: "flex", gap: 6, marginBottom: 10, flexWrap: "wrap" }}>
-                {[...Object.keys(PALETTES), ...Object.keys(BANDED_PALETTES)].map((p) => {
+                {paletteNames().map((p) => {
                   const on = mode === "preset" && palette === p;
                   const inked = !!BANDED_PALETTES[p];
                   return (
@@ -5144,39 +6037,128 @@ export default function App() {
                 )}
               </div>
 
-              <Slider label="Reflection detail (angular zoom)" value={reflMag} min={0.5} max={10}
-                step={0.1} onChange={setReflMag}
-                fmt={(v) => (v === 1 ? "1.0× (off)" : v.toFixed(1) + "×")} />
-              <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 10, lineHeight: 1.5,
-                fontFamily: "ui-monospace, monospace" }}>
-                Compresses the environment into a narrower reflected cone, so a small ripple
-                tilt sweeps more of the colors — the telephoto close-up look where every
-                wavelet carries the whole gradient. Pair with auto-fit for steep-down shots.
-              </div>
-
-              {mode === "paint1d" && (
-                <div>
-                  <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 7, lineHeight: 1.5,
+              {mode !== "preset" && (
+                <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 7 }}>
+                  <span style={{ flex: 1, fontSize: 9.5, color: "#6d808f", lineHeight: 1.5,
                     fontFamily: "ui-monospace, monospace" }}>
-                    Paint by elevation only — sky at the top, waterline at the bottom. Smooth, banded
-                    reflection (same shape as the presets).
-                  </div>
-                  <PaintStrip envColors={envColors} setEnvColors={setEnvColors}
-                    activeColor={activeColor} height={140} brushSize={brushSize} />
+                    {mode === "paint1d"
+                      ? "Paint by elevation only — sky at the top, waterline at the bottom."
+                      : "Left–right = looking across the lake; up = sky, down = waterline."}
+                  </span>
+                  <button onClick={undoBackdrop} disabled={!canUndo(hist)} title="Undo (⌘Z)"
+                    style={histBtn(canUndo(hist))}>↶</button>
+                  <button onClick={redoBackdrop} disabled={!canRedo(hist)} title="Redo (⇧⌘Z)"
+                    style={histBtn(canRedo(hist))}>↷</button>
                 </div>
               )}
 
+              {mode === "paint1d" && (
+                <ElevationScale eLo={eLo} eHi={eHi} mag={reflMag} reach={reach}>
+                  <PaintStrip envColors={envColors} setEnvColors={setEnvColors}
+                    activeColor={activeColor} height={160} brushSize={brushSize}
+                    onEditStart={() => { beginEdit("1d"); setDirty1d(true); }} />
+                </ElevationScale>
+              )}
+
               {mode === "paint2d" && (
-                <div>
-                  <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 7, lineHeight: 1.5,
+                <>
+                  <ElevationScale eLo={eLo} eHi={eHi} mag={reflMag} reach={reach}>
+                    <PaintGrid2D view={docView} w={doc.w} h={doc.h} activeColor={activeColor}
+                      disabled={active.content.kind !== "raster"}
+                      onPaint={(paint) => setDoc((d) => paintFlat(d, activeFlat, paint))}
+                      onStrokeEnd={() => setSegDoc(docRef.current)}
+                      onEditStart={() => { beginEdit("2d"); setDirty2d(true); }}
+                      brushSize={brushSize} brushShape={brushShape} />
+                    {active.content.kind === "shapes" && (
+                      <ShapeOverlay items={active.content.items} selectedId={selectedShape}
+                        onSelect={setSelectedShape}
+                        onEditStart={() => { beginEdit("2d"); setDirty2d(true); }}
+                        onChange={(id, patch) => patchShape(id, patch, true)}
+                        onCommit={() => setSegDoc(docRef.current)} />
+                    )}
+                  </ElevationScale>
+                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9.5,
+                    color: "#6d808f", marginTop: 2, paddingLeft: 40,
                     fontFamily: "ui-monospace, monospace" }}>
-                    Paint the shoreline panorama. Left–right = looking across the lake; up = sky,
-                    down = waterline. The water updates when you lift your finger.
+                    <span>−{azSpan}°</span><span>azimuth</span><span>+{azSpan}°</span>
                   </div>
-                  <PaintGrid2D env2d={env2d} setEnv2d={setEnv2d} activeColor={activeColor}
-                    onStrokeEnd={() => setSegEnv(env2dRef.current)}
-                    brushSize={brushSize} brushShape={brushShape} />
-                </div>
+
+                  <LayerList doc={doc} activeId={activeFlat} onSelect={setActiveFlat}
+                    onToggle={(id) => editDoc((d) =>
+                      updateFlat(d, id, { visible: !d.flats[flatIndex(d, id)].visible }))}
+                    onMove={(id, delta) => editDoc((d) => moveFlat(d, id, delta))} />
+
+                  <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+                    <button style={miniBtn} title="A new painted layer, empty"
+                      onClick={() => addLayer(emptyRaster(doc.w, doc.h), "Painted")}>+ paint</button>
+                    <button style={miniBtn} title="A new repeating band pattern"
+                      onClick={() => addLayer(stripesContent(
+                        [{ color: activeColor, size: 2 }, { color: "#ffffff", size: 1 }], true, 0),
+                        "Repeat")}>+ repeat</button>
+                    <button style={miniBtn} title="A new layer of shapes you can drag"
+                      onClick={() => { setSelectedShape(null);
+                        addLayer(shapesContent([]), "Shapes"); }}>+ shapes</button>
+                    <button style={miniBtn} onClick={duplicateLayer}>copy</button>
+                    <button style={{ ...miniBtn, color: doc.flats.length > 1 ? "#c98a7f" : "#4a5560" }}
+                      onClick={removeLayer} disabled={doc.flats.length <= 1}>delete</button>
+                  </div>
+
+                  <PlaceEditor flat={active} yFar={yFar}
+                    onChange={(place) => patchActive({ place })} />
+
+                  <PlanView doc={doc} activeId={activeFlat} yFar={yFar}
+                    onSelect={setActiveFlat} />
+
+                  {active.content.kind === "ramp" && (
+                    <div style={{ marginTop: 10 }}>
+                      <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 6, lineHeight: 1.5,
+                        fontFamily: "ui-monospace, monospace" }}>
+                        A palette down the elevation. Pick another, or bake it to pixels to paint
+                        over it.
+                      </div>
+                      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                        {paletteNames().map((pn) => (
+                          <button key={pn} onClick={() => patchContent({ palette: pn })}
+                            style={{ flex: "1 0 30%", padding: "6px 4px", fontSize: 10.5,
+                              borderRadius: 6, cursor: "pointer", fontFamily: "ui-monospace, monospace",
+                              background: active.content.palette === pn ? "#27424b" : "#1a232c",
+                              color: active.content.palette === pn ? "#dff1f6" : "#9fb0c0",
+                              border: "1px solid " + (active.content.palette === pn ? "#3f7e8f" : "#26313c") }}>
+                            {pn}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {active.content.kind === "stripes" && (
+                    <StripesEditor content={active.content} rowsPerDeg={doc.h / ((eHi - eLo) || 1)}
+                      onChange={patchContent} activeColor={activeColor} />
+                  )}
+
+                  {active.content.kind === "shapes" && (
+                    <ShapesEditor content={active.content} selectedId={selectedShape}
+                      onSelect={setSelectedShape} onAdd={addShape}
+                      onPatch={(id, patch) => patchShape(id, patch)}
+                      onRemove={(id) => { if (id === selectedShape) setSelectedShape(null);
+                        removeShape(id); }}
+                      activeColor={activeColor} />
+                  )}
+
+                  {active.content.kind !== "raster" && (
+                    <button style={{ ...miniBtn, width: "100%", marginTop: 8 }}
+                      onClick={() => editDoc((d) => bakeFlat(d, activeFlat))}>
+                      Bake to pixels (to paint on it)
+                    </button>
+                  )}
+                  {active.content.kind === "shapes" && (
+                    <div style={{ fontSize: 9.5, color: "#6d808f", marginTop: 6, lineHeight: 1.5,
+                      fontFamily: "ui-monospace, monospace" }}>
+                      Shapes are rendered at {COMPILE_SCALE}× the paint grid, so their edges are
+                      finer than the brush can draw. Two shapes the same colour stay two regions.
+                    </div>
+                  )}
+                </>
               )}
 
               {mode !== "preset" && (
@@ -5209,7 +6191,9 @@ export default function App() {
                         border: "1px dashed #44525e", display: "inline-flex",
                         alignItems: "center", justifyContent: "center" }}>+</button>
                   </div>
-                  <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 8, flexWrap: "wrap" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 8,
+                    flexWrap: "wrap",
+                    opacity: mode === "paint2d" && active.content.kind !== "raster" ? 0.4 : 1 }}>
                     <span style={{ fontSize: 10.5, color: "#6d808f", fontFamily: "ui-monospace, monospace",
                       width: 38 }}>Brush</span>
                     {[[0, "·"], [1, "S"], [2, "M"], [3, "L"]].map(([s, lbl]) => (
@@ -5225,31 +6209,21 @@ export default function App() {
                   </div>
                   <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
                     {mode === "paint1d" && <>
-                      <button style={miniBtn} onClick={() => setEnvColors((p) => smoothEnv(p))}>Smooth</button>
-                      <button style={miniBtn} onClick={() => setEnvColors(seedEnv(palette, ENV_N))}>Reset to {palette}</button>
+                      <button style={miniBtn} onClick={smoothStrip}>Smooth</button>
+                      <button style={miniBtn} onClick={resetStrip}>Reset to {palette}</button>
                     </>}
-                    {mode === "paint2d" && <>
+                    {mode === "paint2d" && active.content.kind === "raster" && <>
+                      <button style={miniBtn} onClick={smoothPanorama}>Smooth this layer</button>
                       <button style={miniBtn}
-                        onClick={() => { const s = smoothEnv2D(env2dRef.current); setEnv2d(s); setSegEnv(s); }}>
-                        Smooth colors
-                      </button>
-                      <button style={miniBtn}
-                        onClick={() => { const s = seedEnv2D(palette, ENV2D_W, ENV2D_H); setEnv2d(s); setSegEnv(s); }}>
-                        Reset to {palette}
-                      </button>
+                        onClick={() => editDoc((d) => updateFlat(d, activeFlat,
+                          { content: emptyRaster(d.w, d.h) }))}>Clear this layer</button>
                     </>}
                   </div>
-                  {mode === "paint2d" && (
-                    <div style={{ marginTop: 10 }}>
-                      <Slider label="azimuth span (panorama width)" value={azSpan} min={15} max={80} step={1}
-                        onChange={setAzSpan} fmt={(v) => "±" + v + "°"} />
-                      <Slider label="edge ripple" value={coherence} min={0} max={8} step={1}
-                        onChange={setCoherence}
-                        fmt={(v) => (v === 0 ? "sharp" : v <= 2 ? "rippled" : v <= 5 ? "smooth" : "broad")} />
-                      <div style={{ fontSize: 9.5, color: "#6d808f", marginTop: 2, lineHeight: 1.5,
-                        fontFamily: "ui-monospace, monospace" }}>
-                        Lower = edges follow every wave; higher = calmer, broader regions.
-                      </div>
+                  {mode === "paint2d" && !docCode && (
+                    <div style={{ fontSize: 9.5, color: "#c96f5f", marginTop: 8, lineHeight: 1.5,
+                      fontFamily: "ui-monospace, monospace" }}>
+                      Too many distinct colors to save in the link — smoothing blends a new color
+                      into every cell. This backdrop will not survive a reload.
                     </div>
                   )}
                 </>
@@ -5267,6 +6241,83 @@ export default function App() {
                     color: "#6d808f", marginTop: 3, fontFamily: "ui-monospace, monospace" }}>
                     <span>{eLo}° horizon</span><span>zenith {eHi}°</span>
                   </div>
+                </>
+              )}
+            </div>
+
+            {/* How the water samples the backdrop, as opposed to what the backdrop is.
+                These used to be scattered — the elevation window three panels down in
+                Advanced, the azimuth span duplicated with two different names — which is
+                most of why the elevation sliders read as unknowable. */}
+            <div style={panel}>
+              <div style={heading}>What the water sees</div>
+              <Toggle label="Show the backdrop itself" value={showBackdrop}
+                onChange={setShowBackdrop} />
+              <div style={{ fontSize: 9.5, color: "#6d808f", margin: "2px 0 12px", lineHeight: 1.5,
+                fontFamily: "ui-monospace, monospace" }}>
+                {penMode
+                  ? "Not in pen mode — the pen styles draw the water's own lines."
+                  : showBackdrop
+                    ? "The frame pulls back to the horizon and the backdrop is drawn where the"
+                      + " camera looks straight at it — same colors, same edges, the same regions"
+                      + " the water is reflecting. Move the elevation window and you can watch"
+                      + " both ends of it at once. The SVG, PNG and video exports carry it; the"
+                      + " paper stack cuts water only."
+                    : "Draw the backdrop above the horizon, not only its reflection. The fastest"
+                      + " way to see what the elevation window is doing."}
+              </div>
+              <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 10, lineHeight: 1.5,
+                fontFamily: "ui-monospace, monospace" }}>
+                The window of the sky the ripples can reach. Every backdrop row maps into
+                {" "}{eLo}°–{eHi}° of reflected elevation; this scene's ripples currently swing
+                across {reach.lo.toFixed(0)}°–{reach.hi.toFixed(0)}°, the band marked on the canvas
+                above.
+              </div>
+              <Toggle label="Auto-fit elevation range" value={autoFit} onChange={setAutoFit} />
+              {autoFit ? (
+                <div style={{ fontFamily: "ui-monospace, monospace", fontSize: 11,
+                  color: "#7f93a3", margin: "2px 0 12px", lineHeight: 1.5 }}>
+                  tracking the view &amp; waves · {eLo}° – {eHi}°
+                </div>
+              ) : (
+                <>
+                  <button onClick={() => { setELo(Math.floor(reach.lo)); setEHi(Math.ceil(reach.hi)); }}
+                    style={{ width: "100%", padding: "8px", borderRadius: 7, cursor: "pointer",
+                      background: "#1a232c", color: "#9fd0d9", border: "1px solid #2f6b78",
+                      fontFamily: "ui-monospace, monospace", fontSize: 11, margin: "2px 0 12px" }}>
+                    ⤢ fit the window to the water ({reach.lo.toFixed(0)}° – {reach.hi.toFixed(0)}°)
+                  </button>
+                  <Slider label="elevation low (waterline end)" value={eLo} min={-5} max={60} step={1}
+                    onChange={setELo} fmt={(v) => v + "°"} />
+                  <Slider label="elevation high (sky end)" value={eHi} min={8} max={90} step={1}
+                    onChange={setEHi} fmt={(v) => v + "°"} />
+                </>
+              )}
+              <Slider label="azimuth span (backdrop width)" value={azSpan} min={15} max={80} step={1}
+                onChange={setAzSpan} fmt={(v) => "±" + v + "°"} />
+              <Slider label="reflection detail (angular zoom)" value={reflMag} min={0.5} max={10}
+                step={0.1} onChange={setReflMag}
+                fmt={(v) => (v === 1 ? "1.0× (off)" : v.toFixed(1) + "×")} />
+              <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 10, lineHeight: 1.5,
+                fontFamily: "ui-monospace, monospace" }}>
+                Compresses the environment into a narrower reflected cone, so a small ripple
+                tilt sweeps more of the colors — the telephoto close-up look where every
+                wavelet carries the whole gradient. Pair with auto-fit for steep-down shots.
+              </div>
+              {use2d && (
+                <>
+                  <Slider label="edge ripple" value={coherence} min={0} max={8} step={1}
+                    onChange={setCoherence}
+                    fmt={(v) => (v === 0 ? "sharp" : v <= 2 ? "rippled" : v <= 5 ? "smooth" : "broad")} />
+                  <div style={{ fontSize: 9.5, color: "#6d808f", margin: "2px 0 10px", lineHeight: 1.5,
+                    fontFamily: "ui-monospace, monospace" }}>
+                    Lower = edges follow every wave; higher = calmer, broader regions.
+                  </div>
+                  <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 6,
+                    fontFamily: "ui-monospace, monospace" }}>
+                    reflected panorama (what the water actually samples):
+                  </div>
+                  <EnvPreview env={envEffective} />
                 </>
               )}
             </div>
@@ -5323,22 +6374,11 @@ export default function App() {
                 </button>
               )}
               {objectsOn && (
-                <>
-                  {!is2d && (
-                    <>
-                      <Slider label="azimuth span (reflection width)" value={azSpan} min={15} max={80}
-                        step={1} onChange={setAzSpan} fmt={(v) => "±" + v + "°"} />
-                      <Slider label="edge ripple" value={coherence} min={0} max={8} step={1}
-                        onChange={setCoherence}
-                        fmt={(v) => (v === 0 ? "sharp" : v <= 2 ? "rippled" : v <= 5 ? "smooth" : "broad")} />
-                    </>
-                  )}
-                  <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 6,
-                    fontFamily: "ui-monospace, monospace" }}>
-                    reflected panorama (what the water sees):
-                  </div>
-                  <EnvPreview env={envEffective} />
-                </>
+                <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5,
+                  fontFamily: "ui-monospace, monospace" }}>
+                  Objects sit on the waterline and are sized in degrees of reflected elevation;
+                  the panorama they land in is in <b>What the water sees</b>, above.
+                </div>
               )}
             </div>
 
@@ -5486,9 +6526,21 @@ export default function App() {
                   its rate — for the animation above and for the video export alike. Turning
                   it down and the video length up is how you get the same stretch of water
                   to unfold slowly: a {vidPlan.seconds.toFixed(1)} s export covers
-                  {" "}{vidPlan.endPhase.toFixed(1)} of phase at this setting. Under advanced,
-                  each emitter has its own rate against this one, so a long swell can roll
-                  while the chop on top of it races.
+                  {" "}{vidPlan.endPhase.toFixed(1)} of phase at this setting.
+                </div>
+                <Toggle label="Speed follows wavelength" value={dispersion}
+                  onChange={setDispersion} />
+                <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5, marginTop: -4,
+                  fontFamily: "ui-monospace, monospace" }}>
+                  Real water disperses: a long wave rolls through slowly and overtakes
+                  everything, a short one bobs fast and barely travels. With this on, the
+                  clock above stays the scene's one tempo and each train's share of it is
+                  worked out from its own wavelength — crests carry as √λ, the bob as 1/√λ —
+                  so a swell at 4.0× runs its crests through twice as fast as one at 1.0×
+                  and oscillates half as often. Off, every train bobs at the clock's rate
+                  whatever its size, which sends long swell across the frame far too fast.
+                  Under advanced each emitter still keeps a rate, now a trim on the share
+                  the rule gives it.
                 </div>
               </div>
               {animate ? null : (
@@ -5523,12 +6575,18 @@ export default function App() {
                   train. Spectrum = the older wind field, a plain ladder of straight waves,
                   kept for scenes built on it. Rings = a scattered field of radial ripples —
                   the concentric color rings you see on a real lake. Point = a single spreading
-                  ripple. Each carries a rate — its gearing off the scene clock — so a long
-                  swell can roll under fast chop, or one train can be frozen while the rest of
-                  the water moves.
+                  ripple.
+                  {dispersion
+                    ? " Speed follows wavelength is on, so each card shows the share of the"
+                      + " clock its wavelength earns it; the rate below that is a trim on"
+                      + " top, and 0 still freezes one train while the rest of the water moves."
+                    : " Each carries a rate — its gearing off the scene clock — so a long"
+                      + " swell can roll under fast chop, or one train can be frozen while"
+                      + " the rest of the water moves."}
                 </div>
                 {emitters.map((em, i) => (
                   <EmitterCard key={em.id} em={em} idx={i} halfW={halfW} yFar={yFar}
+                    dispersion={dispersion}
                     onChange={(patch) => updateEmitter(em.id, patch)}
                     onRemove={() => removeEmitter(em.id)} />
                 ))}
@@ -5541,24 +6599,11 @@ export default function App() {
                   </button>
                 )}
                 <div style={{ ...heading, marginTop: 10 }}>Range & quality</div>
-                <Toggle label="Auto-fit elevation range" value={autoFit} onChange={setAutoFit} />
-                {autoFit ? (
-                  <div style={{ fontFamily: "ui-monospace, monospace", fontSize: 11,
-                    color: "#7f93a3", margin: "2px 0 12px", lineHeight: 1.5 }}>
-                    tracking the view &amp; waves · {eLo}° – {eHi}°
-                  </div>
-                ) : (
-                  <>
-                    <button onClick={() => { setELo(Math.floor(rng.lo)); setEHi(Math.ceil(rng.hi)); }}
-                      style={{ width: "100%", padding: "8px", borderRadius: 7, cursor: "pointer",
-                        background: "#1a232c", color: "#9fd0d9", border: "1px solid #2f6b78",
-                        fontFamily: "ui-monospace, monospace", fontSize: 11, marginBottom: 12 }}>
-                      ⤢ fit elevation range to water ({rng.lo.toFixed(0)}° – {rng.hi.toFixed(0)}°)
-                    </button>
-                    <Slider label="elevation low" value={eLo} min={-5} max={60} step={1} onChange={setELo} fmt={(v) => v + "°"} />
-                    <Slider label="elevation high" value={eHi} min={8} max={90} step={1} onChange={setEHi} fmt={(v) => v + "°"} />
-                  </>
-                )}
+                <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 10, lineHeight: 1.5,
+                  fontFamily: "ui-monospace, monospace" }}>
+                  The elevation window moved up to <b>What the water sees</b>, beside the
+                  backdrop it frames.
+                </div>
                 <Slider label="plane near edge" value={yNear} min={1} max={15} step={0.5}
                   onChange={setYNear} fmt={(v) => v.toFixed(1)} />
                 <Slider label="plane depth (far edge)" value={yFar} min={10} max={90} step={2} onChange={setYFar} />

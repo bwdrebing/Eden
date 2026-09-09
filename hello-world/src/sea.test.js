@@ -1,5 +1,5 @@
 import {
-  prepField, heightAt, slopeAt, WATER_MOODS, SEA_N_DEFAULT, SPECTRUM_N_REF,
+  prepField, heightAt, slopeAt, WATER_MOODS, SEA_N_DEFAULT, SPECTRUM_N_REF, omegaAt,
 } from "./WaterReflectionContours";
 
 /* ------------------------------------------------------------------ *
@@ -19,7 +19,7 @@ const scene = (emitters, over = {}) => prepField({
   nx: 120, ny: 120,
   xMin: -22, xMax: 22, yMin: 3, yMax: 78,
   H: 6, k: (2 * Math.PI) / 2.8, amp: 0.5 * 0.06, sharp: 0,
-  decay: 0.1, omega: 1, t: 3.4, perspective: true,
+  decay: 0.1, omega: 1, t: 3.4, perspective: true, dispersion: true,
   emitters, ...over,
 });
 // a point on that plane, from fractions of it
@@ -162,6 +162,31 @@ describe("sea: the controls do what their labels say", () => {
     // this be dragged without re-tuning strength each time.
     expect(Math.max(...cp)).toBeGreaterThan(Math.max(...ce) * 0.55);
     expect(Math.max(...cp)).toBeLessThan(Math.max(...ce) * 1.15);
+  });
+
+  test("every component takes its speed from the scene's dispersion rule", () => {
+    // A sea is a ladder of wavenumbers, so it is the emitter with the most to
+    // get wrong here: each rung has to run at the frequency its own wavelength
+    // earns it, through the same omegaAt every other emitter type goes through.
+    for (const dispersion of [true, false]) {
+      const T = 2.5;
+      const a = scene([sea({ chop: 0 })], { t: 0, dispersion })._ems[0];
+      const b = scene([sea({ chop: 0 })], { t: T, dispersion })._ems[0];
+      const S = scene([], { dispersion });
+      for (let i = 0; i < a.N; i += 7) {
+        expect(a.K[i]).toBeCloseTo(b.K[i], 10);         // same ladder either way
+        expect(a.PH[i] - b.PH[i]).toBeCloseTo(omegaAt(a.K[i], S) * T, 9);
+      }
+    }
+  });
+
+  test("the envelopes ride at the speed of the waves under them", () => {
+    // groups travel at the group velocity, which is derived from the same rule
+    // — an envelope with a speed of its own would slide over the wave field
+    const kp = ((2 * Math.PI) / 2.8) / 1.7;   // scene ripple scale / emitter size
+    const S = scene([]);
+    const e = scene([sea({ group: 0.9 })], { t: 4 })._ems[0];
+    expect(e.gcg).toBeCloseTo(0.5 * (omegaAt(kp, S) / kp) * 4, 9);
   });
 
   test("patch and group envelopes travel with the clock", () => {

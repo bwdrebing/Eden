@@ -1,0 +1,76 @@
+{
+  "note": "re-recorded when the sea emitter landed: the spectrum amplitude fix and the ripple-source cusp fix both move this field slightly. Same 13 regions, same colors, same clip outline; every path shifted. Gate: rendered against origin/main at 12x into the top of the frame, same edge quality. See backdropParity.test.js",
+  "bg": "#141d33",
+  "count": 13,
+  "twoD": true,
+  "lo": -3.162016,
+  "hi": 42.351215,
+  "clipHash": "911e97f9d9a98adb",
+  "layers": [
+    {
+      "color": "#141d33",
+      "len": 143648,
+      "hash": "eae954830aef886a"
+    },
+    {
+      "color": "#c24529",
+      "len": 143648,
+      "hash": "eae954830aef886a"
+    },
+    {
+      "color": "#070a0b",
+      "len": 143648,
+      "hash": "eae954830aef886a"
+    },
+    {
+      "color": "#3a2c23",
+      "len": 143648,
+      "hash": "eae954830aef886a"
+    },
+    {
+      "color": "#070a09",
+      "len": 143648,
+      "hash": "eae954830aef886a"
+    },
+    {
+      "color": "#f6f2e1",
+      "len": 143648,
+      "hash": "eae954830aef886a"
+    },
+    {
+      "color": "#27406b",
+      "len": 143648,
+      "hash": "eae954830aef886a"
+    },
+    {
+      "color": "#3f5f93",
+      "len": 181603,
+      "hash": "f436a8ac6d5c9de9"
+    },
+    {
+      "color": "#0a130d",
+      "len": 726675,
+      "hash": "00de13579a8e34ce"
+    },
+    {
+      "color": "#ffffff",
+      "len": 688459,
+      "hash": "a05baaedd462a767"
+    },
+    {
+      "color": "#9cc3e8",
+      "len": 189727,
+      "hash": "04a779cbfc04dbf9"
+    },
+    {
+      "color": "#cfe1ef",
+      "len": 20997,
+      "hash": "33d421cbc1e04fb5"
+    },
+    {
+      "color": "#f2f7fb",
+      "len": 2088,
+      "hash": "4c17512c26131b85"
+    }
+  ]
+}

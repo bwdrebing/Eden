@@ -107,19 +107,29 @@ function collect(fields) {
 
 // Two-way binding between a studio's settings and its URL slice.
 //   fields: { fieldName: [value, setter], ... }
+//   legacy: { fieldName: valueForLinksThatPredateIt, ... }
 // On mount it applies any values found in the URL (so a shared link
 // reconstructs the state), then keeps the slice in sync whenever any
 // value changes.
+//
+// `legacy` is for a setting whose *default changed the picture* — one that
+// should be on for new work but must not silently rewrite a scene someone
+// already saved. A slice is written whole, so a slice that exists and does
+// not carry the key is a link from before the setting existed, and that is
+// exactly when the legacy value is applied instead of the field's default.
+// A fresh session (no slice at all) seeds the defaults and never sees it.
 //
 // The tricky part is that applied values arrive one render later than the
 // mount effect (React state updates are async). The `last` guard tracks the
 // serialized value we last committed to the URL and only writes on a real
 // change, so the pre-commit default values are never flushed over a restored
 // slice — the URL only ever gains the restored (or user-edited) values.
-export function useUrlSync(key, fields) {
+export function useUrlSync(key, fields, legacy) {
   const booted = useRef(false);
   const fieldsRef = useRef(fields);
   fieldsRef.current = fields;
+  const legacyRef = useRef(legacy);
+  legacyRef.current = legacy || {};
 
   const serialized = JSON.stringify(collect(fields));
   const last = useRef(serialized); // defaults on the first render
@@ -130,6 +140,13 @@ export function useUrlSync(key, fields) {
       const f = fieldsRef.current;
       for (const name in slice) {
         if (f[name] && slice[name] !== undefined) f[name][1](slice[name]);
+      }
+      // A saved link predates anything it does not carry: hold those fields at
+      // the value that reproduces the scene as it was saved, rather than at
+      // today's default. The write effect below then flushes the choice back
+      // into the URL, so the link stops being ambiguous once it is reopened.
+      for (const name in legacyRef.current) {
+        if (f[name] && slice[name] === undefined) f[name][1](legacyRef.current[name]);
       }
       // Applied values land next render; the write effect flushes them then.
     } else {
