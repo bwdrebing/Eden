@@ -23,11 +23,18 @@
 //    stripes  a run of bands, optionally repeating: "two blue rows, one white
 //             row, all the way up". The generalisation of the painted 1D strip
 //    raster   painted cells, what the brush produces
+//    shapes   stated rather than drawn — a rectangle at a position, this wide
+//             and this tall — so it can be moved afterwards, and rendered at
+//             whatever resolution the compiler asks for rather than the
+//             brush's (see shapes.js)
 //
 //  See docs/backdrop-system.md.
 // ------------------------------------------------------------------ //
 import * as d3 from "d3";
 import { paletteColorAt } from "./palettes";
+import { rasterizeShapes, shapesContent } from "./shapes";
+
+export { shapesContent };
 
 export const DOC_VERSION = 2;
 // The document's cell grid: width is azimuth, height is elevation, row 0 is
@@ -89,7 +96,7 @@ export const stripesPeriod = (content) =>
 function stripeColorAtRow(content, row) {
   const period = stripesPeriod(content);
   if (period <= 0) return null;
-  let r = row - (content.anchor | 0);
+  let r = row - (content.anchor | 0);   // `row` is already in document rows
   if (content.repeat) {
     r = ((r % period) + period) % period;       // tile in both directions
   } else if (r < 0 || r >= period) {
@@ -103,8 +110,14 @@ function stripeColorAtRow(content, row) {
   return null;
 }
 
-// Render content onto a w x h grid. Null means transparent.
-export function renderContent(content, w = DOC_W, h = DOC_H) {
+/**
+ * Render content onto a w x h grid. Null means transparent.
+ *
+ * `rowScale` is how many grid rows one document row comes to, so content
+ * measured in document rows — a repeat's band sizes — keeps its proportions
+ * when the compiler renders onto a finer grid than the brush paints on.
+ */
+export function renderContent(content, w = DOC_W, h = DOC_H, rowScale = 1) {
   if (!content) return new Array(w * h).fill(null);
   if (content.kind === "raster") {
     if (content.w === w && content.h === h) return content.cells;
@@ -126,10 +139,13 @@ export function renderContent(content, w = DOC_W, h = DOC_H) {
   if (content.kind === "stripes") {
     const out = new Array(w * h);
     for (let r = 0; r < h; r++) {
-      const c = stripeColorAtRow(content, r);
+      const c = stripeColorAtRow(content, Math.floor(r / rowScale));
       for (let col = 0; col < w; col++) out[r * w + col] = c;
     }
     return out;
+  }
+  if (content.kind === "shapes") {
+    return rasterizeShapes(content.items, w, h, () => 0).cells;
   }
   return new Array(w * h).fill(null);
 }
@@ -157,7 +173,12 @@ export const docFromPalette = (palette) =>
 export const kindLabel = (content) =>
   content.kind === "ramp" ? "ramp"
     : content.kind === "stripes" ? (content.repeat ? "repeat" : "bands")
-      : "painted";
+      : content.kind === "shapes" ? `${content.items.length} shape`
+        + (content.items.length === 1 ? "" : "s")
+        : "painted";
+
+export const docHasShapes = (doc) =>
+  doc.flats.some((f) => f.visible && f.content.kind === "shapes");
 
 // ---- editing (all pure: hand back a new document) ------------------
 

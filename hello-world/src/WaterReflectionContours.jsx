@@ -12,9 +12,13 @@ import {
   envFromRows, smoothEnv2D, docFromPanorama, docFromPalette, stripesContent,
   emptyRaster, renderContent, flattenDoc, updateFlat, addFlat, duplicateFlat,
   removeFlat, moveFlat, bakeFlat, paintFlat, flatIndex, kindLabel, stripesPeriod,
+  backdropDoc, flat, rasterContent,
 } from "./backdrop/document";
 import { encodeDoc, decodeDoc } from "./backdrop/codec";
-import { compileBackdrop } from "./backdrop/compile";
+import {
+  STAMPS, SHAPE_KINDS, shape, shapesContent, shapeAt, shapeBox, shapeLabel,
+} from "./backdrop/shapes";
+import { compileBackdrop, COMPILE_SCALE } from "./backdrop/compile";
 import { PALETTES, BANDED_PALETTES, paletteStops, paletteColorAt, paletteNames }
   from "./backdrop/palettes";
 import {
@@ -52,6 +56,8 @@ const SKY_PAD = 0.55;
 // bands up here, and cost is per band.
 const SKY_BW = 300;
 const SKY_SMOOTH = 1;
+// what a composed field reads where its flat is not there at all
+const OFF_FLAT = -1e3;
 
 const DEFAULT_EMITTERS = [
   { id: 1, on: true, type: "swell",    x: 0, y: 20, dir: 65,  size: 3.2, amp: 1.85, spread: 25, roughness: 0.4,  detail: 14 },
@@ -1038,14 +1044,16 @@ function cr4(a, b, c, d, t) {
 function rasterizeSurface(S, fit, gN, BW, lift = true, gapVB = 0) {
   const BH = Math.max(2, Math.round(BW * VB_H / VB_W));
   const stride = gN + 1, NV = stride * stride, NP = BW * BH;
-  const GX = new Float64Array(NV), GY = new Float64Array(NV);
+  const GX = new Float64Array(NV), GY = new Float64Array(NV), GZ = new Float64Array(NV);
   const SX = new Float64Array(NV), SY = new Float64Array(NV), QW = new Float64Array(NV);
   for (let j = 0; j <= gN; j++) for (let i = 0; i <= gN; i++) {
     const [gx, gy] = cell2ground((i / gN) * S.nx, (j / gN) * S.ny, S);
     const gz = lift ? clampLift(heightAt(gx, gy, S) * S.waveScale, S, fit) : 0;
     const [sx, sy, dp] = penProject(gx, gy, gz, S, fit);
     const q = j * stride + i;
-    GX[q] = gx; GY[q] = gy;
+    // the height matters to a board at a finite distance: the ray leaves the
+    // crest, not the flat water it would have been on
+    GX[q] = gx; GY[q] = gy; GZ[q] = gz;
     SX[q] = (sx / VB_W) * BW; SY[q] = (sy / VB_H) * BH;
     QW[q] = dp > 1e-6 ? 1 / dp : 0;      // 1/depth: the perspective divide
   }
@@ -1116,7 +1124,7 @@ function rasterizeSurface(S, fit, gN, BW, lift = true, gapVB = 0) {
   const gap = occluding && gapVB > 0
     ? crestGapField(SX, SY, QW, gN, stride, zb, BW, BH, (gapVB * BW) / VB_W, tmp)
     : null;
-  return { BW, BH, NP, stride, GX, GY, GI, GJ, cov, sil, crest, gap };
+  return { BW, BH, NP, stride, GX, GY, GZ, GI, GJ, cov, sil, crest, gap };
 }
 
 // ---- crest seams ---------------------------------------------------
@@ -1528,35 +1536,58 @@ function buildSurface3D(S, fit, opts) {
 // water grid. `uvAt` returns the reflected panorama coordinate in cells,
 // matching buildSegmentation's fG/fF.
 function buildSurface3DPanorama(S, fit, opts) {
-  const { uvAt, backdrop, fresAt, fresThresholds,
+  const { uvAt, rayAt, backdrop, fresAt, fresThresholds,
           gN = 140, BW = 420, polish = 0, gap = 0 } = opts;
   const R = rasterizeSurface(S, fit, gN, BW, true, gap);
   const { NP, BH, cov, sil, crest } = R;
   const iters = S.smooth || 0;
-  const { EW, EH, count: K } = backdrop;
-
-  const nv = R.GX.length;
-  const su = new Float64Array(nv), sv = new Float64Array(nv);
-  for (let q = 0; q < nv; q++) {
-    const uv = uvAt(R.GX[q], R.GY[q]); su[q] = uv[0]; sv[q] = uv[1];
-  }
+  const groups = backdrop.groups || [backdrop];
   const coh = coherencePasses(S, gN);
   const cbuf = coh ? new Float64Array(R.stride * R.stride) : null;
-  meshBlur(R, su, coh, cbuf); meshBlur(R, sv, coh, cbuf);
-  const fu = rasterField(R, su), fv = rasterField(R, sv);
+  const nv = R.GX.length;
 
-  // bilinear taps into panorama space, shared by every layer
-  const tap = new Int32Array(NP), tx = new Float32Array(NP), ty = new Float32Array(NP);
-  for (let p = 0; p < NP; p++) {
-    if (!cov[p]) continue;
-    let x = fu[p] - 0.5; x = x < 0 ? 0 : x > EW - 1 ? EW - 1 : x;
-    let y = fv[p] - 0.5; y = y < 0 ? 0 : y > EH - 1 ? EH - 1 : y;
-    const i0 = Math.min(EW - 2, Math.floor(x)), j0 = Math.min(EH - 2, Math.floor(y));
-    tap[p] = j0 * EW + i0; tx[p] = x - i0; ty[p] = y - j0;
-  }
+  // Where each visible surface point lands on one flat. The sky is a
+  // direction, so the same answer everywhere; a board at a distance is a
+  // point, so the ray has to leave from the crest the camera can actually see
+  // — GZ, not zero, or a near board swims against the waves.
+  const groupTaps = (g) => {
+    const su = new Float64Array(nv), sv = new Float64Array(nv);
+    const sh = new Float64Array(nv), se = new Float64Array(nv);
+    const plane = g.place && g.place.kind === "plane";
+    for (let q = 0; q < nv; q++) {
+      if (!plane) {
+        const uv = uvAt(R.GX[q], R.GY[q]);
+        su[q] = uv[0]; sv[q] = uv[1]; sh[q] = 1;
+        continue;
+      }
+      const ray = rayAt(R.GX[q], R.GY[q]);
+      const uv = g.place.hit(R.GX[q], R.GY[q], R.GZ[q], ray);
+      if (uv) {
+        su[q] = uv[0] * g.EW; sv[q] = uv[1] * g.EH;
+        se[q] = g.place.edge(uv[0], uv[1]) * Math.min(g.EW, g.EH);
+        sh[q] = 1;
+      } else { se[q] = OFF_FLAT; }
+    }
+    meshBlur(R, su, coh, cbuf); meshBlur(R, sv, coh, cbuf);
+    if (plane) meshBlur(R, se, coh, cbuf);
+    const fu = rasterField(R, su), fv = rasterField(R, sv);
+    const fh = plane ? rasterField(R, sh) : null;
+    const fe = plane ? rasterField(R, se) : null;
+    const tap = new Int32Array(NP), tx = new Float32Array(NP), ty = new Float32Array(NP);
+    const on = new Uint8Array(NP);
+    for (let p = 0; p < NP; p++) {
+      if (!cov[p]) continue;
+      if (fh && fh[p] < 0.5) continue;          // this board is not there
+      let x = fu[p] - 0.5; x = x < 0 ? 0 : x > g.EW - 1 ? g.EW - 1 : x;
+      let y = fv[p] - 0.5; y = y < 0 ? 0 : y > g.EH - 1 ? g.EH - 1 : y;
+      const i0 = Math.min(g.EW - 2, Math.floor(x)), j0 = Math.min(g.EH - 2, Math.floor(y));
+      tap[p] = j0 * g.EW + i0; tx[p] = x - i0; ty[p] = y - j0; on[p] = 1;
+    }
+    return { tap, tx, ty, on, edge: fe, EW: g.EW };
+  };
 
   const buf = new Float64Array(NP);
-  const layers = new Array(K);
+  const drawn = [];
   // Polishing here works per layer, because a painted panorama has no single
   // scalar to polish — each color carries its own distance field. Adjacent
   // bands still hold together: where two of them share a boundary their fields
@@ -1564,36 +1595,43 @@ function buildSurface3DPanorama(S, fit, opts) {
   // smoothed fields keep crossing zero in the same place.
   const scratch = polishScratch(NP, polish);
   const fld = polish ? new Float32Array(NP) : null;
-  backdrop.eachField((k, D) => {
-    if (polish) {
+  for (const g of groups) {
+    const { tap, tx, ty, on, edge, EW } = groupTaps(g);
+    const layers = new Array(g.count);
+    g.eachField((k, D) => {
+      if (polish) {
+        for (let p = 0; p < NP; p++) {
+          if (!on[p]) { fld[p] = 0; continue; }
+          const q = tap[p], fx = tx[p], fy = ty[p];
+          fld[p] = (D[q] * (1 - fx) + D[q + 1] * fx) * (1 - fy)
+                 + (D[q + EW] * (1 - fx) + D[q + EW + 1] * fx) * fy;
+        }
+        smoothField(fld, cov, BW, BH, polish, scratch);
+      }
       for (let p = 0; p < NP; p++) {
-        if (!cov[p]) { fld[p] = 0; continue; }
-        const q = tap[p], fx = tx[p], fy = ty[p];
-        fld[p] = (D[q] * (1 - fx) + D[q + 1] * fx) * (1 - fy)
-               + (D[q + EW] * (1 - fx) + D[q + EW + 1] * fx) * fy;
+        const s = sil[p];
+        if (!cov[p]) { buf[p] = s; continue; }
+        if (!on[p]) { buf[p] = OFF_FLAT; continue; }
+        let d;
+        if (polish) d = fld[p];
+        else {
+          const q = tap[p], fx = tx[p], fy = ty[p];
+          d = (D[q] * (1 - fx) + D[q + 1] * fx) * (1 - fy)
+            + (D[q + EW] * (1 - fx) + D[q + EW + 1] * fx) * fy;
+        }
+        if (edge && edge[p] < d) d = edge[p];   // the board's own edge
+        let b = d < s ? d : s;
+        if (crest) {                            // snap seam crossings to the crest
+          const c = crest[p];
+          if (c) b = b < 0 ? -Math.abs(c) : Math.abs(c);
+        }
+        buf[p] = b;
       }
-      smoothField(fld, cov, BW, BH, polish, scratch);
-    }
-    for (let p = 0; p < NP; p++) {
-      const s = sil[p];
-      if (!cov[p]) { buf[p] = s; continue; }
-      let d;
-      if (polish) d = fld[p];
-      else {
-        const q = tap[p], fx = tx[p], fy = ty[p];
-        d = (D[q] * (1 - fx) + D[q + 1] * fx) * (1 - fy)
-          + (D[q + EW] * (1 - fx) + D[q + EW + 1] * fx) * fy;
-      }
-      let b = d < s ? d : s;
-      if (crest) {                            // snap seam crossings to the crest
-        const c = crest[p];
-        if (c) b = b < 0 ? -Math.abs(c) : Math.abs(c);
-      }
-      buf[p] = b;
-    }
-    const multi = d3.contours().size([BW, BH]).thresholds([0])(buf)[0];
-    layers[k] = { d: contourToScreenPath(multi, BW, BH, iters), color: backdrop.colorAt(k) };
-  });
+      const multi = d3.contours().size([BW, BH]).thresholds([0])(buf)[0];
+      layers[k] = { d: contourToScreenPath(multi, BW, BH, iters), color: g.colorAt(k) };
+    });
+    for (const l of layers) if (l && l.d) drawn.push(l);
+  }
 
   let fres = null;
   if (fresAt) {
@@ -1601,7 +1639,7 @@ function buildSurface3DPanorama(S, fit, opts) {
     smoothField(ff, cov, BW, BH, polish, scratch);
     fres = fresThresholds.map((t) => contourRegion(R, ff, t, iters, buf));
   }
-  return { bg: backdrop.colorAt(0), layers: layers.filter((l) => l.d), fres,
+  return { bg: backdrop.colorAt(0), layers: drawn, fres,
            gap: gapRegion(R, iters, buf) };
 }
 
@@ -1619,7 +1657,8 @@ function buildSolid3D(S, fieldSpec, raster) {
   const { uvAt, backdrop, scalarAt, thresholds, cols, fresAt, fresThresholds } = fieldSpec;
   // painted panorama: same outlines as the flat 2D render, now stopping at
   // the wave crests in front of them
-  if (uvAt) return buildSurface3DPanorama(S, fit, { uvAt, backdrop, fresAt, fresThresholds, ...raster });
+  if (uvAt) return buildSurface3DPanorama(S, fit,
+    { uvAt, rayAt: fieldSpec.rayAt, backdrop, fresAt, fresThresholds, ...raster });
   // preset / paint1d: the wave silhouette does the occlusion. Lowest band
   // shows the background, exactly like the flat render, so no base layer.
   const { layers, fres, gap } = buildSurface3D(S, fit, { scalarAt, thresholds, fresAt, fresThresholds, ...raster });
@@ -2370,6 +2409,7 @@ function skyRayField(S, fit, BW) {
   const BH = Math.max(1, Math.round((BW * VB_H) / VB_W));
   const NP = BW * BH;
   const phi = new Float64Array(NP), psi = new Float64Array(NP);
+  const dir = new Float64Array(NP * 3);       // the view ray itself, for boards
   const sky = new Uint8Array(NP);
   const sp = Math.sin(S.pitch), cp = Math.cos(S.pitch);
   const scaleY = fit.scaleY || fit.scale;
@@ -2384,12 +2424,14 @@ function skyRayField(S, fit, BW) {
       const dx = rx, dy = -ry * sp + cp, dz = -ry * cp - sp;
       if (dz <= 0) { phi[p] = BELOW_HORIZON; continue; }   // the water's half
       const len = Math.hypot(dx, dy, dz);
-      const a = rayAngles([dx / len, dy / len, dz / len]);
+      const ux = dx / len, uy = dy / len, uz = dz / len;
+      const a = rayAngles([ux, uy, uz]);
       phi[p] = a[0]; psi[p] = a[1];
+      dir[p * 3] = ux; dir[p * 3 + 1] = uy; dir[p * 3 + 2] = uz;
       sky[p] = 1; any = true;
     }
   }
-  return any ? { BW, BH, NP, phi, psi, sky } : null;
+  return any ? { BW, BH, NP, phi, psi, dir, sky } : null;
 }
 
 // Painted backdrops: one contour per region, through its distance field —
@@ -2398,36 +2440,59 @@ function buildSkyRegions(S, fit, backdrop, azSpan, opts = {}) {
   if (!S.perspective || !backdrop || backdrop.overflow) return null;
   const R = skyRayField(S, fit, opts.BW || SKY_BW);
   if (!R) return null;                        // horizon off the top of the frame
-  const { BW, BH, NP, phi, psi, sky } = R;
-  const { EW, EH, count: K } = backdrop;
+  const { BW, BH, NP, phi, psi, dir, sky } = R;
+  const groups = backdrop.groups || [backdrop];
   const iters = Math.min(S.smooth || 0, SKY_SMOOTH);
-  const place = makeSkyPlace({ eLo: S.eLo, eHi: S.eHi, azSpan,
-    mag: S.reflMag || 1, EW, EH });
 
-  // one screen -> backdrop tap per pixel, shared by every region
-  const tap = new Int32Array(NP), tx = new Float32Array(NP), ty = new Float32Array(NP);
-  for (let p = 0; p < NP; p++) {
-    if (!sky[p]) continue;
-    const u = place.col(place.clampAz(psi[p])), v = place.row(phi[p]);
-    let x = u - 0.5; x = x < 0 ? 0 : x > EW - 1 ? EW - 1 : x;
-    let y = v - 0.5; y = y < 0 ? 0 : y > EH - 1 ? EH - 1 : y;
-    const i0 = Math.min(EW - 2, Math.floor(x)), j0 = Math.min(EH - 2, Math.floor(y));
-    tap[p] = j0 * EW + i0; tx[p] = x - i0; ty[p] = y - j0;
-  }
+  // Where each screen point lands on one flat. The plane intersection is the
+  // same function the water uses — only the ray changes, from one leaving the
+  // surface to one leaving the camera — so a board drawn above the horizon and
+  // the same board reflected below it cannot disagree.
+  const groupTaps = (g) => {
+    const plane = g.place && g.place.kind === "plane";
+    const place = plane ? null : makeSkyPlace({ eLo: S.eLo, eHi: S.eHi, azSpan,
+      mag: S.reflMag || 1, EW: g.EW, EH: g.EH });
+    const tap = new Int32Array(NP), tx = new Float32Array(NP), ty = new Float32Array(NP);
+    const on = new Uint8Array(NP);
+    const edge = plane ? new Float64Array(NP) : null;
+    for (let p = 0; p < NP; p++) {
+      if (!sky[p]) continue;
+      let u, v;
+      if (plane) {
+        const h = g.place.hit(0, 0, S.H, [dir[p * 3], dir[p * 3 + 1], dir[p * 3 + 2]]);
+        if (!h) continue;
+        u = h[0] * g.EW; v = h[1] * g.EH;
+        edge[p] = g.place.edge(h[0], h[1]) * Math.min(g.EW, g.EH);
+      } else {
+        u = place.col(place.clampAz(psi[p])); v = place.row(phi[p]);
+      }
+      let x = u - 0.5; x = x < 0 ? 0 : x > g.EW - 1 ? g.EW - 1 : x;
+      let y = v - 0.5; y = y < 0 ? 0 : y > g.EH - 1 ? g.EH - 1 : y;
+      const i0 = Math.min(g.EW - 2, Math.floor(x)), j0 = Math.min(g.EH - 2, Math.floor(y));
+      tap[p] = j0 * g.EW + i0; tx[p] = x - i0; ty[p] = y - j0; on[p] = 1;
+    }
+    return { tap, tx, ty, on, edge };
+  };
 
   const F = new Float64Array(NP);
-  const layers = new Array(K);
-  backdrop.eachField((k, D) => {
-    for (let p = 0; p < NP; p++) {
-      if (!sky[p]) { F[p] = BELOW_HORIZON; continue; }
-      const q = tap[p], fx = tx[p], fy = ty[p];
-      F[p] = (D[q] * (1 - fx) + D[q + 1] * fx) * (1 - fy)
-           + (D[q + EW] * (1 - fx) + D[q + EW + 1] * fx) * fy;
-    }
-    const multi = d3.contours().size([BW, BH]).thresholds([0])(F)[0];
-    layers[k] = { d: contourToScreenPath(multi, BW, BH, iters), color: backdrop.colorAt(k) };
-  });
-  return layers.filter((l) => l.d);
+  const drawn = [];
+  for (const g of groups) {
+    const { tap, tx, ty, on, edge } = groupTaps(g);
+    const layers = new Array(g.count);
+    g.eachField((k, D) => {
+      for (let p = 0; p < NP; p++) {
+        if (!on[p]) { F[p] = BELOW_HORIZON; continue; }
+        const q = tap[p], fx = tx[p], fy = ty[p];
+        const d = (D[q] * (1 - fx) + D[q + 1] * fx) * (1 - fy)
+                + (D[q + g.EW] * (1 - fx) + D[q + g.EW + 1] * fx) * fy;
+        F[p] = edge && edge[p] < d ? edge[p] : d;
+      }
+      const multi = d3.contours().size([BW, BH]).thresholds([0])(F)[0];
+      layers[k] = { d: contourToScreenPath(multi, BW, BH, iters), color: g.colorAt(k) };
+    });
+    for (const l of layers) if (l && l.d) drawn.push(l);
+  }
+  return drawn;
 }
 
 // Preset and 1D backdrops: colour depends on elevation alone, so — exactly as
@@ -2476,6 +2541,10 @@ function buildSegmentation(S, backdrop, azSpan) {
   const { nx, ny } = S;
   prepField(S);
   const { EW, EH, cells } = backdrop;
+  const groups = backdrop.groups || [backdrop];
+  // a board at a finite distance needs the ray itself, not just its direction:
+  // where it lands depends on where on the water it left from
+  const needRay = groups.some((g) => g.place && g.place.kind === "plane");
   const place = makeSkyPlace({ eLo: S.eLo, eHi: S.eHi, azSpan,
     mag: S.reflMag || 1, EW, EH });
 
@@ -2483,15 +2552,25 @@ function buildSegmentation(S, backdrop, azSpan) {
   const fF = new Float64Array(nx * ny); // elevation, 0..EH (row units)
   const fG = new Float64Array(nx * ny); // azimuth,   0..EW (col units)
   const fW = S.fresOn ? new Float64Array(nx * ny) : null; // deep-water weight 0..1
+  const N = nx * ny;
+  const rGX = needRay ? new Float64Array(N) : null;
+  const rGY = needRay ? new Float64Array(N) : null;
+  const rRX = needRay ? new Float64Array(N) : null;
+  const rRY = needRay ? new Float64Array(N) : null;
+  const rRZ = needRay ? new Float64Array(N) : null;
   let lo = Infinity, hi = -Infinity;
   for (let j = 0; j < ny; j++) {
     for (let i = 0; i < nx; i++) {
+      const p = j * nx + i;
       const [gx, gy] = cell2ground(i + 0.5, j + 0.5, S);
       const R = reflectAt(gx, gy, S);
       const [phi, psi0] = rayAngles(R);
-      fF[j * nx + i] = phi;
-      fG[j * nx + i] = place.clampAz(psi0);
-      if (fW) fW[j * nx + i] = fresnelDeepW(R[3]);
+      fF[p] = phi;
+      fG[p] = place.clampAz(psi0);
+      if (fW) fW[p] = fresnelDeepW(R[3]);
+      if (needRay) {
+        rGX[p] = gx; rGY[p] = gy; rRX[p] = R[0]; rRY[p] = R[1]; rRZ[p] = R[2];
+      }
       if (phi < lo) lo = phi; if (phi > hi) hi = phi;
     }
   }
@@ -2524,7 +2603,34 @@ function buildSegmentation(S, backdrop, azSpan) {
       .map((c) => multiToPath(c, S, fit));
   }
 
-  const K = backdrop.count;
+  // the coordinate fields for one group, in its own cell units, plus which
+  // samples reach it at all (a board is simply absent from water that cannot
+  // see it — the sky is everywhere)
+  const groupFields = (g) => {
+    if (!g.place || g.place.kind !== "plane") return { U: fG, V: fF, hit: null, edge: null };
+    const U = new Float64Array(N), V = new Float64Array(N);
+    const hit = new Uint8Array(N);
+    // how far inside the board's own rectangle each sample lands, in its
+    // cells. Composed as a floor under the region's field, this is what keeps
+    // the board's edge a curve: a binary in-or-out would contour into a
+    // sawtooth at the sample grid.
+    const edge = new Float64Array(N);
+    const cellScale = Math.min(g.EW, g.EH);
+    for (let p = 0; p < N; p++) {
+      const uv = g.place.hit(rGX[p], rGY[p], 0, [rRX[p], rRY[p], rRZ[p]]);
+      if (!uv) { edge[p] = OFF_FLAT; continue; }
+      U[p] = uv[0] * g.EW; V[p] = uv[1] * g.EH;
+      edge[p] = g.place.edge(uv[0], uv[1]) * cellScale;
+      hit[p] = 1;
+    }
+    if (passes) {                             // "edge ripple", as for the sky
+      const tmp2 = new Float64Array(N);
+      blurField(U, nx, ny, tmp2, passes);
+      blurField(V, nx, ny, tmp2, passes);
+      blurField(edge, nx, ny, tmp2, passes);
+    }
+    return { U, V, hit, edge };
+  };
 
   if (!backdrop.overflow) {
     const F = new Float64Array(nx * ny);
@@ -2545,29 +2651,40 @@ function buildSegmentation(S, backdrop, azSpan) {
     const clip = "M" + cs.map((c) => c[0].toFixed(1) + " " + c[1].toFixed(1)).join(" L") + " Z";
     const ex = { cx: (cs[0][0] + cs[1][0] + cs[2][0] + cs[3][0]) / 4,
                  cy: (cs[0][1] + cs[1][1] + cs[2][1] + cs[3][1]) / 4, s: 1.05 };
-    const layers = new Array(K);
-    backdrop.eachField((k, D) => {
-      // compose through the reflection: bilinear sample at each water
-      // sample's continuous (azimuth, elevation) panorama coordinate
-      for (let p = 0; p < nx * ny; p++) {
-        const x = Math.min(EW - 1, Math.max(0, fG[p] - 0.5));
-        const y = Math.min(EH - 1, Math.max(0, fF[p] - 0.5));
-        const i0 = Math.min(EW - 2, Math.floor(x)), j0 = Math.min(EH - 2, Math.floor(y));
-        const fx = x - i0, fy = y - j0, q = j0 * EW + i0;
-        F[p] = (D[q] * (1 - fx) + D[q + 1] * fx) * (1 - fy)
-             + (D[q + EW] * (1 - fx) + D[q + EW + 1] * fx) * fy;
-      }
-      for (let j = 0; j < py; j++) {
-        const jj = Math.min(ny - 1, Math.max(0, j - 1));
-        for (let i = 0; i < px; i++) {
-          const ii = Math.min(nx - 1, Math.max(0, i - 1));
-          FP[j * px + i] = F[jj * nx + ii];
+    const drawn = [];
+    // furthest group first, each drawn whole: a nearer board covers what is
+    // behind it by being painted over it, so nothing has to cut a hole and no
+    // seam can open between them
+    for (const g of groups) {
+      const { U, V, hit, edge } = groupFields(g);
+      const GW = g.EW, GH = g.EH;
+      const layers = new Array(g.count);
+      g.eachField((k, D) => {
+        // compose through the reflection: bilinear sample at each water
+        // sample's continuous coordinate on this flat
+        for (let p = 0; p < N; p++) {
+          if (hit && !hit[p]) { F[p] = OFF_FLAT; continue; }
+          const x = Math.min(GW - 1, Math.max(0, U[p] - 0.5));
+          const y = Math.min(GH - 1, Math.max(0, V[p] - 0.5));
+          const i0 = Math.min(GW - 2, Math.floor(x)), j0 = Math.min(GH - 2, Math.floor(y));
+          const fx = x - i0, fy = y - j0, q = j0 * GW + i0;
+          const d = (D[q] * (1 - fx) + D[q + 1] * fx) * (1 - fy)
+                  + (D[q + GW] * (1 - fx) + D[q + GW + 1] * fx) * fy;
+          // the board's own edge is a floor under every region on it
+          F[p] = edge && edge[p] < d ? edge[p] : d;
         }
-      }
-      const cont = d3.contours().size([px, py]).thresholds([0])(FP)[0];
-      layers[k] = { d: multiToPath(cont, S, fit, -1, ex), color: backdrop.colorAt(k) };
-    });
-    const drawn = layers.filter((l) => l.d);
+        for (let j = 0; j < py; j++) {
+          const jj = Math.min(ny - 1, Math.max(0, j - 1));
+          for (let i = 0; i < px; i++) {
+            const ii = Math.min(nx - 1, Math.max(0, i - 1));
+            FP[j * px + i] = F[jj * nx + ii];
+          }
+        }
+        const cont = d3.contours().size([px, py]).thresholds([0])(FP)[0];
+        layers[k] = { d: multiToPath(cont, S, fit, -1, ex), color: g.colorAt(k) };
+      });
+      for (const l of layers) if (l && l.d) drawn.push(l);
+    }
     return { bg: backdrop.bg, layers: drawn, clip, fres, lo, hi,
              count: drawn.length, twoD: true };
   }
@@ -2783,7 +2900,7 @@ function buildPaperImage(S, fit, opts) {
   const { gN = 150, BW = 440, lift = true, bgColor,
           maxColors = PAPER_MAX_COLORS,
           scalarAt, thresholds, cols,      // preset / 1D palettes: one scalar
-          uvAt, backdrop,                  // painted panorama: reflected u,v
+          uvAt, rayAt, backdrop,           // painted panorama: reflected u,v
           gap = 0, gapColor,               // crest gaps, as in the SVG
           fresAt, fresBands, deepMix } = opts;
   const R = rasterizeSurface(S, fit, gN, BW, lift, gap);
@@ -2805,18 +2922,32 @@ function buildPaperImage(S, fit, opts) {
   const cbuf = coh ? new Float64Array(R.stride * R.stride) : null;
   let colorOf;
   if (uvAt) {
-    const { EW, EH, cells } = backdrop;
+    // one sampler per flat, near to far: the first one this point actually
+    // reaches is the colour it reflects
     const nv = R.GX.length;
-    const su = new Float64Array(nv), sv = new Float64Array(nv);
-    for (let q = 0; q < nv; q++) {
-      const uv = uvAt(R.GX[q], R.GY[q]); su[q] = uv[0]; sv[q] = uv[1];
-    }
-    meshBlur(R, su, coh, cbuf); meshBlur(R, sv, coh, cbuf);
-    const fu = rasterField(R, su), fv = rasterField(R, sv);
+    const samplers = (backdrop.groups || [backdrop]).map((g) => {
+      const su = new Float64Array(nv), sv = new Float64Array(nv), sh = new Float64Array(nv);
+      const plane = g.place && g.place.kind === "plane";
+      for (let q = 0; q < nv; q++) {
+        if (!plane) {
+          const uv = uvAt(R.GX[q], R.GY[q]); su[q] = uv[0]; sv[q] = uv[1]; sh[q] = 1;
+          continue;
+        }
+        const uv = g.place.hit(R.GX[q], R.GY[q], R.GZ[q], rayAt(R.GX[q], R.GY[q]));
+        if (uv) { su[q] = uv[0] * g.EW; sv[q] = uv[1] * g.EH; sh[q] = 1; }
+      }
+      meshBlur(R, su, coh, cbuf); meshBlur(R, sv, coh, cbuf);
+      return { fu: rasterField(R, su), fv: rasterField(R, sv),
+               fh: plane ? rasterField(R, sh) : null, g };
+    }).reverse();
     colorOf = (p) => {
-      const u = fu[p] < 0 ? 0 : fu[p] > EW - 1 ? EW - 1 : fu[p] | 0;
-      const v = fv[p] < 0 ? 0 : fv[p] > EH - 1 ? EH - 1 : fv[p] | 0;
-      return cells[v * EW + u];
+      for (const { fu, fv, fh, g } of samplers) {
+        if (fh && fh[p] < 0.5) continue;
+        const u = fu[p] < 0 ? 0 : fu[p] > g.EW - 1 ? g.EW - 1 : fu[p] | 0;
+        const v = fv[p] < 0 ? 0 : fv[p] > g.EH - 1 ? g.EH - 1 : fv[p] | 0;
+        return g.cells[v * g.EW + u];
+      }
+      return backdrop.bg;
     };
   } else {
     const fs = rasterField(R, meshBlur(R, gridSamples(R, scalarAt), coh, cbuf));
@@ -3232,6 +3363,235 @@ function PaintGrid2D({ view, w, h, onPaint, activeColor, onStrokeEnd, onEditStar
       <canvas ref={cvRef}
         style={{ width: "100%", height: "100%", display: "block", imageRendering: "auto" }} />
     </div>
+  );
+}
+
+// Sky or board. The sky is a direction, the same from everywhere on the water;
+// a board is a thing at a distance, so it has parallax, it can be missed, and
+// its size is in world units rather than degrees.
+function PlaceEditor({ flat, yFar, onChange }) {
+  const plane = flat.place && flat.place.kind === "plane";
+  const pl = plane ? flat.place : { distance: Math.round(yFar * 0.4), width: 40, height: 12 };
+  const set = (patch) => onChange({ kind: "plane", ...pl, ...patch });
+  return (
+    <div style={{ marginTop: 10 }}>
+      <div style={{ display: "flex", gap: 6 }}>
+        <button onClick={() => onChange({ kind: "sky" })} style={{ ...miniBtnBase,
+          background: plane ? "#1a232c" : "#27424b", color: plane ? "#9fb0c0" : "#dff1f6",
+          border: "1px solid " + (plane ? "#26313c" : "#3f7e8f") }}>at the sky</button>
+        <button onClick={() => set({})} style={{ ...miniBtnBase,
+          background: plane ? "#27424b" : "#1a232c", color: plane ? "#dff1f6" : "#9fb0c0",
+          border: "1px solid " + (plane ? "#3f7e8f" : "#26313c") }}>standing at</button>
+      </div>
+      {plane ? (
+        <div style={{ marginTop: 8 }}>
+          <Slider label="distance out" value={pl.distance} min={2} max={Math.max(20, yFar)}
+            step={1} onChange={(v) => set({ distance: v })} fmt={(v) => v + " units"} />
+          <Slider label="board width" value={pl.width} min={4} max={160} step={2}
+            onChange={(v) => set({ width: v })} fmt={(v) => v + " units"} />
+          <Slider label="board height" value={pl.height} min={1} max={60} step={1}
+            onChange={(v) => set({ height: v })} fmt={(v) => v + " units"} />
+          <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5,
+            fontFamily: "ui-monospace, monospace" }}>
+            Water further out than {pl.distance} units reflects rays that leave without ever
+            reaching this board, so it simply is not there — which is what makes it read as
+            near. Distance decides what covers what; the layer order settles ties.
+          </div>
+        </div>
+      ) : (
+        <div style={{ fontSize: 9.5, color: "#6d808f", marginTop: 6, lineHeight: 1.5,
+          fontFamily: "ui-monospace, monospace" }}>
+          At infinity: the same from every point on the water, which is what a sky is.
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Where the flats stand, seen from above: the camera at the bottom, the water
+// running away from it, and a tick for each board. It is a small drawing, but
+// it is the only place the scene's depth is a picture rather than a number —
+// and depth is the one thing about a backdrop you cannot see by looking at it
+// from the front.
+function PlanView({ doc, activeId, yFar, onSelect }) {
+  const boards = doc.flats
+    .map((f, i) => ({ f, i }))
+    .filter(({ f }) => f.place && f.place.kind === "plane");
+  const far = Math.max(yFar, ...boards.map(({ f }) => f.place.distance), 1);
+  const at = (d) => 100 - (d / far) * 100;          // % from the top
+  return (
+    <div style={{ marginTop: 10 }}>
+      <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 5,
+        fontFamily: "ui-monospace, monospace" }}>
+        from above · water runs {yFar} units out
+      </div>
+      <div style={{ position: "relative", height: 74, borderRadius: 8,
+        border: "1px solid #26313c", background: "#10161d", overflow: "hidden" }}>
+        {/* the water, near at the bottom */}
+        <div style={{ position: "absolute", left: 0, right: 0, bottom: 0,
+          height: `${(yFar / far) * 100}%`,
+          background: "linear-gradient(to top, #1a3040, #131d26)" }} />
+        <div style={{ position: "absolute", left: 6, right: 6, bottom: 3, height: 2,
+          borderRadius: 1, background: "#5fb6c9" }} title="the camera" />
+        {boards.map(({ f }) => (
+          <button key={f.id} onClick={() => onSelect(f.id)}
+            title={`${f.name} · ${f.place.distance} units`}
+            style={{ position: "absolute", left: "8%", right: "8%",
+              top: `calc(${at(f.place.distance)}% - 4px)`, height: 8, padding: 0,
+              cursor: "pointer", borderRadius: 2,
+              background: f.id === activeId ? "#f6e2b0" : "#7f93a3",
+              border: "none", opacity: f.visible ? 1 : 0.35 }} />
+        ))}
+        {!boards.length && (
+          <div style={{ position: "absolute", inset: 0, display: "flex",
+            alignItems: "center", justifyContent: "center", fontSize: 9.5,
+            color: "#4a5560", fontFamily: "ui-monospace, monospace" }}>
+            every layer is sky · nothing stands in front of it
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Shapes are moved, not repainted, so the canvas grows a selection: click one,
+// drag it, drag a corner to resize. The overlay sits over the same canvas the
+// brush uses and works in flat coordinates (0..1 across, 0..1 up from the
+// waterline), which is what the shapes themselves are stored in.
+function ShapeOverlay({ items, selectedId, onSelect, onChange, onEditStart, onCommit }) {
+  const ref = useRef(null);
+  const drag = useRef(null);
+  const at = (e) => {
+    const r = ref.current.getBoundingClientRect();
+    return [(e.clientX - r.left) / r.width, 1 - (e.clientY - r.top) / r.height];
+  };
+  const HANDLE = 0.022;
+
+  const down = (e) => {
+    e.preventDefault();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    const [fx, fy] = at(e);
+    const sel = items.find((i) => i.id === selectedId);
+    // a corner of the selected shape takes priority over anything under it
+    if (sel) {
+      const b = shapeBox(sel);
+      if (Math.abs(fx - b.x1) < HANDLE && Math.abs(fy - b.y1) < HANDLE) {
+        onEditStart();
+        drag.current = { id: sel.id, mode: "size", fx, fy, w: sel.w, h: sel.h };
+        return;
+      }
+    }
+    // topmost shape under the pointer
+    for (let k = items.length - 1; k >= 0; k--) {
+      if (shapeAt(items[k], fx, fy)) {
+        onSelect(items[k].id);
+        onEditStart();
+        drag.current = { id: items[k].id, mode: "move", fx, fy, x: items[k].x, y: items[k].y };
+        return;
+      }
+    }
+    onSelect(null);
+  };
+  const move = (e) => {
+    const d = drag.current;
+    if (!d) return;
+    const [fx, fy] = at(e);
+    if (d.mode === "move") onChange(d.id, { x: d.x + (fx - d.fx), y: d.y + (fy - d.fy) });
+    else onChange(d.id, { w: Math.max(0.02, d.w + 2 * (fx - d.fx)),
+                          h: Math.max(0.02, d.h + (fy - d.fy)) });
+  };
+  const up = () => { if (drag.current) { drag.current = null; onCommit(); } };
+
+  const sel = items.find((i) => i.id === selectedId);
+  const b = sel && shapeBox(sel);
+  return (
+    <svg ref={ref} viewBox="0 0 1 1" preserveAspectRatio="none"
+      onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={up}
+      style={{ position: "absolute", inset: 0, width: "100%", height: "100%",
+        cursor: "move", touchAction: "none" }}>
+      {b && (
+        <g>
+          <rect x={b.x0} y={1 - b.y1} width={b.x1 - b.x0} height={b.y1 - b.y0}
+            fill="none" stroke="#ffffff" strokeOpacity={0.9} strokeWidth={0.004}
+            strokeDasharray="0.012 0.008" vectorEffect="non-scaling-stroke" />
+          <rect x={b.x1 - 0.012} y={1 - b.y1 - 0.012} width={0.024} height={0.024}
+            fill="#ffffff" stroke="#0b0f14" strokeWidth={0.003} />
+        </g>
+      )}
+    </svg>
+  );
+}
+
+// The shape catalogue and the selected shape's colours. Position and size are
+// not sliders here on purpose: they are the canvas above, where you can see
+// what you are doing.
+function ShapesEditor({ content, selectedId, onSelect, onAdd, onPatch, onRemove, activeColor }) {
+  const items = content.items;
+  const sel = items.find((i) => i.id === selectedId);
+  const stamp = sel && STAMPS[sel.type];
+  return (
+    <div style={{ marginTop: 10 }}>
+      <div style={{ display: "flex", gap: 5, flexWrap: "wrap", marginBottom: 8 }}>
+        {SHAPE_KINDS.map((k) => (
+          <button key={k} onClick={() => onAdd(k)} style={{ ...miniBtnBase, flex: "1 0 28%",
+            fontSize: 10.5, padding: "6px 3px" }}>+ {k}</button>
+        ))}
+      </div>
+      {!items.length && (
+        <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5,
+          fontFamily: "ui-monospace, monospace" }}>
+          Add a shape, then drag it on the canvas. Corner handle resizes.
+        </div>
+      )}
+      {items.length > 0 && (
+        <div style={{ border: "1px solid #26313c", borderRadius: 8, overflow: "hidden" }}>
+          {items.slice().reverse().map((it) => (
+            <div key={it.id} onClick={() => onSelect(it.id)}
+              style={{ display: "flex", alignItems: "center", gap: 6, padding: "4px 6px",
+                cursor: "pointer", background: it.id === selectedId ? "#243642" : "#141c24" }}>
+              <span style={{ width: 16, height: 16, borderRadius: 4, flex: "none",
+                background: it.color, border: "1px solid #00000055" }} />
+              <span style={{ flex: 1, fontSize: 10.5, fontFamily: "ui-monospace, monospace",
+                color: it.id === selectedId ? "#dff1f6" : "#9fb0c0" }}>{shapeLabel(it)}</span>
+              <button onClick={(e) => { e.stopPropagation(); onRemove(it.id); }}
+                style={layerNudge(true)}>×</button>
+            </div>
+          ))}
+        </div>
+      )}
+      {sel && (
+        <div style={{ marginTop: 8 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <ColorWell label={stamp ? stamp.label[0] : "fill"} value={sel.color}
+              onChange={(c) => onPatch(sel.id, { color: c })} />
+            {stamp && (
+              <ColorWell label={stamp.label[1]} value={sel.color2}
+                onChange={(c) => onPatch(sel.id, { color2: c })} />
+            )}
+            <button onClick={() => onPatch(sel.id, { rim: sel.rim > 0 ? 0 : 1 })}
+              style={{ ...miniBtnBase, flex: "none", padding: "6px 10px",
+                background: sel.rim > 0 ? "#27424b" : "#1a232c",
+                color: sel.rim > 0 ? "#dff1f6" : "#9fb0c0" }}>ink rim</button>
+            <button onClick={() => onPatch(sel.id, { color: activeColor })}
+              style={{ ...miniBtnBase, flex: "none", padding: "6px 10px" }}>use swatch</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ColorWell({ label, value, onChange }) {
+  return (
+    <label style={{ display: "inline-flex", alignItems: "center", gap: 5, cursor: "pointer",
+      fontSize: 10, color: "#8fa4b5", fontFamily: "ui-monospace, monospace" }}>
+      <span style={{ width: 22, height: 22, borderRadius: 5, border: "1px solid #44525e",
+        position: "relative", overflow: "hidden", background: value, display: "inline-block" }}>
+        <input type="color" value={value} onChange={(e) => onChange(e.target.value)}
+          style={{ position: "absolute", inset: -4, opacity: 0, cursor: "pointer" }} />
+      </span>
+      {label}
+    </label>
   );
 }
 
@@ -3681,6 +4041,7 @@ export default function App() {
   const [segDoc, setSegDoc] = useState(doc);
   const docRef = useRef(doc); docRef.current = doc;
   const [activeFlat, setActiveFlat] = useState(() => doc.flats[0].id);
+  const [selectedShape, setSelectedShape] = useState(null);
   const envColorsRef = useRef(envColors); envColorsRef.current = envColors;
   const active = doc.flats[flatIndex(doc, activeFlat)] || doc.flats[doc.flats.length - 1];
   // what the canvas shows: every visible layer composited, live (the water
@@ -3893,8 +4254,39 @@ export default function App() {
     if (next !== d) setActiveFlat(next.flats[Math.max(0, flatIndex(d, activeFlat) - 1)].id);
     return next;
   });
+  const patchActive = (patch) => editDoc((d) => updateFlat(d, activeFlat, patch));
   const patchContent = (patch) => editDoc((d) =>
     updateFlat(d, activeFlat, { content: { ...d.flats[flatIndex(d, activeFlat)].content, ...patch } }));
+  // Shapes: add, patch and remove all go through the document, so each is one
+  // undo step. A drag is one step too — it opens on pointer-down and commits
+  // on pointer-up, like a brush stroke.
+  const addShape = (type) => {
+    // a stamp keeps its own colours; a plain shape takes the swatch in hand
+    const item = shape(type, {
+      ...(STAMPS[type] ? {} : { color: activeColor }),
+      points: type === "poly"
+        ? [[0.35, 0.1], [0.5, 0.35], [0.65, 0.1]] : undefined,
+    });
+    setSelectedShape(item.id);
+    editDoc((d) => updateFlat(d, activeFlat, {
+      content: { ...d.flats[flatIndex(d, activeFlat)].content,
+        items: [...d.flats[flatIndex(d, activeFlat)].content.items, item] },
+    }));
+  };
+  const patchShape = (id, patch, live) => {
+    const apply = (d) => updateFlat(d, activeFlat, {
+      content: { ...d.flats[flatIndex(d, activeFlat)].content,
+        items: d.flats[flatIndex(d, activeFlat)].content.items
+          .map((i) => (i.id === id ? { ...i, ...patch } : i)) },
+    });
+    if (live) setDoc(apply);            // mid-drag: the canvas follows, the water waits
+    else editDoc(apply);
+  };
+  const removeShape = (id) => editDoc((d) => updateFlat(d, activeFlat, {
+    content: { ...d.flats[flatIndex(d, activeFlat)].content,
+      items: d.flats[flatIndex(d, activeFlat)].content.items.filter((i) => i.id !== id) },
+  }));
+
   const smoothPanorama = () => editDoc((d) => {
     const f = d.flats[flatIndex(d, activeFlat)];
     if (!f || f.content.kind !== "raster") return d;
@@ -4120,9 +4512,22 @@ export default function App() {
   // ~1200ms of contouring — but it is what lets the compiler grow (finer
   // grids, vector content rasterized up, several flats) without that growth
   // landing on every animation frame.
-  const backdrop = useMemo(
-    () => (use2d ? compileBackdrop(docFromPanorama(envEffective)) : null),
-    [use2d, envEffective]);
+  const backdrop = useMemo(() => {
+    if (!use2d) return null;
+    // In layers mode the document itself is compiled — flattening it first
+    // would throw away where each layer stands, which is the whole of depth.
+    // The preset and 1D modes have no document, so they compile the panorama
+    // their palette or strip derives.
+    if (!is2d) return compileBackdrop(docFromPanorama(envEffective));
+    if (!objectsOn) return compileBackdrop(segDoc);
+    // objects are still stamped rather than placed; they ride on top as their
+    // own transparent layer instead of being baked into everything below
+    const blank = { w: segDoc.w, h: segDoc.h,
+      cells: new Array(segDoc.w * segDoc.h).fill(null) };
+    const stamped = stampObjects(blank, objects, azSpan, eLo, eHi);
+    return compileBackdrop(backdropDoc(
+      [...segDoc.flats, flat(rasterContent(stamped), "Objects")], segDoc.w, segDoc.h));
+  }, [use2d, is2d, segDoc, objectsOn, objects, azSpan, eLo, eHi, envEffective]);
 
   // The backdrop as the camera sees it, above the horizon. Keyed on camS, so it
   // survives every animation frame and rebuilds only when the camera, the
@@ -4260,7 +4665,10 @@ export default function App() {
         const [phi, psi] = rayAngles(reflectAt(gx, gy, S));
         return [place.col(place.clampAz(psi)), place.row(phi)];
       };
-      return { uvAt, backdrop, fresAt, fresThresholds };
+      // a board at a distance needs the ray, not just where the sky mapping
+      // sends it, so hand that through as well
+      const rayAt = (gx, gy) => reflectAt(gx, gy, S);
+      return { uvAt, rayAt, backdrop, fresAt, fresThresholds };
     }
     const cols = mode === "paint1d" ? colors1d : presetColors;
     const thresholds = bandThresholds(S, cols.length);
@@ -4973,6 +5381,13 @@ export default function App() {
                       onStrokeEnd={() => setSegDoc(docRef.current)}
                       onEditStart={() => { beginEdit("2d"); setDirty2d(true); }}
                       brushSize={brushSize} brushShape={brushShape} />
+                    {active.content.kind === "shapes" && (
+                      <ShapeOverlay items={active.content.items} selectedId={selectedShape}
+                        onSelect={setSelectedShape}
+                        onEditStart={() => { beginEdit("2d"); setDirty2d(true); }}
+                        onChange={(id, patch) => patchShape(id, patch, true)}
+                        onCommit={() => setSegDoc(docRef.current)} />
+                    )}
                   </ElevationScale>
                   <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9.5,
                     color: "#6d808f", marginTop: 2, paddingLeft: 40,
@@ -4992,10 +5407,19 @@ export default function App() {
                       onClick={() => addLayer(stripesContent(
                         [{ color: activeColor, size: 2 }, { color: "#ffffff", size: 1 }], true, 0),
                         "Repeat")}>+ repeat</button>
+                    <button style={miniBtn} title="A new layer of shapes you can drag"
+                      onClick={() => { setSelectedShape(null);
+                        addLayer(shapesContent([]), "Shapes"); }}>+ shapes</button>
                     <button style={miniBtn} onClick={duplicateLayer}>copy</button>
                     <button style={{ ...miniBtn, color: doc.flats.length > 1 ? "#c98a7f" : "#4a5560" }}
                       onClick={removeLayer} disabled={doc.flats.length <= 1}>delete</button>
                   </div>
+
+                  <PlaceEditor flat={active} yFar={yFar}
+                    onChange={(place) => patchActive({ place })} />
+
+                  <PlanView doc={doc} activeId={activeFlat} yFar={yFar}
+                    onSelect={setActiveFlat} />
 
                   {active.content.kind === "ramp" && (
                     <div style={{ marginTop: 10 }}>
@@ -5024,11 +5448,27 @@ export default function App() {
                       onChange={patchContent} activeColor={activeColor} />
                   )}
 
+                  {active.content.kind === "shapes" && (
+                    <ShapesEditor content={active.content} selectedId={selectedShape}
+                      onSelect={setSelectedShape} onAdd={addShape}
+                      onPatch={(id, patch) => patchShape(id, patch)}
+                      onRemove={(id) => { if (id === selectedShape) setSelectedShape(null);
+                        removeShape(id); }}
+                      activeColor={activeColor} />
+                  )}
+
                   {active.content.kind !== "raster" && (
                     <button style={{ ...miniBtn, width: "100%", marginTop: 8 }}
                       onClick={() => editDoc((d) => bakeFlat(d, activeFlat))}>
                       Bake to pixels (to paint on it)
                     </button>
+                  )}
+                  {active.content.kind === "shapes" && (
+                    <div style={{ fontSize: 9.5, color: "#6d808f", marginTop: 6, lineHeight: 1.5,
+                      fontFamily: "ui-monospace, monospace" }}>
+                      Shapes are rendered at {COMPILE_SCALE}× the paint grid, so their edges are
+                      finer than the brush can draw. Two shapes the same colour stay two regions.
+                    </div>
                   )}
                 </>
               )}

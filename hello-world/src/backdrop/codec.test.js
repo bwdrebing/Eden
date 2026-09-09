@@ -3,6 +3,7 @@ import {
   backdropDoc, flat, rampContent, stripesContent, rasterContent, emptyRaster,
   renderContent, envFromRows, DOC_W, DOC_H,
 } from "./document";
+import { shape, shapesContent } from "./shapes";
 
 const sameDoc = (a, b) => {
   expect(b.flats.length).toBe(a.flats.length);
@@ -101,5 +102,64 @@ describe("documents", () => {
   test("every decoded layer gets its own id", () => {
     const back = decodeDoc(encodeDoc(layered()));
     expect(new Set(back.flats.map((f) => f.id)).size).toBe(back.flats.length);
+  });
+});
+
+describe("shape layers", () => {
+  test("round-trips shapes as statements, not pixels", () => {
+    const items = [
+      shape("rect", { x: 0.25, y: 0.1, w: 0.3, h: 0.4, color: "#141d33" }),
+      shape("tree", { x: 0.7, y: 0.2, w: 0.12, h: 0.3, color: "#0a130d",
+        color2: "#2c5736", rim: 1 }),
+      shape("poly", { points: [[0.1, 0.1], [0.3, 0.4], [0.5, 0.1]], color: "#3f5f93" }),
+    ];
+    const d = backdropDoc([flat(shapesContent(items), "Shapes")], DOC_W, DOC_H);
+    const back = decodeDoc(encodeDoc(d));
+    const got = back.flats[0].content.items;
+    expect(got.map((i) => i.type)).toEqual(["rect", "tree", "poly"]);
+    expect(got[0].x).toBeCloseTo(0.25, 4);
+    expect(got[0].w).toBeCloseTo(0.3, 4);
+    expect(got[1].color2).toBe("#2c5736");
+    expect(got[1].rim).toBe(1);
+    expect(got[2].points).toEqual([[0.1, 0.1], [0.3, 0.4], [0.5, 0.1]]);
+  });
+
+  test("a shape layer is a handful of bytes whatever it draws", () => {
+    const items = Array.from({ length: 8 }, (_, i) =>
+      shape("tree", { x: 0.1 * i, y: 0.1, w: 0.1, h: 0.3 }));
+    const code = encodeDoc(backdropDoc([flat(shapesContent(items), "Trees")], DOC_W, DOC_H));
+    expect(code.length).toBeLessThan(900);
+  });
+
+  test("drops shapes of a type it does not know", () => {
+    const code = JSON.stringify({ v: 2, w: DOC_W, h: DOC_H, f: [
+      { n: "S", v: 1, k: "h", i: [{ t: "wormhole", b: [0, 0, 1, 1], c: "141d33", d: "", m: 0 }] },
+    ] });
+    expect(decodeDoc(code).flats[0].content.items).toEqual([]);
+  });
+});
+
+describe("where a layer stands", () => {
+  test("a board carries its distance and size", () => {
+    const d = backdropDoc([
+      flat(rampContent("Treeline"), "Sky"),
+      { ...flat(shapesContent([shape("tree")]), "Trees"),
+        place: { kind: "plane", distance: 9, width: 30, height: 8 } },
+    ], DOC_W, DOC_H);
+    const back = decodeDoc(encodeDoc(d));
+    expect(back.flats[0].place).toEqual({ kind: "sky" });
+    expect(back.flats[1].place).toEqual({ kind: "plane", distance: 9, width: 30, height: 8 });
+  });
+
+  test("a layer with no placement is sky, as it always was", () => {
+    const back = decodeDoc(encodeDoc(backdropDoc([flat(rampContent("Treeline"), "S")], DOC_W, DOC_H)));
+    expect(back.flats[0].place.kind).toBe("sky");
+  });
+
+  test("a malformed placement falls back to sky rather than failing to open", () => {
+    const code = JSON.stringify({ v: 2, w: DOC_W, h: DOC_H, f: [
+      { n: "S", v: 1, k: "r", p: "Treeline", q: [9, "wide"] },
+    ] });
+    expect(decodeDoc(code).flats[0].place.kind).toBe("sky");
   });
 });
