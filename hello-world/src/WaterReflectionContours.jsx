@@ -21,6 +21,7 @@ import {
 import { compileBackdrop, COMPILE_SCALE } from "./backdrop/compile";
 import { PALETTES, BANDED_PALETTES, paletteStops, paletteColorAt, paletteNames }
   from "./backdrop/palettes";
+import { createSolidBuilder } from "./solidBuilder";
 import {
   VIDEO_FPS, VIDEO_MIN_SEC, VIDEO_MAX_SEC, VIDEO_DEFAULT_SEC,
   VIDEO_SCALES, VIDEO_DEFAULT_SCALE, videoSize, framePlan,
@@ -592,21 +593,36 @@ function rollTransform(rollDeg) {
 
 // Chaikin corner-cutting on a closed ring — rounds the marching-squares
 // staircase. Done in grid space, before projection.
+// ---- ring helpers ---------------------------------------------------
+// Rings travel through these as flat Float64Arrays, [x0, y0, x1, y1, …]. A
+// smoothed ring is several hundred thousand points per layer, and building
+// each one as an array of two-element arrays was a third of the trace time:
+// ten million small allocations a frame, most of them thrown away again by
+// simplifyRing a moment later. The arithmetic below is exactly what the
+// pair-array versions did, operand for operand, so the paths come out
+// byte-identical — only the storage changed.
+function flatRing(ring0) {
+  const n = ring0.length, f = new Float64Array(n * 2);
+  for (let i = 0; i < n; i++) { const p = ring0[i]; f[2 * i] = p[0]; f[2 * i + 1] = p[1]; }
+  return f;
+}
+
+// Chaikin corner cutting, `iters` rounds. Takes a d3 ring (array of pairs) or
+// a flat ring; always hands back a flat one.
 function chaikin(ring, iters) {
-  let p = ring;
-  if (p.length > 1) {
-    const a = p[0], b = p[p.length - 1];
-    if (a[0] === b[0] && a[1] === b[1]) p = p.slice(0, -1);
-  }
+  let p = ring instanceof Float64Array ? ring : flatRing(ring);
+  let n = p.length / 2;
+  if (n > 1 && p[0] === p[2 * n - 2] && p[1] === p[2 * n - 1]) { n -= 1; p = p.subarray(0, 2 * n); }
   for (let it = 0; it < iters; it++) {
-    if (p.length < 3) break;
-    const q = [];
-    for (let i = 0; i < p.length; i++) {
-      const a = p[i], b = p[(i + 1) % p.length];
-      q.push([a[0] * 0.75 + b[0] * 0.25, a[1] * 0.75 + b[1] * 0.25]);
-      q.push([a[0] * 0.25 + b[0] * 0.75, a[1] * 0.25 + b[1] * 0.75]);
+    if (n < 3) break;
+    const q = new Float64Array(n * 4);
+    for (let i = 0; i < n; i++) {
+      const j = i + 1 < n ? i + 1 : 0;
+      const ax = p[2 * i], ay = p[2 * i + 1], bx = p[2 * j], by = p[2 * j + 1];
+      q[4 * i] = ax * 0.75 + bx * 0.25; q[4 * i + 1] = ay * 0.75 + by * 0.25;
+      q[4 * i + 2] = ax * 0.25 + bx * 0.75; q[4 * i + 3] = ay * 0.25 + by * 0.75;
     }
-    p = q;
+    p = q; n *= 2;
   }
   return p;
 }
@@ -622,23 +638,54 @@ function chaikin(ring, iters) {
 // that noise at the only scale it exists at; a run is shorter than eps by
 // construction, so nothing the output could have resolved is lost.
 function simplifyRing(pts, eps) {
-  const out = [];
+  const N = pts.length / 2, out = new Float64Array(pts.length);
+  let m = 0;                                   // points written so far
   let ax = 0, ay = 0, sx = 0, sy = 0, n = 0;   // cluster anchor and running sum
-  for (const p of pts) {
-    if (n && Math.hypot(p[0] - ax, p[1] - ay) >= eps) {
-      out.push([sx / n, sy / n]);
+  for (let i = 0; i < N; i++) {
+    const px = pts[2 * i], py = pts[2 * i + 1];
+    if (n && farther(px - ax, py - ay, eps)) {
+      out[2 * m] = sx / n; out[2 * m + 1] = sy / n; m++;
       sx = 0; sy = 0; n = 0;
     }
-    if (!n) { ax = p[0]; ay = p[1]; }
-    sx += p[0]; sy += p[1]; n++;
+    if (!n) { ax = px; ay = py; }
+    sx += px; sy += py; n++;
   }
-  if (n) out.push([sx / n, sy / n]);
-  if (out.length > 1) {
-    const a = out[0], b = out[out.length - 1];
-    if (Math.hypot(a[0] - b[0], a[1] - b[1]) < eps) out.pop();
-  }
-  return out;
+  if (n) { out[2 * m] = sx / n; out[2 * m + 1] = sy / n; m++; }
+  if (m > 1 && !farther(out[0] - out[2 * m - 2], out[1] - out[2 * m - 1], eps)) m--;
+  return out.subarray(0, 2 * m);
 }
+
+// Math.hypot(dx, dy) >= eps, decided from the squared distance wherever that
+// is unambiguous. hypot is exact to a few ulp, so only a distance within a
+// billionth of eps can come out differently, and there the call itself
+// decides — the comparison is the one hypot would have made, at a fraction of
+// its cost for the millions of points a smoothed frame runs through here.
+function farther(dx, dy, eps) {
+  const d2 = dx * dx + dy * dy, e2 = eps * eps;
+  if (d2 > e2 * 1.000000002) return true;
+  if (d2 < e2 * 0.999999998) return false;
+  return Math.hypot(dx, dy) >= eps;
+}
+
+// Number#toFixed, only faster. A traced frame formats a couple of million
+// coordinates, and the built-in spends most of its time being general. This
+// rounds the scaled value directly, which agrees with toFixed everywhere the
+// binary value is not within a hair of a rounding tie — and there, where the
+// exact decimal expansion has to decide, it defers to toFixed. Digits, signs
+// and "-0.00" all come out as the built-in writes them.
+function fixed(x, scale, digits) {
+  if (!(x > -1e6 && x < 1e6)) return x.toFixed(digits);
+  let s = "";
+  if (x < 0) { s = "-"; x = -x; }
+  const y = x * scale, fl = Math.floor(y), fr = y - fl;
+  if (fr > 0.499999 && fr < 0.500001) return s + x.toFixed(digits);
+  const n = fr < 0.5 ? fl : fl + 1;
+  const fp = n % scale, ip = (n - fp) / scale;
+  if (digits === 1) return s + ip + "." + fp;
+  return s + ip + (fp < 10 ? ".0" : ".") + fp;
+}
+const fix1 = (x) => fixed(x, 10, 1);
+const fix2 = (x) => fixed(x, 100, 2);
 
 // closed Catmull-Rom spline through the points, emitted as cubic beziers —
 // the exported edge is a genuinely smooth curve (an elliptical region becomes
@@ -647,16 +694,28 @@ function simplifyRing(pts, eps) {
 // export width, so rounding there would re-quantize the sub-pixel crossings
 // the whole pipeline works to keep, as visible steps under zoom.
 function ringToBezier(p) {
-  const n = p.length;
-  let d = "M" + p[0][0].toFixed(2) + " " + p[0][1].toFixed(2) + " ";
+  const n = p.length / 2;
+  let d = "M" + fix2(p[0]) + " " + fix2(p[1]) + " ";
   for (let i = 0; i < n; i++) {
-    const p0 = p[(i - 1 + n) % n], p1 = p[i], p2 = p[(i + 1) % n], p3 = p[(i + 2) % n];
-    const c1x = p1[0] + (p2[0] - p0[0]) / 6, c1y = p1[1] + (p2[1] - p0[1]) / 6;
-    const c2x = p2[0] - (p3[0] - p1[0]) / 6, c2y = p2[1] - (p3[1] - p1[1]) / 6;
-    d += "C" + c1x.toFixed(2) + " " + c1y.toFixed(2) + " "
-       + c2x.toFixed(2) + " " + c2y.toFixed(2) + " "
-       + p2[0].toFixed(2) + " " + p2[1].toFixed(2) + " ";
+    const i0 = (i - 1 + n) % n, i2 = (i + 1) % n, i3 = (i + 2) % n;
+    const p0x = p[2 * i0], p0y = p[2 * i0 + 1], p1x = p[2 * i], p1y = p[2 * i + 1];
+    const p2x = p[2 * i2], p2y = p[2 * i2 + 1], p3x = p[2 * i3], p3y = p[2 * i3 + 1];
+    const c1x = p1x + (p2x - p0x) / 6, c1y = p1y + (p2y - p0y) / 6;
+    const c2x = p2x - (p3x - p1x) / 6, c2y = p2y - (p3y - p1y) / 6;
+    d += "C" + fix2(c1x) + " " + fix2(c1y) + " "
+       + fix2(c2x) + " " + fix2(c2y) + " "
+       + fix2(p2x) + " " + fix2(p2y) + " ";
   }
+  return d + "Z ";
+}
+
+// straight segments through a flat ring, one decimal — the sharp (smoothing 0)
+// and degenerate-ring fallback the tracers share
+function ringToPolyline(p) {
+  const n = p.length / 2;
+  let d = "";
+  for (let i = 0; i < n; i++)
+    d += (i === 0 ? "M" : "L") + fix1(p[2 * i]) + " " + fix1(p[2 * i + 1]) + " ";
   return d + "Z ";
 }
 
@@ -675,10 +734,10 @@ function multiToPath(multi, S, fit, off = 0, ex = null) {
   let d = "";
   for (const poly of multi.coordinates) {
     for (const ring0 of poly) {
-      const ring = iters ? chaikin(ring0, iters) : ring0;
-      const pts = [];
-      for (let idx = 0; idx < ring.length; idx++) {
-        let gi = ring[idx][0] + off, gj = ring[idx][1] + off;
+      const ring = iters ? chaikin(ring0, iters) : flatRing(ring0);
+      const n = ring.length / 2, pts = new Float64Array(ring.length);
+      for (let idx = 0; idx < n; idx++) {
+        let gi = ring[2 * idx] + off, gj = ring[2 * idx + 1] + off;
         // Pad-zone vertices exist to overshoot the flat watertrap clip — but
         // 3D mode skips that clip so crests can rise above the trapezoid,
         // which would leave the overshoot visible: every layer's rim would
@@ -705,17 +764,14 @@ function multiToPath(multi, S, fit, off = 0, ex = null) {
           X = ex.cx + (X - ex.cx) * ex.s;
           Y = ex.cy + (Y - ex.cy) * ex.s;
         }
-        pts.push([X, Y]);
+        pts[2 * idx] = X; pts[2 * idx + 1] = Y;
       }
       if (iters) {
         const simp = simplifyRing(pts, 1.1);
-        if (simp.length >= 3) { d += ringToBezier(simp); continue; }
+        if (simp.length >= 6) { d += ringToBezier(simp); continue; }
       }
       // sharp mode (smoothing = 0) or degenerate ring: straight segments
-      for (let idx = 0; idx < pts.length; idx++) {
-        d += (idx === 0 ? "M" : "L") + pts[idx][0].toFixed(1) + " " + pts[idx][1].toFixed(1) + " ";
-      }
-      d += "Z ";
+      d += ringToPolyline(pts);
     }
   }
   return d;
@@ -1010,13 +1066,16 @@ function contourToScreenPath(multi, BW, BH, iters, off = 0) {
   let d = "";
   for (const poly of multi.coordinates) {
     for (const ring0 of poly) {
-      let ring = ring0.map((p) => [(p[0] + off) * kx, (p[1] + off) * ky]);
+      const n = ring0.length;
+      let ring = new Float64Array(n * 2);
+      for (let i = 0; i < n; i++) {
+        const p = ring0[i];
+        ring[2 * i] = (p[0] + off) * kx; ring[2 * i + 1] = (p[1] + off) * ky;
+      }
       ring = iters ? chaikin(ring, iters) : ring;
       const simp = simplifyRing(ring, 0.6);
-      if (simp.length >= 3) { d += ringToBezier(simp); continue; }
-      for (let idx = 0; idx < ring.length; idx++)
-        d += (idx === 0 ? "M" : "L") + ring[idx][0].toFixed(1) + " " + ring[idx][1].toFixed(1) + " ";
-      d += "Z ";
+      if (simp.length >= 6) { d += ringToBezier(simp); continue; }
+      d += ringToPolyline(ring);
     }
   }
   return d;
@@ -1643,6 +1702,67 @@ function buildSurface3DPanorama(S, fit, opts) {
            gap: gapRegion(R, iters, buf) };
 }
 
+// The fields any surface-raster pass contours: one continuous scalar for
+// preset/1D palettes (the reflected elevation, banded at the palette's
+// boundaries — the same banding buildGeometry uses), the reflected panorama
+// coordinate for painted ones, plus the Fresnel deep-water weight. The live
+// 3D render, the video frames and the layered-paper export all build their
+// picture from these, so a cut line lands where the rendered color edge does.
+//
+// `opts` is the slice of studio state the spec depends on, as plain data:
+// { use2d, env2d, azSpan, cols, fresOn, fresBands }. The spec itself is
+// closures over S and cannot cross into a worker, but this can — the render
+// worker stands the same spec up on its side from the same inputs.
+function fieldSpecFor(S, opts) {
+  const { use2d, doc, azSpan, cols, fresOn, fresBands } = opts;
+  const mag = S.reflMag || 1;
+  // occluded Fresnel: the deep-water weight at the front-most surface point,
+  // contoured into the same bands the flat path clips with
+  const fresAt = fresOn ? (gx, gy) => fresnelDeepW(reflectAt(gx, gy, S)[3]) : null;
+  const fresThresholds = fresOn ? d3.range(1, fresBands).map((k) => k / fresBands) : null;
+  if (use2d) {
+    // arbitrary backdrop colors have no single scalar to contour, so the
+    // reflected coordinate on each flat is the field: the flat path's
+    // per-region signed distance fields get composed through it.
+    //
+    // The document is compiled HERE rather than handed in already compiled,
+    // because this runs on either thread: the studio calls it, and so does the
+    // render worker, which can only be given data. Compiling is ~1ms against
+    // the seconds of contouring that follow it.
+    const backdrop = compileBackdrop(doc);
+    const place = makeSkyPlace({ eLo: S.eLo, eHi: S.eHi, azSpan, mag,
+      EW: backdrop.EW, EH: backdrop.EH });
+    const uvAt = (gx, gy) => {
+      const [phi, psi] = rayAngles(reflectAt(gx, gy, S));
+      return [place.col(place.clampAz(psi)), place.row(phi)];
+    };
+    // a flat standing at a distance needs the ray, not just where the sky
+    // mapping sends it, so hand that through as well
+    const rayAt = (gx, gy) => reflectAt(gx, gy, S);
+    return { uvAt, rayAt, backdrop, fresAt, fresThresholds };
+  }
+  const scalarAt = (gx, gy) =>
+    Math.asin(Math.max(-1, Math.min(1, reflectAt(gx, gy, S)[2]))) * 180 / Math.PI;
+  return { scalarAt, thresholds: bandThresholds(S, cols.length), cols, fresAt, fresThresholds };
+}
+
+// The range of reflected elevation over the sample grid — the two numbers
+// auto-fit and the "fit range" button read. buildGeometry and
+// buildSegmentation find the same lo/hi on their way to the flat contours;
+// this is that sample pass on its own, for the modes that draw nothing from
+// the flat build and used to run all of it for these two values.
+function elevationRange(S) {
+  const { nx, ny } = S;
+  prepField(S);
+  let lo = Infinity, hi = -Infinity;
+  for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+    const [gx, gy] = cell2ground(i + 0.5, j + 0.5, S);
+    const v = Math.asin(Math.max(-1, Math.min(1, reflectAt(gx, gy, S)[2]))) * 180 / Math.PI;
+    if (v < lo) lo = v; if (v > hi) hi = v;
+  }
+  return { lo, hi };
+}
+
 // One 3D-solid pass at a given raster: hidden-surface removal, then the usual
 // smooth contouring on top. Whichever field the mode carries picks the builder,
 // and the result — { bg, layers, fres } — slots straight into the same render
@@ -1691,10 +1811,10 @@ function buildPenConcentric(S, fit, colorAt, opts) {
   const byColor = new Map();
   const add = (color, sub) => { const a = byColor.get(color) || []; a.push(sub); byColor.set(color, a); };
   const emitRing = (ring, color) => {
-    const n = ring.length; let cur = "", started = false, hasL = false;
+    const n = ring.length / 2; let cur = "", started = false, hasL = false;
     for (let k = 0; k <= n; k++) {
-      const v = ring[k % n];
-      const [gx, gy] = cell2ground(v[0], v[1], S);
+      const v = k % n;
+      const [gx, gy] = cell2ground(ring[2 * v], ring[2 * v + 1], S);
       const gz = threeD ? clampLift(heightAt(gx, gy, S) * relief, S, fit) : 0;
       const [sx, sy, depth] = penProject(gx, gy, gz, S, fit);
       if (visAt(sx, sy, depth)) {
@@ -1719,7 +1839,7 @@ function buildPenConcentric(S, fit, colorAt, opts) {
     if (!ts.length) continue;
     const conts = d3.contours().size([nx, ny]).thresholds(ts)(D);
     for (const cont of conts) for (const poly of cont.coordinates) for (const ring0 of poly) {
-      emitRing((S.smooth || 0) ? chaikin(ring0, S.smooth) : ring0, palette[c]);
+      emitRing((S.smooth || 0) ? chaikin(ring0, S.smooth) : flatRing(ring0), palette[c]);
     }
   }
   return [...byColor.entries()].map(([color, subs]) => ({ color, d: subs.join("") }));
@@ -2736,7 +2856,7 @@ export {
   DERIVED_ENV_H, ENV2D_W, DEFAULT_EMITTERS,
   computeFit, cell2ground, heightAt, clampLift, penProject, reflectAt,
   withWakes, newWake, WAKE_ANGLE_DEG, prepField, slopeAt,
-  buildSurface3D, buildSurface3DPanorama, buildSolid3D, crestField,
+  buildSurface3D, buildSurface3DPanorama, buildSolid3D, fieldSpecFor, crestField,
   buildPenLines, buildPenConcentric, buildPenHatch, HATCH_AIMS,
   RASTER_LEVELS, RASTER_DEFAULT, EXPORT_MULTS, EXPORT_DEFAULT, EXPORT_MAX_BW,
   EXPORT_MESHES, EXPORT_MESH_DEFAULT, EXPORT_MESH_FLOOR, exportRaster,
@@ -4401,6 +4521,9 @@ export default function App() {
 
   const tRef = useRef(0);
   const [, force] = useState(0);
+  // the 3D solid pass in flight, when it runs in the worker (see surf3d below)
+  const jobRef = useRef({ inflight: false, pending: null, armed: false, alive: true });
+  const holdRef = useRef(false);   // whether that pass is what paces the animation
   useEffect(() => {
     // a video export renders one frame at a time on this same thread; letting
     // the preview keep animating underneath it only steals time from it
@@ -4412,7 +4535,14 @@ export default function App() {
     const loop = (ts) => {
       raf = requestAnimationFrame(loop);
       if (ts - last < minDelta) return;
+      // A frame still being built in the worker holds the clock. The phase
+      // advances once per delivered frame — exactly the pace it had when the
+      // build ran inline and blocked this loop until it was done — rather
+      // than racing ahead at the display's rate while the picture cannot.
+      const job = jobRef.current;
+      if (holdRef.current && (job.inflight || job.pending || job.armed)) return;
       last = ts;
+      job.armed = true;
       tRef.current += 0.12 * speed;
       force((n) => n + 1);
     };
@@ -4458,23 +4588,29 @@ export default function App() {
        surface3d, waveScale, bandFractions, fresOn, fresBands, reflMag,
        showBackdrop, penMode]);
 
-  const S = useMemo(() => ({
+  // The scene minus the instant: everything about the water except what phase
+  // the waves are at. Split out for the same reason camS was — something wants
+  // the scene without paying for it once per frame (see `reach`).
+  const waveS = useMemo(() => ({
     ...camS,
     k: (2 * Math.PI) / wavelength,
     amp: strength * 0.06,
     sharp,
     decay: 0.18 - spread * 0.16,
     omega: 1.0,
-    t: animate ? tRef.current : manualTime,
     // waves scatter off the buoy's hull: a ring source pinned to the object,
     // with a tight decay so the disturbance stays local
     emitters: withWakes(objOn && objRipple > 0
       ? [...emitters, { id: "buoy", on: true, type: "point", x: objX, y: objY,
           size: Math.max(0.3, objSize * objRippleScale), amp: objRipple * 1.5, decay: 0.28 }]
       : emitters, wakes),
-  }), [camS, wavelength, strength, sharp, spread,
-       emitters, wakes, animate, speed, tRef.current, manualTime,
+  }), [camS, wavelength, strength, sharp, spread, emitters, wakes,
        objOn, objX, objY, objSize, objRipple, objRippleScale]);
+
+  const S = useMemo(() => ({
+    ...waveS,
+    t: animate ? tRef.current : manualTime,
+  }), [waveS, animate, speed, tRef.current, manualTime]);
 
   const is2d = mode === "paint2d";
   const presetColors = useMemo(
@@ -4505,55 +4641,36 @@ export default function App() {
     () => (use2d ? stampObjects(baseEnv2d, objects, azSpan, eLo, eHi) : null),
     [use2d, baseEnv2d, objects, azSpan, eLo, eHi]);
 
-  // The backdrop compiles once per document: the region list and its distance
-  // fields depend on what is painted, not on where the camera is or what the
-  // waves are doing, and this is where that becomes true of the code as well.
-  // It is not a speedup worth quoting — compiling this scene is ~1ms against
-  // ~1200ms of contouring — but it is what lets the compiler grow (finer
-  // grids, vector content rasterized up, several flats) without that growth
-  // landing on every animation frame.
-  const backdrop = useMemo(() => {
+  // The backdrop as a DOCUMENT — plain data, no closures — because this is
+  // what crosses to the render worker, which compiles its own copy on the far
+  // side (fieldSpecFor). Keeping the document and its compiled form separate
+  // is what makes that possible at all.
+  const backdropSource = useMemo(() => {
     if (!use2d) return null;
-    // In layers mode the document itself is compiled — flattening it first
-    // would throw away where each layer stands, which is the whole of depth.
-    // The preset and 1D modes have no document, so they compile the panorama
-    // their palette or strip derives.
-    if (!is2d) return compileBackdrop(docFromPanorama(envEffective));
-    if (!objectsOn) return compileBackdrop(segDoc);
+    // In layers mode the document itself is used — flattening it first would
+    // throw away where each layer stands, which is the whole of depth. The
+    // preset and 1D modes have no document, so they wrap the panorama their
+    // palette or strip derives.
+    if (!is2d) return docFromPanorama(envEffective);
+    if (!objectsOn) return segDoc;
     // objects are still stamped rather than placed; they ride on top as their
     // own transparent layer instead of being baked into everything below
     const blank = { w: segDoc.w, h: segDoc.h,
       cells: new Array(segDoc.w * segDoc.h).fill(null) };
     const stamped = stampObjects(blank, objects, azSpan, eLo, eHi);
-    return compileBackdrop(backdropDoc(
-      [...segDoc.flats, flat(rasterContent(stamped), "Objects")], segDoc.w, segDoc.h));
+    return backdropDoc(
+      [...segDoc.flats, flat(rasterContent(stamped), "Objects")], segDoc.w, segDoc.h);
   }, [use2d, is2d, segDoc, objectsOn, objects, azSpan, eLo, eHi, envEffective]);
 
-  // The backdrop as the camera sees it, above the horizon. Keyed on camS, so it
-  // survives every animation frame and rebuilds only when the camera, the
-  // window or the painting moves. Painted backdrops go through their regions;
-  // preset and 1D ones band a single scalar, exactly as the water does.
-  const skyLayers = useMemo(() => {
-    if (!showBackdrop) return null;
-    const fit = computeFit(camS);
-    if (use2d) return buildSkyRegions(camS, fit, backdrop, azSpan);
-    const cols = mode === "paint1d" ? colors1d : presetColors;
-    if (!cols || !cols.length) return null;
-    return buildSkyBands(camS, fit, bandThresholds(camS, cols.length), cols);
-  }, [showBackdrop, use2d, backdrop, camS, azSpan, mode, colors1d, presetColors]);
+  // The compiled form, for this thread: the region list and its distance
+  // fields depend on what is painted, not on where the camera is or what the
+  // waves are doing. Compiling is ~1ms against ~1200ms of contouring, so this
+  // is not a speedup worth quoting — it is what lets the compiler grow (finer
+  // grids, vector content rasterized up, several flats) without that growth
+  // landing on every animation frame.
+  const backdrop = useMemo(
+    () => (backdropSource ? compileBackdrop(backdropSource) : null), [backdropSource]);
 
-  const geom = useMemo(() => (use2d ? null : buildGeometry(S)), [use2d, S]);
-  const seg = useMemo(() => (use2d ? buildSegmentation(S, backdrop, azSpan) : null),
-    [use2d, S, backdrop, azSpan]);
-
-  const isobandColors = mode === "paint1d" ? colors1d : presetColors;
-  const bg = use2d ? seg.bg : isobandColors[0];
-  const autoBg = penMode ? "#0a0d12" : bg;
-  const bgFill = bgColor || autoBg;
-  const gapFill = crestGapColor || bgFill;
-  const layers = use2d ? (seg.layers || null)
-    : geom.ds.map((d, k) => ({ d, color: isobandColors[k + 1] }));
-  const rng = use2d ? seg : geom;
   // 3D "solid" surface: the lifted color layers have no depth ordering, so a
   // tall wave's far side used to show through the crest in front of it. In this
   // mode we instead z-buffer the surface into a raster and re-contour it (see
@@ -4561,17 +4678,64 @@ export default function App() {
   // mode has its own hidden-line path, so this only covers filled regions.
   const solid3d = !penMode && surface3d && perspective;
 
+  // The backdrop as the camera sees it, above the horizon. Keyed on camS, so it
+  // survives every animation frame and rebuilds only when the camera, the
+  // window or the painting moves. Painted backdrops go through their regions;
+  // preset and 1D ones band a single scalar, exactly as the water does.
+  const skyLayers = useMemo(() => {
+    if (!showBackdrop || penMode) return null;
+    const fit = computeFit(camS);
+    if (use2d) return buildSkyRegions(camS, fit, backdrop, azSpan);
+    const cols = mode === "paint1d" ? colors1d : presetColors;
+    if (!cols || !cols.length) return null;
+    return buildSkyBands(camS, fit, bandThresholds(camS, cols.length), cols);
+  }, [showBackdrop, penMode, use2d, backdrop, camS, azSpan, mode, colors1d, presetColors]);
+
+  // The flat builders draw the picture only in the flat modes. In 3D solid the
+  // occluded raster pass (surf3d) replaces every one of their outputs, and pen
+  // mode draws lines instead — yet both used to run the whole flat build every
+  // frame, for the two numbers auto-fit reads. On a detailed scene that was
+  // most of the frame (the flat trace lifts every smoothed vertex through the
+  // wave height), spent on geometry nothing displayed.
+  const flatNeeded = !solid3d && !penMode;
+  const geom = useMemo(() => (flatNeeded && !use2d ? buildGeometry(S) : null),
+    [flatNeeded, use2d, S]);
+  const seg = useMemo(
+    () => (flatNeeded && use2d ? buildSegmentation(S, backdrop, azSpan) : null),
+    [flatNeeded, use2d, S, backdrop, azSpan]);
+  // …and those two numbers from the sample pass alone, only while something
+  // is looking at them
+  const rangeNeeded = !flatNeeded && (autoFit || advanced);
+  const range = useMemo(() => (rangeNeeded ? elevationRange(S) : null), [rangeNeeded, S]);
+  const rng = flatNeeded ? (use2d ? seg : geom) : range;
+  const rngLo = rng ? rng.lo : null, rngHi = rng ? rng.hi : null;
+
+  // The swing the ripples actually reach, for the backdrop panel's ruler and
+  // the dimmed rows on its canvas. Taken at a fixed phase rather than the live
+  // one: it is a property of the scene rather than of the instant, it is read
+  // to the degree, and computing it per animation frame would spend a whole
+  // sample pass on two numbers that barely move — which is the cost the flat
+  // build was taken off the 3D path to avoid. It also stops the readout
+  // flickering while the water runs.
+  const reach = useMemo(
+    () => elevationRange({ ...waveS, t: manualTime }), [waveS, manualTime]);
+
+  const isobandColors = mode === "paint1d" ? colors1d : presetColors;
+  // the furthest flat's first cell is the background (as buildSegmentation has
+  // it), and the compiled backdrop has it whether or not the flat build ran
+  const bg = use2d ? backdrop.bg : isobandColors[0];
+  const autoBg = penMode ? "#0a0d12" : bg;
+  const bgFill = bgColor || autoBg;
+  const gapFill = crestGapColor || bgFill;
+  const layers = !flatNeeded ? null : use2d ? (seg.layers || null)
+    : geom.ds.map((d, k) => ({ d, color: isobandColors[k + 1] }));
+
   // Fresnel depth bands: clip paths + the color mixer for each band
   const mixDeep = useMemo(
     () => (fresOn ? makeDeepMixer(deepColor, fresStrength, fresBands) : (c) => c),
     [fresOn, deepColor, fresStrength, fresBands]);
-  const fresPaths = fresOn ? (use2d ? seg.fres : geom.fres) : null;
-  const fresIdx = useMemo(
-    () => (fresOn && fresPaths ? d3.range(fresBands) : [0]),
-    [fresOn, fresPaths, fresBands]);
+  const fresPaths = fresOn && flatNeeded ? (use2d ? seg.fres : geom.fres) : null;
   const rollTf = rollTransform(rollDeg);
-
-  const regionCount = (use2d ? seg.count : layers.length + 1) * fresIdx.length;
 
   // pen-plot lines: equally spaced scan lines colored by the reflection beneath.
   // Takes the scene rather than closing over it, so the video export can build
@@ -4643,39 +4807,17 @@ export default function App() {
       envEffective, azSpan, colors1d, presetColors, fresOn, fresBands, mixDeep]);
   const penLines = useMemo(() => makePenLines(S), [makePenLines, S]);
 
-  // The fields any surface-raster pass contours: one continuous scalar for
-  // preset/1D palettes (the reflected elevation, banded at the palette's
-  // boundaries — the same banding buildGeometry uses), the reflected panorama
-  // coordinate for painted ones, plus the Fresnel deep-water weight. The live
-  // 3D render and the layered-paper export both build their picture from
-  // these, so a cut line lands where the rendered color edge does.
-  const makeFieldSpec = useCallback((S) => {
-    const mag = S.reflMag || 1;
-    // occluded Fresnel: the deep-water weight at the front-most surface point,
-    // contoured into the same bands the flat path clips with
-    const fresAt = fresOn ? (gx, gy) => fresnelDeepW(reflectAt(gx, gy, S)[3]) : null;
-    const fresThresholds = fresOn ? d3.range(1, fresBands).map((k) => k / fresBands) : null;
-    if (use2d) {
-      // arbitrary panorama colors have no single scalar to contour, so the
-      // reflected panorama coordinate is the field: the flat path's per-color
-      // signed distance fields get composed through it.
-      const place = makeSkyPlace({ eLo: S.eLo, eHi: S.eHi, azSpan, mag,
-        EW: backdrop.EW, EH: backdrop.EH });
-      const uvAt = (gx, gy) => {
-        const [phi, psi] = rayAngles(reflectAt(gx, gy, S));
-        return [place.col(place.clampAz(psi)), place.row(phi)];
-      };
-      // a board at a distance needs the ray, not just where the sky mapping
-      // sends it, so hand that through as well
-      const rayAt = (gx, gy) => reflectAt(gx, gy, S);
-      return { uvAt, rayAt, backdrop, fresAt, fresThresholds };
-    }
-    const cols = mode === "paint1d" ? colors1d : presetColors;
-    const thresholds = bandThresholds(S, cols.length);
-    const scalarAt = (gx, gy) =>
-      Math.asin(Math.max(-1, Math.min(1, reflectAt(gx, gy, S)[2]))) * 180 / Math.PI;
-    return { scalarAt, thresholds, cols, fresAt, fresThresholds };
-  }, [use2d, mode, backdrop, azSpan, colors1d, presetColors, fresOn, fresBands]);
+  // The fields the surface-raster passes contour (fieldSpecFor), from the
+  // slice of studio state they depend on — kept as plain data so the same spec
+  // can be stood up inside the render worker. The backdrop travels as its
+  // DOCUMENT rather than its compiled form: compiling produces distance fields
+  // and closures, which cannot cross to a worker, but a document is data all
+  // the way down and the far side compiles its own.
+  const specOpts = useMemo(() => ({
+    use2d, doc: backdropSource, azSpan,
+    cols: mode === "paint1d" ? colors1d : presetColors, fresOn, fresBands,
+  }), [use2d, backdropSource, azSpan, mode, colors1d, presetColors, fresOn, fresBands]);
+  const makeFieldSpec = useCallback((S) => fieldSpecFor(S, specOpts), [specOpts]);
   const fieldSpec = useMemo(() => makeFieldSpec(S), [makeFieldSpec, S]);
 
   // 3D solid surface: hidden-surface removal on a z-buffered raster, then the
@@ -4683,21 +4825,77 @@ export default function App() {
   // smooth region outlines but a near crest correctly hides the wave's far
   // side. Produces occluded { layers, fres } that slot straight into the same
   // render path the flat layers use (Fresnel, edges and all).
-  const surf3d = useMemo(
-    () => (solid3d
-      ? buildSolid3D(S, fieldSpec, { gN: rasterLevel.gN, BW: rasterLevel.BW, gap: crestGap })
-      : null),
-    [solid3d, S, fieldSpec, rasterLevel, crestGap]);
+  //
+  // The pass runs in a worker wherever the browser has one (solidWorker.js),
+  // so a scene that takes seconds to build no longer takes the page with it:
+  // sliders keep moving, the tab stays responsive, and the preview holds the
+  // last finished picture — marked "rendering" — until the next one lands.
+  // Only the newest request waits: settings changed mid-build replace the
+  // queued build instead of piling up behind it. Where there is no worker
+  // (tests, a browser without them) the pass runs inline, as it always did.
+  const solidRaster = useMemo(
+    () => ({ gN: rasterLevel.gN, BW: rasterLevel.BW, gap: crestGap }), [rasterLevel, crestGap]);
+  // undefined until mounted: not yet known whether there is a worker, so the
+  // first paint builds nothing rather than one slow inline frame
+  const [builder, setBuilder] = useState(undefined);
+  useEffect(() => {
+    const b = createSolidBuilder();
+    const job = jobRef.current;
+    job.alive = true;
+    setBuilder(b);
+    return () => { job.alive = false; if (b) b.terminate(); };
+  }, []);
+  const surfSync = useMemo(
+    () => (solid3d && builder === null ? buildSolid3D(S, fieldSpec, solidRaster) : null),
+    [solid3d, builder, S, fieldSpec, solidRaster]);
+  const [surfAsync, setSurfAsync] = useState(null);
+  const [building, setBuilding] = useState(false);
+  holdRef.current = !!builder && solid3d;
+  useEffect(() => {
+    if (!builder || !solid3d) return;
+    const job = jobRef.current;
+    job.armed = false;
+    const run = (req) => {
+      job.inflight = true;
+      setBuilding(true);
+      builder.build(req.S, req.spec, req.raster).then(
+        (out) => { if (job.alive) setSurfAsync(out); },
+        (e) => {
+          console.warn("3D solid pass failed in the render worker:", e);
+          // the worker itself is gone (its script did not load, it crashed):
+          // fall back to building inline rather than showing nothing forever
+          if (job.alive && e && e.fatal) setBuilder(null);
+        },
+      ).then(() => {
+        if (!job.alive) return;
+        job.inflight = false;
+        if (job.pending) { const next = job.pending; job.pending = null; run(next); }
+        else setBuilding(false);
+      });
+    };
+    const req = { S, spec: specOpts, raster: solidRaster };
+    if (job.inflight) job.pending = req; else run(req);
+  }, [builder, solid3d, S, specOpts, solidRaster]);
+  const surf3d = builder ? surfAsync : surfSync;
+  // a 3D solid picture is still on its way: the first one, or a newer one
+  const rendering = solid3d && (building || !surf3d);
 
   // in 3D-solid mode the occluded surf3d geometry drives every filled-region
   // code path below (live preview, SVG export, Fresnel clips) in place of the
   // flat/lifted layers, so the rest of the renderer stays untouched
-  const drawLayers = solid3d ? surf3d.layers : layers;
-  const drawFres = solid3d ? surf3d.fres : fresPaths;
-  const drawBg = solid3d ? surf3d.bg : bg;
+  const drawLayers = solid3d ? (surf3d ? surf3d.layers : []) : layers;
+  const drawFres = solid3d ? (surf3d ? surf3d.fres : null) : fresPaths;
+  const drawBg = solid3d && surf3d ? surf3d.bg : bg;
   // the crest gaps ride on top of every layer, in whatever shows through a
   // hole in the picture — the page background, unless asked for another color
-  const drawGap = solid3d ? surf3d.gap : null;
+  const drawGap = solid3d && surf3d ? surf3d.gap : null;
+  const fresIdx = useMemo(
+    () => (fresOn && drawFres ? d3.range(fresBands) : [0]),
+    [fresOn, drawFres, fresBands]);
+  // what the SVG export will hold: pen mode writes its pens, 3D solid the
+  // occluded layers, the flat modes their own
+  const regionCount = penMode ? penLines.length
+    : (solid3d ? drawLayers.length + 1 : use2d ? seg.count : layers.length + 1) * fresIdx.length;
 
   // floating buoy: projected cap + waterline clip + mirrored reflection
   const makeBuoy = useCallback((S) => {
@@ -4713,12 +4911,12 @@ export default function App() {
   // never silently clamps to one band. φ min/max don't depend on eLo/eHi, so
   // this settles in a single step (no feedback loop).
   useEffect(() => {
-    if (!autoFit) return;
-    const lo = Math.floor(rng.lo);
-    const hi = Math.max(Math.ceil(rng.hi), lo + 1);
+    if (!autoFit || rngLo === null) return;
+    const lo = Math.floor(rngLo);
+    const hi = Math.max(Math.ceil(rngHi), lo + 1);
     if (lo !== eLo) setELo(lo);
     if (hi !== eHi) setEHi(hi);
-  }, [autoFit, rng.lo, rng.hi, eLo, eHi]);
+  }, [autoFit, rngLo, rngHi, eLo, eHi]);
 
   // Everything about the picture that changes when the wave phase does,
   // gathered into one object. The preview's is memoized above, a frame at a
@@ -4729,26 +4927,32 @@ export default function App() {
     seg, fresPaths, penLines, buoy,
     drawLayers, drawFres, drawBg, drawGap, bgFill, gapFill,
   };
-  const frameAt = (t) => {
+  // The 3D solid pass at any phase, through the worker when there is one —
+  // the video export's frames come this way, and the page stays usable while
+  // they render — and inline otherwise. Requests queue behind the preview's in
+  // the order sent; the animation is paused during an export, so in practice
+  // the frames have the worker to themselves.
+  const buildSolidAt = (St, raster) => (builder
+    ? builder.build(St, specOpts, raster)
+    : Promise.resolve(buildSolid3D(St, makeFieldSpec(St), raster)));
+  const frameAt = async (t) => {
     const St = { ...S, t };
     if (penMode) {
       // pen mode has no filled regions at all: lines, the buoy, and paper
       return { ...liveFrame, penLines: makePenLines(St), buoy: makeBuoy(St) };
     }
-    const geomT = use2d ? null : buildGeometry(St);
-    const segT = use2d ? buildSegmentation(St, backdrop, azSpan) : null;
-    const bgT = use2d ? segT.bg : isobandColors[0];
+    // the flat build only where it is what gets drawn (see flatNeeded)
+    const geomT = !solid3d && !use2d ? buildGeometry(St) : null;
+    const segT = !solid3d && use2d ? buildSegmentation(St, backdrop, azSpan) : null;
+    const bgT = use2d ? backdrop.bg : isobandColors[0];
     const bgFillT = bgColor || bgT;
-    const layersT = use2d ? (segT.layers || null)
+    const layersT = solid3d ? null : use2d ? (segT.layers || null)
       : geomT.ds.map((d, k) => ({ d, color: isobandColors[k + 1] }));
-    const fresT = fresOn ? (use2d ? segT.fres : geomT.fres) : null;
+    const fresT = fresOn && !solid3d ? (use2d ? segT.fres : geomT.fres) : null;
     // the preview's own raster and mesh, deliberately: a video frame is not a
     // print, and the export retrace would multiply a minutes-long render by
     // the frame count for edges nobody will pause on
-    const solidT = solid3d
-      ? buildSolid3D(St, makeFieldSpec(St),
-          { gN: rasterLevel.gN, BW: rasterLevel.BW, gap: crestGap })
-      : null;
+    const solidT = solid3d ? await buildSolidAt(St, solidRaster) : null;
     return {
       seg: segT, fresPaths: fresT, penLines: null, buoy: makeBuoy(St),
       drawLayers: solid3d ? solidT.layers : layersT,
@@ -4976,7 +5180,7 @@ export default function App() {
     try {
       const out = await encodeMp4({
         width: vidAt.w, height: vidAt.h, fps: plan.fps, count: plan.count,
-        renderFrame: (i) => svgToCanvas(buildSvg(null, frameAt(plan.phaseAt(i))),
+        renderFrame: async (i) => svgToCanvas(buildSvg(null, await frameAt(plan.phaseAt(i))),
           vidAt.w, vidAt.h, vidCanvasRef.current),
         onProgress: (done, total) => setVidProg({ done, total, startedAt }),
         cancelled: () => vidCancelRef.current,
@@ -5136,7 +5340,7 @@ export default function App() {
                 <>
                   <defs>
                     {use2d && !solid3d && <clipPath id="watertrap"><path d={seg.clip} /></clipPath>}
-                    {fresOn && drawFres.map((d, i) => d ? (
+                    {fresOn && drawFres && drawFres.map((d, i) => d ? (
                       <clipPath key={`f${i}`} id={`fres${i + 1}`}><path d={d} /></clipPath>
                     ) : null)}
                     {fresOn && drawLayers.map((l, i) => (
@@ -5199,7 +5403,7 @@ export default function App() {
             <div style={{ position: "absolute", left: 12, bottom: 10, fontSize: 10.5,
               color: "#6d808f", fontFamily: "ui-monospace, monospace", letterSpacing: 0.5 }}>
               {penMode ? `${penStyle === "rings" ? "rings" : penStyle === "hatch" ? `hatch ${penHatchAngle}\u00b0\u00b1${penHatchSpread}\u00b0` : penCount + " lines"} · ${penLines.length} pens${S.perspective && penRelief > 0 ? " · 3D" : ""}${penHidden || penStyle === "hatch" ? " · hidden-line" : ""}`
-                : solid3d ? `${drawLayers.length + 1} regions · ${S.nx}×${S.ny} sample grid · 3D ${rasterLevel.name} ${rasterLevel.BW}px`
+                : solid3d ? `${drawLayers.length + 1} regions · ${S.nx}×${S.ny} sample grid · 3D ${rasterLevel.name} ${rasterLevel.BW}px${rendering ? " · rendering…" : ""}`
                 : `${regionCount} regions · ${S.nx}×${S.ny} sample grid${surface3d && perspective ? " · 3D" : ""}`}
             </div>
             <button onClick={() => setCamDrag((v) => !v)}
@@ -5365,7 +5569,7 @@ export default function App() {
               )}
 
               {mode === "paint1d" && (
-                <ElevationScale eLo={eLo} eHi={eHi} mag={reflMag} reach={rng}>
+                <ElevationScale eLo={eLo} eHi={eHi} mag={reflMag} reach={reach}>
                   <PaintStrip envColors={envColors} setEnvColors={setEnvColors}
                     activeColor={activeColor} height={160} brushSize={brushSize}
                     onEditStart={() => { beginEdit("1d"); setDirty1d(true); }} />
@@ -5374,7 +5578,7 @@ export default function App() {
 
               {mode === "paint2d" && (
                 <>
-                  <ElevationScale eLo={eLo} eHi={eHi} mag={reflMag} reach={rng}>
+                  <ElevationScale eLo={eLo} eHi={eHi} mag={reflMag} reach={reach}>
                     <PaintGrid2D view={docView} w={doc.w} h={doc.h} activeColor={activeColor}
                       disabled={active.content.kind !== "raster"}
                       onPaint={(paint) => setDoc((d) => paintFlat(d, activeFlat, paint))}
@@ -5582,7 +5786,7 @@ export default function App() {
                 fontFamily: "ui-monospace, monospace" }}>
                 The window of the sky the ripples can reach. Every backdrop row maps into
                 {" "}{eLo}°–{eHi}° of reflected elevation; this scene's ripples currently swing
-                across {rng.lo.toFixed(0)}°–{rng.hi.toFixed(0)}°, the band marked on the canvas
+                across {reach.lo.toFixed(0)}°–{reach.hi.toFixed(0)}°, the band marked on the canvas
                 above.
               </div>
               <Toggle label="Auto-fit elevation range" value={autoFit} onChange={setAutoFit} />
@@ -5593,11 +5797,11 @@ export default function App() {
                 </div>
               ) : (
                 <>
-                  <button onClick={() => { setELo(Math.floor(rng.lo)); setEHi(Math.ceil(rng.hi)); }}
+                  <button onClick={() => { setELo(Math.floor(reach.lo)); setEHi(Math.ceil(reach.hi)); }}
                     style={{ width: "100%", padding: "8px", borderRadius: 7, cursor: "pointer",
                       background: "#1a232c", color: "#9fd0d9", border: "1px solid #2f6b78",
                       fontFamily: "ui-monospace, monospace", fontSize: 11, margin: "2px 0 12px" }}>
-                    ⤢ fit the window to the water ({rng.lo.toFixed(0)}° – {rng.hi.toFixed(0)}°)
+                    ⤢ fit the window to the water ({reach.lo.toFixed(0)}° – {reach.hi.toFixed(0)}°)
                   </button>
                   <Slider label="elevation low (waterline end)" value={eLo} min={-5} max={60} step={1}
                     onChange={setELo} fmt={(v) => v + "°"} />
