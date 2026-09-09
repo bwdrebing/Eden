@@ -138,3 +138,28 @@ describe("shape layers", () => {
     expect(decodeDoc(code).flats[0].content.items).toEqual([]);
   });
 });
+
+describe("where a layer stands", () => {
+  test("a board carries its distance and size", () => {
+    const d = backdropDoc([
+      flat(rampContent("Treeline"), "Sky"),
+      { ...flat(shapesContent([shape("tree")]), "Trees"),
+        place: { kind: "plane", distance: 9, width: 30, height: 8 } },
+    ], DOC_W, DOC_H);
+    const back = decodeDoc(encodeDoc(d));
+    expect(back.flats[0].place).toEqual({ kind: "sky" });
+    expect(back.flats[1].place).toEqual({ kind: "plane", distance: 9, width: 30, height: 8 });
+  });
+
+  test("a layer with no placement is sky, as it always was", () => {
+    const back = decodeDoc(encodeDoc(backdropDoc([flat(rampContent("Treeline"), "S")], DOC_W, DOC_H)));
+    expect(back.flats[0].place.kind).toBe("sky");
+  });
+
+  test("a malformed placement falls back to sky rather than failing to open", () => {
+    const code = JSON.stringify({ v: 2, w: DOC_W, h: DOC_H, f: [
+      { n: "S", v: 1, k: "r", p: "Treeline", q: [9, "wide"] },
+    ] });
+    expect(decodeDoc(code).flats[0].place.kind).toBe("sky");
+  });
+});

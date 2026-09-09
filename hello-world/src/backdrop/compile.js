@@ -34,6 +34,7 @@ import * as d3 from "d3";
 import { distTransform, blurField } from "./field";
 import { renderContent, docHasShapes } from "./document";
 import { rasterizeShapes } from "./shapes";
+import { makePlanePlace } from "./place";
 
 export const MAX_REGIONS = 160;
 // A shape layer is stated, not painted, so it can be rendered onto a finer
@@ -52,7 +53,7 @@ export const COMPILE_SCALE = 4;
  * "a colour is a band" means for them, and it keeps a one-layer document
  * identical to what it compiled to before. Shape layers key per shape.
  */
-function flattenKeyed(doc, EW, EH) {
+function flattenKeyed(doc, EW, EH, flats, fillHoles) {
   const rowScale = EH / doc.h, colScale = EW / doc.w;
   const cells = new Array(EW * EH).fill(null);
   const labels = new Int32Array(EW * EH).fill(-1);
@@ -64,7 +65,7 @@ function flattenKeyed(doc, EW, EH) {
     return k;
   };
 
-  doc.flats.forEach((f, li) => {
+  flats.forEach((f, li) => {
     if (!f.visible) return;
     if (f.content.kind === "shapes") {
       const items = f.content.items;
@@ -97,13 +98,18 @@ function flattenKeyed(doc, EW, EH) {
     }
   });
 
-  // A null cell has no colour to contour, so anything still uncovered takes
-  // the lowest colour it can see — what the water would have reflected there.
   let fill = -1;
   for (let p = 0; p < EW * EH; p++) if (labels[p] >= 0) { fill = labels[p]; break; }
   if (fill < 0) return null;
-  for (let p = 0; p < EW * EH; p++) {
-    if (labels[p] < 0) { labels[p] = fill; cells[p] = info[fill].color; }
+  // The furthest flat is what the water falls back on, so it may not have a
+  // hole in it: a null cell has no colour to contour, and anything still
+  // uncovered takes the lowest colour it can see. A board is the opposite —
+  // its transparent cells are where the sky behind it shows through, and
+  // filling them would turn every board into a solid slab.
+  if (fillHoles) {
+    for (let p = 0; p < EW * EH; p++) {
+      if (labels[p] < 0) { labels[p] = fill; cells[p] = info[fill].color; }
+    }
   }
   return { cells, labels, info };
 }
@@ -112,14 +118,15 @@ function flattenKeyed(doc, EW, EH) {
 // row of the region's cells, as it has always been; a shape layer keeps the
 // order the shapes are in, which is the order they were drawn in and the order
 // the panel shows. Layers themselves stack in their own order.
-function stackRegions(doc, EW, EH) {
-  const flat = flattenKeyed(doc, EW, EH);
+function stackRegions(doc, EW, EH, flats, fillHoles) {
+  const flat = flattenKeyed(doc, EW, EH, flats, fillHoles);
   if (!flat) return null;
   const { cells, labels, info } = flat;
   const K = info.length;
   const areas = new Float64Array(K), rowSum = new Float64Array(K);
   for (let p = 0; p < EW * EH; p++) {
     const k = labels[p];
+    if (k < 0) continue;                        // a hole in a board
     areas[k]++; rowSum[k] += (p / EW) | 0;
   }
   const meanRow = (k) => (areas[k] ? rowSum[k] / areas[k] : 0);
@@ -180,19 +187,65 @@ function eachStackField(stack, visit) {
  *   overflow   true when there are more regions than the smooth path can take
  *   eachField  hand each region its signed distance field, top down
  */
+function groupOf(stack, place) {
+  const { colorOf, order, K } = stack;
+  return {
+    place,
+    EW: stack.EW, EH: stack.EH, cells: stack.cells,
+    count: K,
+    colorAt: (k) => colorOf[order[k]],
+    eachField: (visit) => eachStackField(stack, visit),
+  };
+}
+
+/**
+ * Compile a document into what the renderer needs.
+ *
+ * The result is a list of GROUPS, furthest first. Every flat on the sky is one
+ * group — they share a coordinate space, so they composite into one grid the
+ * way they always have. A flat standing at a distance is its own group,
+ * because it has its own space: its own ray query, its own hit and miss.
+ *
+ * Across groups the renderer paints far to near with each group drawn whole,
+ * so no group cuts a hole in the one behind it and there is no seam to open.
+ * Within a group the union construction is unchanged, which is what keeps
+ * neighbours from parting. A document with no boards compiles to exactly one
+ * group, which is exactly what it compiled to before there were boards.
+ */
 export function compileBackdrop(doc, opts = {}) {
   // shapes render onto a finer grid than the brush paints on; everything else
   // compiles at the resolution it was authored at
   const scale = opts.scale || (docHasShapes(doc) ? COMPILE_SCALE : 1);
-  const stack = stackRegions(doc, doc.w * scale, doc.h * scale);
-  if (!stack) return null;
-  const { colorOf, order, K } = stack;
+  const EW = doc.w * scale, EH = doc.h * scale;
+
+  const sky = doc.flats.filter((f) => !f.place || f.place.kind !== "plane");
+  const boards = doc.flats.filter((f) => f.place && f.place.kind === "plane");
+
+  const groups = [];
+  const skyStack = sky.length ? stackRegions(doc, EW, EH, sky, true) : null;
+  // the sky is a flat at infinity, and saying so keeps the group list
+  // self-describing: every group has a distance, and they come out sorted
+  if (skyStack) groups.push(groupOf(skyStack, { kind: "sky", distance: Infinity }));
+  // furthest board first; boards at the same distance keep the document's order
+  boards
+    .map((f, i) => ({ f, i }))
+    .sort((a, b) => (b.f.place.distance - a.f.place.distance) || (a.i - b.i))
+    .forEach(({ f }) => {
+      const st = stackRegions(doc, EW, EH, [f], false);
+      if (st) groups.push(groupOf(st, makePlanePlace(f.place)));
+    });
+  if (!groups.length) return null;
+
+  const count = groups.reduce((n, g) => n + g.count, 0);
+  const base = groups[0];
   return {
-    EW: stack.EW, EH: stack.EH, cells: stack.cells, scale,
-    bg: stack.cells[0],
-    count: K,
-    overflow: K > MAX_REGIONS,
-    colorAt: (k) => colorOf[order[k]],
-    eachField: (visit) => eachStackField(stack, visit),
+    groups, scale, count,
+    overflow: count > MAX_REGIONS,
+    // the furthest group is the one the water falls back on, and the one the
+    // single-group paths (the panorama preview, the paper export) still read
+    EW: base.EW, EH: base.EH, cells: base.cells,
+    bg: base.cells[0],
+    colorAt: (k) => base.colorAt(k),
+    eachField: (visit) => base.eachField(visit),
   };
 }
