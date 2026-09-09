@@ -1,6 +1,7 @@
 # Backdrop system: critique and rearchitecture
 
-Status: proposal. Nothing here is implemented yet.
+Status: phases 0–5 landed; phase 6 is still a proposal. What each phase
+delivered is noted against it in §5.
 Scope: everything that answers the question *what does the water reflect?* —
 the `preset` / `paint1d` / `paint2d` modes, the reflected-objects catalogue, and
 the elevation/azimuth controls that give them meaning.
@@ -250,7 +251,7 @@ run `src/sceneFixture.test.js`, then render **GRAZING_RIPPLES** at
 `RASTER_LEVELS[5]`, write the layers to `.svg`, and *look at the top of the
 frame at 8–24×* against the same crop before the change.
 
-### Phase 0 — stop the bleeding (~1 day, no new architecture)
+### Phase 0 — stop the bleeding — **landed**
 
 The acute pain, fixed where the code stands today.
 
@@ -263,50 +264,77 @@ The acute pain, fixed where the code stands today.
    band the water can actually reach.
 5. Show `EnvPreview` in both paint modes, not only when an object is on.
 
-### Phase 1 — document and compiler, no UI change (~3–4 days)
+### Phase 1 — document and compiler, no UI change — **landed**
 
 New `src/backdrop/`: `document.js`, `compile.js`, `rasterize.js`, `place.js`.
 Represent today's three modes as documents; `buildSegmentation` and
 `buildSurface3DPanorama` consume compiled regions instead of `env2d`. The
 existing UI writes documents through a thin adapter.
 
-Exit criteria: legacy `?s=` URLs — the fixture URL in `CLAUDE.md` above all —
-open **byte-identical geometry**, proven by a parity test that diffs the emitted
-path data against the pre-change builder.
+Exit criteria met: the saved scene renders a byte-identical 14,478,436-byte SVG
+at `RASTER_LEVELS[5]` across the change, and `backdropParity.test.js` pins a
+painted panorama — bands, a hand-painted blob, two stamped objects with their
+ink rims — against a baseline recorded before the refactor, hashing every
+region's path data. That test is the regression net for phases 3–6.
 
-### Phase 2 — the backdrop in the viewport (~1–2 days)
+### Phase 2 — the backdrop in the viewport — **landed**
 
 Pulled ahead of the editor deliberately: it is cheap once Phase 1 lands, and it
 is the thing that makes every later phase authorable. You cannot tune an
 elevation window you cannot see.
 
-`computeFit` gains optional sky headroom (the horizon sits at
-`ry = −tan(pitch)`, above the water plane's far edge — currently just out of
+`computeFit` gained optional sky headroom (the horizon sits at
+`ry = −tan(pitch)`, above the water plane's far edge — previously just out of
 frame). Screen points above it are inverted to view rays and the same compiled
-flats are contoured through them, so the sky is drawn as flat vector regions in
-the same idiom as the water, not as a bitmap. Toggle: **Show backdrop**.
+regions are contoured through them, so the sky draws as flat vector regions in
+the same idiom as the water, not as a bitmap. Toggle: **Show the backdrop
+itself**.
 
-### Phase 3 — layers and the repeater (~4–5 days)
+Two things the implementation found. A painted backdrop goes through its
+regions, but a preset or 1D one bands a single scalar exactly as `buildGeometry`
+does for the water — taking the region path there would mean one contour per
+distinct colour, and a smooth palette has one per row (~60 passes for a picture
+with a dozen visible edges). And the sky needs far less raster than the water:
+it carries no ripple detail, and on a pinhole camera its edges are conics, so
+it is contoured at 300px with one round of corner-cutting rather than the
+water's three.
+
+Not covered: the layered-paper export cuts water only. Pen mode draws no
+backdrop and is not reframed for one.
+
+### Phase 3 — layers and the repeater — **landed**
 
 The layers panel: add / duplicate / delete, eye toggle, drag to reorder, per-flat
 opacity-free compositing. Document-level undo replaces the Phase 0 ring. `ramp`,
 `stripes` and `raster` content editors, with the stripes editor being the
 repeater — band list, sizes in degrees, repeat toggle, anchor.
 
-### Phase 4 — vector shapes (~5–6 days)
+### Phase 4 — vector shapes — **landed**
 
 `shapes` content: rect, ellipse, polygon, freehand path. Click to select, drag to
 move, handles to resize — the "move the thing I just placed" ask. The four
 hardcoded objects become shape presets on a flat, `stampObjects` and `tweakHex`
 are deleted, and the four-object cap goes with them.
 
-### Phase 5 — depth (~4–5 days)
+### Phase 5 — depth — **landed**
 
-`place: { kind: "plane", distance }`. Ray/plane intersection in `place.js`,
-far→near draw order, and a small top-down plan strip showing the camera, the
-water plane, and each flat's distance as a draggable tick. Sizes on a plane flat
-are in world units, so "a dock 12 units wide at 8 units out" is finally a thing
-you can type.
+`place: { kind: "plane", distance, width, height }`. Ray/plane intersection in
+`place.js`, far→near draw order, and a top-down plan strip showing the camera,
+the water, and each board's distance. Sizes are in world units.
+
+Three things the implementation turned up. Compiling has to group by placement
+rather than flatten — flattening first throws away where each layer stands,
+which is the whole of depth, and the studio was still compiling a flattened
+panorama until the browser check caught it. A board must NOT have its
+transparent cells filled the way the sky does, or every board renders as a
+solid slab. And landing past a board's edge has to stay a smooth signed
+distance rather than a binary miss, or the edge contours into a sawtooth at the
+sample grid; only a ray that never arrives (running parallel to the board, or
+away from it) is a hard boundary, and that one is a genuine fold in the
+reflection.
+
+The 3D surface path takes the ray from the lifted crest (`GZ`) rather than
+`z = 0`, which is what the risk register above called for.
 
 ### Phase 6 — polish
 
@@ -333,7 +361,10 @@ readout in the panel.
   not done until all of them take compiled regions — a partial migration would
   leave the video export or the paper export drawing a different backdrop from
   the preview.
-- **Plane flats and the 3D surface.** With `surface3d` on, the reflected ray
-  originates from the lifted wave surface, not `z = 0`. The plane intersection
-  must use the surface point, or near flats will swim against the waves. Worth a
-  targeted test in Phase 5.
+- **Plane flats and the 3D surface.** Handled in phase 5: `rasterizeSurface`
+  keeps each vertex's world height and the intersection leaves from the crest
+  the camera can actually see, not from `z = 0`.
+
+- **The objects panel is still a separate system.** It stamps into a panorama
+  rather than placing shapes, because the preset and 1D modes have no document
+  to hold shapes. Phase 6 territory, and `tweakHex` goes with it.

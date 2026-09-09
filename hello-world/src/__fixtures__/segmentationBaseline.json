@@ -1,0 +1,76 @@
+{
+  "note": "recorded from the pre-rearchitecture buildSegmentation; see backdropParity.test.js",
+  "bg": "#141d33",
+  "count": 13,
+  "twoD": true,
+  "lo": -2.823922,
+  "hi": 41.930843,
+  "clipHash": "911e97f9d9a98adb",
+  "layers": [
+    {
+      "color": "#141d33",
+      "len": 143644,
+      "hash": "d7e1985b68430b55"
+    },
+    {
+      "color": "#c24529",
+      "len": 143644,
+      "hash": "d7e1985b68430b55"
+    },
+    {
+      "color": "#070a0b",
+      "len": 143644,
+      "hash": "d7e1985b68430b55"
+    },
+    {
+      "color": "#3a2c23",
+      "len": 143644,
+      "hash": "d7e1985b68430b55"
+    },
+    {
+      "color": "#070a09",
+      "len": 143644,
+      "hash": "d7e1985b68430b55"
+    },
+    {
+      "color": "#f6f2e1",
+      "len": 143644,
+      "hash": "d7e1985b68430b55"
+    },
+    {
+      "color": "#27406b",
+      "len": 143644,
+      "hash": "d7e1985b68430b55"
+    },
+    {
+      "color": "#3f5f93",
+      "len": 172150,
+      "hash": "aac7bfa1332fc68b"
+    },
+    {
+      "color": "#0a130d",
+      "len": 696722,
+      "hash": "e745f25358277d35"
+    },
+    {
+      "color": "#ffffff",
+      "len": 655763,
+      "hash": "ad7acd1912cf199b"
+    },
+    {
+      "color": "#9cc3e8",
+      "len": 183555,
+      "hash": "7a6b53c0e566bbcb"
+    },
+    {
+      "color": "#cfe1ef",
+      "len": 20031,
+      "hash": "2a44a30c8918317a"
+    },
+    {
+      "color": "#f2f7fb",
+      "len": 1766,
+      "hash": "e31d361af0c1b946"
+    }
+  ]
+}
