@@ -41,15 +41,48 @@ export const PHASE_PER_TICK = 0.12;
 export const TICKS_PER_SEC = 60;
 export const PHASE_PER_SEC = PHASE_PER_TICK * TICKS_PER_SEC;
 
-// The frames of a `seconds`-long export: how many, and the wave phase each
-// one is rendered at. Frame 0 is t = 0, as asked; the last frame sits one
-// frame short of the end, so the clip loops onto its own start rather than
-// repeating a phase.
-export function framePlan(seconds, speed, fps = VIDEO_FPS) {
+// The default loop, in phase units. A round number rather than a duration:
+// how many phase units close a loop is a property of the water, and the
+// seconds it comes to fall out of Speed.
+export const VIDEO_LOOP_DEFAULT_PHASE = 12;
+
+// What a loop of this many phase units runs to, in seconds, at a given speed —
+// and the ends of the range the export can actually hold. A loop is only worth
+// offering at a length the file is allowed to be, so the control is bounded by
+// the clip's own limits rather than clamped after the fact.
+export function loopSeconds(loopPhase, speed) {
+  const rate = PHASE_PER_SEC * (speed || 0);
+  return rate > 0 ? loopPhase / rate : 0;
+}
+export function loopPhaseRange(speed) {
+  const rate = PHASE_PER_SEC * (speed || 0);
+  return { min: rate * VIDEO_MIN_SEC, max: rate * VIDEO_MAX_SEC };
+}
+
+// The frames of an export: how many, and the wave phase each one is rendered
+// at. Frame 0 is t = 0, as asked; the last frame sits one frame short of the
+// end, so the clip loops onto its own start rather than repeating a phase.
+//
+// `loopPhase` turns the clip into exactly one loop of that many phase units,
+// and then it is the phase span — not the duration — that is the fixed
+// quantity: the frame count is whatever that span comes to at this speed,
+// and the frames divide the span evenly so the last one lands one step short
+// of the start. Which only closes the picture because the field itself is
+// made periodic over the same span; see `loopOmega` in the renderer. Without
+// it the plan is unchanged, down to the arithmetic.
+export function framePlan(seconds, speed, fps = VIDEO_FPS, loopPhase = 0) {
+  if (loopPhase > 0) {
+    const raw = loopSeconds(loopPhase, speed);
+    const secs = Math.max(VIDEO_MIN_SEC, Math.min(VIDEO_MAX_SEC, raw || VIDEO_MIN_SEC));
+    const count = Math.max(1, Math.round(secs * fps));
+    return { fps, count, seconds: count / fps, loopPhase,
+      phaseAt: (i) => (i * loopPhase) / count, endPhase: loopPhase };
+  }
   const secs = Math.max(VIDEO_MIN_SEC, Math.min(VIDEO_MAX_SEC, seconds));
   const count = Math.max(1, Math.round(secs * fps));
   const phaseAt = (i) => (i / fps) * PHASE_PER_SEC * (speed || 0);
-  return { fps, count, seconds: count / fps, phaseAt, endPhase: phaseAt(count) };
+  return { fps, count, seconds: count / fps, loopPhase: 0, phaseAt,
+    endPhase: phaseAt(count) };
 }
 
 // Flat color regions sound cheap to compress, and the near field is. The far
