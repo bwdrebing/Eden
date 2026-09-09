@@ -2290,6 +2290,51 @@ const RASTER_LEVELS = [
 ];
 const RASTER_DEFAULT = 1;   // "normal"
 
+// Antialiasing: how much of the raster's own grid to take off the edges,
+// before the regions are cut, on whatever raster the picture is being drawn at.
+//
+// A region boundary is a curve through one marching-squares crossing per raster
+// pixel. Wherever the reflection varies faster than a pixel — which is the far
+// half of any grazing frame, where one pixel spans several wavelengths — the
+// field beats against that grid and the traced edge zigzags at pixel scale:
+// staircases along a crest, slivers either side of a seam, one-pixel specks.
+// Raising "3D surface detail" makes each stair smaller but never removes one,
+// and at the top step there is nothing left to raise.
+//
+// So this is the same operator the SVG's edge polish uses (smoothField), moved
+// in front of the preview rather than kept for the way out: it smooths the
+// FIELD, before the topology is decided, which is the only place a jagged
+// contour can be reached at all (a filter on the traced path cannot — Chaikin
+// already converges to that polyline's spline).
+//
+// The passes are counted in RASTER pixels and deliberately do not scale with
+// the raster: a pass is a 3-tap box blur each way, so N of them is sigma =
+// sqrt(2N/3) pixels of the very grid whose aliasing this is, and one setting
+// therefore means one thing — "blur out the grid" — at draft and at max alike.
+// What the raster changes is the price. At max a pixel sits far below any real
+// feature and the blur costs almost nothing visible; at draft a bright ribbon
+// IS a pixel or two wide, and it leaves with the aliasing. That is why this is
+// off by default, and why even the top step is a handful of passes.
+//
+// The steps were picked by rendering the saved grazing-ripples scene at max and
+// looking at the far third of the frame. One pass is the smallest kernel there
+// is (sigma 0.82px) and already takes the staircase off the region boundaries
+// while a filament one raster pixel wide survives, dotted, as it was. Three
+// straightens the boundaries properly and costs that filament. Six is a poster
+// setting: very clean, and the small bright glints are gone.
+const ANTIALIAS = [
+  { name: "off",    passes: 0 },
+  { name: "light",  passes: 1 },
+  { name: "medium", passes: 3 },
+  { name: "strong", passes: 6 },
+];
+// Off, so that every scene saved before this existed — and every new one until
+// it is asked for — keeps exactly the edges it had. There is no legacy entry on
+// `useUrlSync` for the same reason: the default already is the old behaviour.
+const ANTIALIAS_DEFAULT = 0;
+const antialiasAt = (q) =>
+  ANTIALIAS[Math.max(0, Math.min(ANTIALIAS.length - 1, Math.round(q) || 0))];
+
 // Export detail: the raster the *exported* SVG is traced on, as a multiple of
 // the preview's.
 //
@@ -2342,6 +2387,11 @@ const EXPORT_MESH_FLOOR = 110;   // "draft"'s mesh: the coarsest that still hold
 // Light is the default because at export width it takes the aliasing and little
 // else; strong is for a still that has to hold up very large, at the price of
 // the thinnest ribbons.
+//
+// Same operator as ANTIALIAS above, and the two ADD: the scene's antialiasing
+// is part of the picture on screen, so the file carries it and this is the
+// extra the file asks for on top. That is also why an export is only worth a
+// retrace when the total exceeds what the preview already ran.
 const EXPORT_POLISH = [
   { name: "off",    passes: 0 },
   { name: "light",  passes: 3 },
@@ -2353,6 +2403,19 @@ function exportRaster(level, mult, meshF = 1) {
     gN: Math.max(Math.min(level.gN, EXPORT_MESH_FLOOR), Math.round(level.gN * meshF)),
     BW: Math.min(EXPORT_MAX_BW, Math.round(level.BW * mult)),
   };
+}
+
+// How many polish passes each output runs, from the scene's antialiasing and
+// the SVG's own edge-polish step. In one place because these have to agree:
+// the preview is the picture, the PNG, the video frames and the paper stack are
+// that same picture in another medium, and only the SVG adds anything — so an
+// output that quietly picked a different number would be a file that does not
+// match what was on screen. `retrace` says whether the SVG's total is more than
+// the preview already ran, which is the only reason to pay for one.
+function polishPlan(aaPasses, exportPasses) {
+  const svg = aaPasses + exportPasses;
+  return { preview: aaPasses, png: aaPasses, paper: aaPasses, svg,
+           retrace: svg > aaPasses };
 }
 
 // ---- PNG export ---------------------------------------------------
@@ -2368,11 +2431,15 @@ function exportRaster(level, mult, meshF = 1) {
 //
 // A raster output has no such problem. There is no outline to wobble, only
 // pixels, and the ones along an edge get averaged by the rasterizer rather than
-// decided by it. So this path runs no polish and no mesh stand-down: it is the
-// preview's own geometry at print size. The one export step it does keep is the
-// width multiplier, which resolves the same picture finer rather than smoothing
-// it — and which the larger scales need, since a preview-raster stair is as
-// many output pixels tall as the scale makes it.
+// decided by it. So this path runs no EXPORT polish and no mesh stand-down: it
+// is the preview's own geometry at print size. The one export step it does keep
+// is the width multiplier, which resolves the same picture finer rather than
+// smoothing it — and which the larger scales need, since a preview-raster stair
+// is as many output pixels tall as the scale makes it.
+//
+// The scene's own antialiasing is a different thing and does come through: it
+// is not a step on the way out, it is part of the picture that was on screen,
+// and this file's whole job is to be that picture.
 const PNG_SCALES = [2, 3, 4, 6];
 const PNG_DEFAULT = 2;     // 4x — 3040 x 2000
 // Safari, on iOS especially, hands back a blank canvas past ~16.7M pixels
@@ -3001,8 +3068,9 @@ export {
   withWakes, newWake, WAKE_ANGLE_DEG, prepField, slopeAt,
   buildSurface3D, buildSurface3DPanorama, buildSolid3D, fieldSpecFor, crestField,
   buildPenLines, buildPenConcentric, buildPenHatch, HATCH_AIMS,
-  RASTER_LEVELS, RASTER_DEFAULT, EXPORT_MULTS, EXPORT_DEFAULT, EXPORT_MAX_BW,
-  EXPORT_MESHES, EXPORT_MESH_DEFAULT, EXPORT_MESH_FLOOR, exportRaster,
+  RASTER_LEVELS, RASTER_DEFAULT, ANTIALIAS, ANTIALIAS_DEFAULT, antialiasAt,
+  EXPORT_MULTS, EXPORT_DEFAULT, EXPORT_MAX_BW,
+  EXPORT_MESHES, EXPORT_MESH_DEFAULT, EXPORT_MESH_FLOOR, exportRaster, polishPlan,
   EXPORT_POLISH, EXPORT_POLISH_DEFAULT, smoothField,
   PNG_SCALES, PNG_DEFAULT, PNG_MAX_PIXELS, pngSize, sizedSvg, svgToPngBlob, svgToCanvas,
   SPEED_MIN, SPEED_MAX, EMITTER_RATE_DEFAULT,
@@ -3166,9 +3234,17 @@ function buildPaperImage(S, fit, opts) {
           scalarAt, thresholds, cols,      // preset / 1D palettes: one scalar
           uvAt, rayAt, backdrop,           // painted panorama: reflected u,v
           gap = 0, gapColor,               // crest gaps, as in the SVG
+          polish = 0,                      // the scene's antialiasing, as in the SVG
           fresAt, fresBands, deepMix } = opts;
   const R = rasterizeSurface(S, fit, gN, BW, lift, gap);
   const { NP, cov } = R;
+  // Antialiasing, on the fields a pixel's color is read from rather than on the
+  // colors themselves — the same place and the same operator the contour path
+  // uses, which is what keeps a cut line on the edge the render draws. A blur
+  // of a color index would invent colors between two papers; a blur of the
+  // reflected coordinate, or of the banded scalar, only moves the boundary.
+  const paperScratch = polishScratch(NP, polish);
+  const paperPolish = (f) => { smoothField(f, cov, R.BW, R.BH, polish, paperScratch); return f; };
 
   const idOf = new Map(), palette = [];
   const idFor = (c) => {
@@ -3201,7 +3277,9 @@ function buildPaperImage(S, fit, opts) {
         if (uv) { su[q] = uv[0] * g.EW; sv[q] = uv[1] * g.EH; sh[q] = 1; }
       }
       meshBlur(R, su, coh, cbuf); meshBlur(R, sv, coh, cbuf);
-      return { fu: rasterField(R, su), fv: rasterField(R, sv),
+      // fh is a presence mask — whether this board is there at all — so it is
+      // left hard; blurring it would fade a board's own edge into the one behind
+      return { fu: paperPolish(rasterField(R, su)), fv: paperPolish(rasterField(R, sv)),
                fh: plane ? rasterField(R, sh) : null, g };
     }).reverse();
     colorOf = (p) => {
@@ -3214,7 +3292,7 @@ function buildPaperImage(S, fit, opts) {
       return backdrop.bg;
     };
   } else {
-    const fs = rasterField(R, meshBlur(R, gridSamples(R, scalarAt), coh, cbuf));
+    const fs = paperPolish(rasterField(R, meshBlur(R, gridSamples(R, scalarAt), coh, cbuf)));
     colorOf = (p) => {
       let k = 0;
       for (const t of thresholds) { if (fs[p] >= t) k++; else break; }
@@ -3222,7 +3300,7 @@ function buildPaperImage(S, fit, opts) {
     };
   }
   const fw = fresAt
-    ? rasterField(R, meshBlur(R, gridSamples(R, fresAt), coh, cbuf)) : null;
+    ? paperPolish(rasterField(R, meshBlur(R, gridSamples(R, fresAt), coh, cbuf))) : null;
 
   const grid = new Int32Array(NP);
   const counts = [];
@@ -4222,6 +4300,7 @@ export default function App() {
   const [manualTime, setManualTime] = useState(0); // scrub the wave phase when not animating
   const [lowPower, setLowPower] = useState(false);  // cap resolution + throttle animation
   const [rasterQ, setRasterQ] = useState(RASTER_DEFAULT); // 3D surface resolution step
+  const [antialiasQ, setAntialiasQ] = useState(ANTIALIAS_DEFAULT); // edge antialiasing step
   const [exportQ, setExportQ] = useState(EXPORT_DEFAULT);  // export raster, x preview
   const [exportMeshQ, setExportMeshQ] = useState(EXPORT_MESH_DEFAULT); // export mesh step
   const [exportPolishQ, setExportPolishQ] = useState(EXPORT_POLISH_DEFAULT); // export edge polish
@@ -4467,7 +4546,8 @@ export default function App() {
     animate: [animate, setAnimate], speed: [speed, setSpeed],
     dispersion: [dispersion, setDispersion], quality: [quality, setQuality],
     manualTime: [manualTime, setManualTime], lowPower: [lowPower, setLowPower],
-    rasterQ: [rasterQ, setRasterQ], exportQ: [exportQ, setExportQ],
+    rasterQ: [rasterQ, setRasterQ], antialiasQ: [antialiasQ, setAntialiasQ],
+    exportQ: [exportQ, setExportQ],
     exportMeshQ: [exportMeshQ, setExportMeshQ],
     exportPolishQ: [exportPolishQ, setExportPolishQ], pngQ: [pngQ, setPngQ],
     vidSec: [vidSec, setVidSec], vidQ: [vidQ, setVidQ],
@@ -4736,6 +4816,17 @@ export default function App() {
   // low power pins the 3D pass to "draft" — the battery saver has the last word
   const rasterLevel = RASTER_LEVELS[
     Math.max(0, Math.min(RASTER_LEVELS.length - 1, lowPower ? 0 : rasterQ))];
+  // How much of that raster's own grid to blur off the edges before they are
+  // cut. Not capped by low power: the passes are a handful of blurs over the
+  // raster against a contour of every layer, so it is noise beside the pass it
+  // rides on — and draft, which low power pins to, is where the grid shows most.
+  const antialias = antialiasAt(antialiasQ);
+  const exportPolish = EXPORT_POLISH[
+    Math.max(0, Math.min(EXPORT_POLISH.length - 1, exportPolishQ))];
+  // ...and what each output does with it. Up here, above the preview raster,
+  // because the preview is the first thing that reads it.
+  const polish = useMemo(() => polishPlan(antialias.passes, exportPolish.passes),
+    [antialias, exportPolish]);
 
   // The half of the scene that has nothing to do with the waves: where the
   // camera is, how the picture is framed, and how the backdrop maps into it.
@@ -5004,8 +5095,14 @@ export default function App() {
   // Only the newest request waits: settings changed mid-build replace the
   // queued build instead of piling up behind it. Where there is no worker
   // (tests, a browser without them) the pass runs inline, as it always did.
+  //
+  // The antialiasing step rides here rather than on the way out: it is what is
+  // on screen, so it is what the video frames and the PNG carry too — all three
+  // build from this one raster — and what the SVG's own edge polish adds to.
   const solidRaster = useMemo(
-    () => ({ gN: rasterLevel.gN, BW: rasterLevel.BW, gap: crestGap }), [rasterLevel, crestGap]);
+    () => ({ gN: rasterLevel.gN, BW: rasterLevel.BW, gap: crestGap,
+             polish: polish.preview }),
+    [rasterLevel, crestGap, polish]);
   // undefined until mounted: not yet known whether there is a worker, so the
   // first paint builds nothing rather than one slow inline frame
   const [builder, setBuilder] = useState(undefined);
@@ -5244,16 +5341,17 @@ export default function App() {
   };
   const exportMult = EXPORT_MULTS[Math.max(0, Math.min(EXPORT_MULTS.length - 1, exportQ))];
   const exportMesh = EXPORT_MESHES[Math.max(0, Math.min(EXPORT_MESHES.length - 1, exportMeshQ))];
-  const exportPolish = EXPORT_POLISH[Math.max(0, Math.min(EXPORT_POLISH.length - 1, exportPolishQ))];
+  // The file carries the scene's antialiasing — it is the picture on screen —
+  // and the export's edge polish on top of it.
   const exportAt = solid3d
-    ? { ...exportRaster(rasterLevel, exportMult, exportMesh.f), polish: exportPolish.passes,
-        gap: crestGap }
+    ? { ...exportRaster(rasterLevel, exportMult, exportMesh.f),
+        polish: polish.svg, gap: crestGap }
     : null;
   // a retrace is only worth its seconds when it would actually differ from what
-  // is already on screen — a wider raster, a stood-down mesh, a polish pass the
-  // preview never runs, or any combination
+  // is already on screen — a wider raster, a stood-down mesh, polish passes
+  // beyond the ones the preview already ran, or any combination
   const exportRetrace = !!exportAt
-    && (exportAt.BW > rasterLevel.BW || exportAt.gN < rasterLevel.gN || exportAt.polish > 0);
+    && (exportAt.BW > rasterLevel.BW || exportAt.gN < rasterLevel.gN || polish.retrace);
   const downloadSVG = () => {
     if (exporting || pngBusy) return;
     if (!exportRetrace) { emitSvg(null); return; }
@@ -5273,13 +5371,17 @@ export default function App() {
   // PNG at `pngQ`: the preview's geometry, drawn by the browser at several
   // times the frame. It keeps the export's width multiplier — that step
   // resolves the same picture finer, and the bigger the output the more it is
-  // needed — and deliberately skips the mesh and polish steps, which change the
-  // picture to protect a vector edge this file does not have. Same pause as the
-  // SVG export when a retrace is involved, then one async rasterize.
+  // needed — and deliberately skips the mesh and edge-polish steps, which
+  // change the picture to protect a vector edge this file does not have. Same
+  // pause as the SVG export when a retrace is involved, then one async
+  // rasterize.
   const pngAt = pngSize(PNG_SCALES[Math.max(0, Math.min(PNG_SCALES.length - 1, pngQ))]);
   const pngRetrace = solid3d && exportMult > 1;
+  // the scene's own antialiasing comes along (it is part of the picture); the
+  // export's polish step does not
   const pngGeom = pngRetrace
-    ? { ...exportRaster(rasterLevel, exportMult), polish: 0, gap: crestGap } : null;
+    ? { ...exportRaster(rasterLevel, exportMult), polish: polish.png, gap: crestGap }
+    : null;
   const showPng = (blob, name) => {
     let url = null;
     try {
@@ -5397,6 +5499,7 @@ export default function App() {
     const image = buildPaperImage(S, fit, {
       gN: rasterLevel.gN, BW: Math.min(rasterLevel.BW, PAPER_MAX_BW),
       lift: surface3d && perspective,      // the render's own 3D-solid rule
+      polish: polish.paper,                // and its antialiasing
       gap: solid3d ? crestGap : 0, gapColor: crestGapColor,
       bgColor: bgFill, fresBands, deepMix: mixDeep,
       ...fieldSpec,
@@ -5591,7 +5694,7 @@ export default function App() {
             <div style={{ position: "absolute", left: 12, bottom: 10, fontSize: 10.5,
               color: "#6d808f", fontFamily: "ui-monospace, monospace", letterSpacing: 0.5 }}>
               {penMode ? `${penStyle === "rings" ? "rings" : penStyle === "hatch" ? `hatch ${penHatchAngle}\u00b0\u00b1${penHatchSpread}\u00b0` : penCount + " lines"} · ${penLines.length} pens${S.perspective && penRelief > 0 ? " · 3D" : ""}${penHidden || penStyle === "hatch" ? " · hidden-line" : ""}`
-                : solid3d ? `${drawLayers.length + 1} regions · ${S.nx}×${S.ny} sample grid · 3D ${rasterLevel.name} ${rasterLevel.BW}px${rendering ? " · rendering…" : ""}`
+                : solid3d ? `${drawLayers.length + 1} regions · ${S.nx}×${S.ny} sample grid · 3D ${rasterLevel.name} ${rasterLevel.BW}px${antialias.passes ? ` · aa ${antialias.name}` : ""}${rendering ? " · rendering…" : ""}`
                 : `${regionCount} regions · ${S.nx}×${S.ny} sample grid${surface3d && perspective ? " · 3D" : ""}`}
             </div>
             <button onClick={() => setCamDrag((v) => !v)}
@@ -6333,6 +6436,33 @@ export default function App() {
                     + " cut lines get finer than paper and scissors care about."}
                   {lowPower && rasterQ > 0 && " Low power mode is holding this at draft."}
                 </div>
+                <Slider label="antialiasing" value={antialiasQ} min={0} max={ANTIALIAS.length - 1}
+                  step={1} onChange={setAntialiasQ}
+                  fmt={(v) => {
+                    const a = ANTIALIAS[v];
+                    return a.passes ? `${a.name} · ${a.passes} passes` : a.name;
+                  }} />
+                <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 10, lineHeight: 1.5,
+                  fontFamily: "ui-monospace, monospace" }}>
+                  Detail above sets how fine a stair is; this is what removes one. An edge is
+                  cut at one crossing per raster pixel, so out where the reflection turns over
+                  faster than a pixel the boundary zigzags against that grid — staircases along
+                  a far crest, slivers either side of a seam, specks a pixel across. This blurs
+                  the field first, before the shapes are decided, which is the only place a
+                  jagged contour can be reached: the bands stay parallel and a pinched-off
+                  speck leaves cleanly instead of as a stray ring.
+                  {" It is a smoothing pass, so it is not free — the thinnest bright ribbons"
+                    + " fatten and can break into dots, and the finer the raster the less of"
+                    + " that you pay. Light at " + RASTER_LEVELS[RASTER_LEVELS.length - 1].name
+                    + " costs almost nothing visible; at draft it will soften the picture"
+                    + " itself."}
+                  {solid3d
+                    ? " Everything built from what is on screen carries it: the preview, the"
+                      + " PNG, the video frames, the paper stack — and the SVG, whose own edge"
+                      + " polish adds to it."
+                    : " The 3D wave surface is off, so this only reaches the layered-paper"
+                      + " export, which is cut from the same kind of raster."}
+                </div>
               </div>
             )}
 
@@ -6482,14 +6612,18 @@ export default function App() {
                   }} />
                 <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5,
                   fontFamily: "ui-monospace, monospace" }}>
-                  Smooths the field the regions are cut from, just before they are cut. What is
-                  left on a far edge once the raster is as wide as it goes is the reflection
-                  varying faster than one pixel, and this is the step that reaches it — before
-                  the shapes are decided, so the bands stay parallel and a pinched-off speck
-                  leaves cleanly rather than as a stray ring. Light takes the crawl and little
-                  else. Strong goes further and starts to cost you the thinnest ribbons, which
-                  fatten or break into dots — worth it for a still that has to hold up very
-                  large, not much else.
+                  The same step as <b>antialiasing</b> under Range &amp; quality, and this is the
+                  extra the file gets on top of it: smoothing the field the regions are cut
+                  from, just before they are cut. What is left on a far edge once the raster is
+                  as wide as it goes is the reflection varying faster than one pixel, and this
+                  is what reaches it — before the shapes are decided, so the bands stay
+                  parallel and a pinched-off speck leaves cleanly rather than as a stray ring.
+                  Light takes the crawl and little else. Strong goes further and starts to cost
+                  you the thinnest ribbons, which fatten or break into dots — worth it for a
+                  still that has to hold up very large, not much else.
+                  {polish.preview > 0
+                    && ` This scene already antialiases at ${polish.preview}, so the file is`
+                       + ` traced at ${polish.svg}.`}
                 </div>
               </div>
             )}
@@ -6526,8 +6660,9 @@ export default function App() {
                   can hand you. The steps above smooth the vector outline so it survives
                   being magnified — edge polish especially, which blurs the field before
                   the regions are cut and takes the smallest glints and highlights with
-                  it. A raster has no outline to smooth, so the PNG runs neither polish
-                  nor the mesh stand-down: it draws the preview's own geometry{pngRetrace
+                  it. A raster has no outline to smooth, so the PNG runs neither that
+                  polish nor the mesh stand-down: it draws the preview's own geometry —
+                  antialiasing included, since that is part of what is on screen{pngRetrace
                     ? `, retraced at ${exportRaster(rasterLevel, exportMult).BW}px so the edges are resolved for a file this wide.`
                     : "."} Reach for it when the SVG loses something you can see on screen.
                 </>
