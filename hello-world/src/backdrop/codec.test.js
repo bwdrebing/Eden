@@ -1,4 +1,4 @@
-import { encodeDoc, decodeDoc, encodeCells, decodeCells, MAX_DOC_LEN } from "./codec";
+import { encodeDoc, decodeDoc, encodeCells, decodeCells, MAX_DOC_LEN, MAX_TEXT } from "./codec";
 import {
   backdropDoc, flat, rampContent, stripesContent, rasterContent, emptyRaster,
   renderContent, envFromRows, DOC_W, DOC_H,
@@ -161,5 +161,52 @@ describe("where a layer stands", () => {
       { n: "S", v: 1, k: "r", p: "Treeline", q: [9, "wide"] },
     ] });
     expect(decodeDoc(code).flats[0].place.kind).toBe("sky");
+  });
+});
+
+describe("a text shape in the URL", () => {
+  const textDoc = (patch) => backdropDoc([
+    flat(shapesContent([shape("text", {
+      text: "Eden\n2026", font: "mono", weight: 800, italic: true, tracking: 0.125,
+      x: 0.4, y: 0.3, w: 0.5, h: 0.12, color: "#ff00aa", ...patch,
+    })]), "Sign"),
+  ], DOC_W, DOC_H);
+
+  test("the words and the type they are set in survive the round trip", () => {
+    const it = decodeDoc(encodeDoc(textDoc())).flats[0].content.items[0];
+    expect(it.type).toBe("text");
+    expect(it.text).toBe("Eden\n2026");
+    expect(it.font).toBe("mono");
+    expect(it.weight).toBe(800);
+    expect(it.italic).toBe(true);
+    expect(it.tracking).toBeCloseTo(0.125, 3);
+    expect(it.color).toBe("#ff00aa");
+    expect([it.x, it.y, it.w, it.h]).toEqual([0.4, 0.3, 0.5, 0.12]);
+  });
+
+  test("the mask is never written into the link", () => {
+    // it is thousands of cells, and it is derivable from the two fields above
+    const doc = textDoc();
+    doc.flats[0].content.items[0].mask = { w: 4, h: 4, sdf: new Float32Array(16) };
+    const code = encodeDoc(doc);
+    expect(code).not.toMatch(/sdf/);
+    expect(code.length).toBeLessThan(400);
+    expect(decodeDoc(code).flats[0].content.items[0].mask).toBeUndefined();
+  });
+
+  test("an essay is trimmed rather than blowing the link", () => {
+    const back = decodeDoc(encodeDoc(textDoc({ text: "x".repeat(4000) })));
+    expect(back.flats[0].content.items[0].text.length).toBeLessThanOrEqual(MAX_TEXT);
+  });
+
+  test("a text shape from a link with no type on it opens with a default", () => {
+    const code = JSON.stringify({ v: 2, w: DOC_W, h: DOC_H, f: [
+      { n: "Sign", v: 1, k: "h", i: [{ t: "text", b: [0.5, 0.2, 0.4, 0.1], c: "ffffff", s: "hi" }] },
+    ] });
+    const it = decodeDoc(code).flats[0].content.items[0];
+    expect(it.text).toBe("hi");
+    expect(it.font).toBe("serif");
+    expect(it.weight).toBeGreaterThan(0);
+    expect(it.tracking).toBe(0);
   });
 });
