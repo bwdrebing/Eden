@@ -110,3 +110,49 @@ export function skyPlaceUnit(sky) {
 // Sort flats the way the water sees them: furthest first, so the nearer ones
 // are drawn over them. Ties keep the order the document has them in.
 export const byDepth = (a, b) => (b.distance - a.distance) || 0;
+
+// ---- the floor under the water --------------------------------------
+//
+// A pool bottom: a HORIZONTAL plane a fixed depth below the surface, which is
+// the one thing a backdrop at infinity cannot be. The difference is the whole
+// look of tiled water. A direction map answers the same thing however deep
+// the pool is, so a grid painted into it would ripple but never warp; a floor
+// is a place, so the ray has to travel to it, and how far it travels off the
+// straight-down point is
+//
+//     displacement = depth * tan(refracted angle)
+//
+// That is the warp. Grout lines bow where the surface tilts, the bow grows
+// with depth, and it goes to nothing as the water gets shallow — all of it
+// falls out of the intersection rather than being drawn in.
+//
+// The floor REPEATS: `span` world units carry one copy of the document, so a
+// pool is tiled by construction and never runs out under the frame the way a
+// bounded board would. Two things follow, and the grid content is built to
+// match them (see gridContent):
+//
+//   * the document's edges must fall in the MIDDLE of a tile, never along a
+//     grout line. Each region's distance field is transformed on the document
+//     grid, which is not periodic, so a feature sitting on the seam gets its
+//     field measured against the grid's edge instead of its neighbour across
+//     the repeat. Mid-tile, both sides of the seam are deep inside the same
+//     region, the field is large and equal on both, and nothing contours.
+//   * anything varying per tile has to be keyed on the tile's index WITHIN
+//     the block, so the copy on the far side of a seam is the same tile.
+export function makeFloorPlace({ depth, span, spanY }) {
+  const D = depth, SX = span || 1, SY = spanY || span || 1;
+  return {
+    kind: "floor", distance: D, depth: D, span: SX, spanY: SY, repeat: true,
+    // (x, y, z) is the point on the WATER — z is the wave height there, not
+    // zero, so a floor under a lifted crest is that much further away and the
+    // warp answers to the surface the camera can actually see.
+    hit(x, y, z, R) {
+      if (R[2] >= -1e-9) return null;           // not heading down: no floor
+      const t = (-D - z) / R[2];
+      if (t <= 0) return null;
+      return [(x + t * R[0]) / SX, (y + t * R[1]) / SY];
+    },
+    // the floor has no rim to run off — it is under everything
+    edge() { return Infinity; },
+  };
+}

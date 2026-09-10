@@ -12,7 +12,7 @@ import {
   envFromRows, smoothEnv2D, docFromPanorama, docFromPalette, stripesContent,
   emptyRaster, renderContent, flattenDoc, updateFlat, addFlat, duplicateFlat,
   removeFlat, moveFlat, bakeFlat, paintFlat, flatIndex, kindLabel, stripesPeriod,
-  backdropDoc, flat, rasterContent,
+  backdropDoc, flat, rasterContent, gridContent,
 } from "./backdrop/document";
 import { encodeDoc, decodeDoc } from "./backdrop/codec";
 import {
@@ -1861,9 +1861,18 @@ function buildSurface3DPanorama(S, fit, opts) {
   const groupTaps = (g) => {
     const su = new Float64Array(nv), sv = new Float64Array(nv);
     const sh = new Float64Array(nv), se = new Float64Array(nv);
-    const plane = g.place && g.place.kind === "plane";
+    // The sky answers with a direction, so one answer serves the whole frame.
+    // Everything else — a board standing at a distance, the floor under the
+    // water — answers with a POINT, so the ray has to leave from the crest the
+    // camera can actually see (GZ, not zero) or the flat swims against the
+    // waves. That distinction, not the particular kind, is what branches here.
+    const located = !!(g.place && g.place.kind !== "sky");
+    const wrap = !!(g.place && g.place.repeat);
+    // A floor has no rim to run off, and says so with an infinite edge; a
+    // board's edge is a real boundary that has to be carried as a field.
+    const bounded = located && g.place.edge(0.5, 0.5) !== Infinity;
     for (let q = 0; q < nv; q++) {
-      if (!plane) {
+      if (!located) {
         const uv = uvAt(R.GX[q], R.GY[q]);
         su[q] = uv[0]; sv[q] = uv[1]; sh[q] = 1;
         continue;
@@ -1871,27 +1880,59 @@ function buildSurface3DPanorama(S, fit, opts) {
       const ray = rayAt(R.GX[q], R.GY[q]);
       const uv = g.place.hit(R.GX[q], R.GY[q], R.GZ[q], ray);
       if (uv) {
+        // A repeating flat hands back an UNWRAPPED coordinate — how far across
+        // the floor the ray landed, in documents — and the wrap is taken at
+        // the tap below. That ordering is deliberate: blurring or
+        // interpolating a coordinate that has already been folded averages the
+        // two ends of the document together once per repeat, which paints a
+        // smeared band along every seam. Unwrapped, it is continuous, and
+        // every filter downstream is valid on it.
         su[q] = uv[0] * g.EW; sv[q] = uv[1] * g.EH;
-        se[q] = g.place.edge(uv[0], uv[1]) * Math.min(g.EW, g.EH);
+        if (bounded) se[q] = g.place.edge(uv[0], uv[1]) * Math.min(g.EW, g.EH);
         sh[q] = 1;
-      } else { se[q] = OFF_FLAT; }
+      } else if (bounded) { se[q] = OFF_FLAT; }
     }
     meshBlur(R, su, coh, cbuf); meshBlur(R, sv, coh, cbuf);
-    if (plane) meshBlur(R, se, coh, cbuf);
+    if (bounded) meshBlur(R, se, coh, cbuf);
     const fu = rasterField(R, su), fv = rasterField(R, sv);
-    const fh = plane ? rasterField(R, sh) : null;
-    const fe = plane ? rasterField(R, se) : null;
-    const tap = new Int32Array(NP), tx = new Float32Array(NP), ty = new Float32Array(NP);
+    const fh = located ? rasterField(R, sh) : null;
+    const fe = bounded ? rasterField(R, se) : null;
+    // the four corners the bilinear read needs, resolved once here so the read
+    // sites do not have to know whether this flat wraps
+    const t00 = new Int32Array(NP), t10 = new Int32Array(NP);
+    const t01 = new Int32Array(NP), t11 = new Int32Array(NP);
+    const tx = new Float32Array(NP), ty = new Float32Array(NP);
     const on = new Uint8Array(NP);
+    const md = (a2, m) => { const v = a2 % m; return v < 0 ? v + m : v; };
     for (let p = 0; p < NP; p++) {
       if (!cov[p]) continue;
       if (fh && fh[p] < 0.5) continue;          // this board is not there
-      let x = fu[p] - 0.5; x = x < 0 ? 0 : x > g.EW - 1 ? g.EW - 1 : x;
-      let y = fv[p] - 0.5; y = y < 0 ? 0 : y > g.EH - 1 ? g.EH - 1 : y;
-      const i0 = Math.min(g.EW - 2, Math.floor(x)), j0 = Math.min(g.EH - 2, Math.floor(y));
-      tap[p] = j0 * g.EW + i0; tx[p] = x - i0; ty[p] = y - j0; on[p] = 1;
+      let i0, j0, i1, j1, fx, fy;
+      if (wrap) {
+        const x = md(fu[p] - 0.5, g.EW), y = md(fv[p] - 0.5, g.EH);
+        i0 = Math.floor(x); j0 = Math.floor(y);
+        fx = x - i0; fy = y - j0;
+        i0 = md(i0, g.EW); j0 = md(j0, g.EH);
+        i1 = md(i0 + 1, g.EW); j1 = md(j0 + 1, g.EH);
+      } else {
+        let x = fu[p] - 0.5; x = x < 0 ? 0 : x > g.EW - 1 ? g.EW - 1 : x;
+        let y = fv[p] - 0.5; y = y < 0 ? 0 : y > g.EH - 1 ? g.EH - 1 : y;
+        i0 = Math.min(g.EW - 2, Math.floor(x)); j0 = Math.min(g.EH - 2, Math.floor(y));
+        fx = x - i0; fy = y - j0; i1 = i0 + 1; j1 = j0 + 1;
+      }
+      t00[p] = j0 * g.EW + i0; t10[p] = j0 * g.EW + i1;
+      t01[p] = j1 * g.EW + i0; t11[p] = j1 * g.EW + i1;
+      tx[p] = fx; ty[p] = fy; on[p] = 1;
     }
-    return { tap, tx, ty, on, edge: fe, EW: g.EW };
+    return { t00, t10, t01, t11, tx, ty, on, edge: fe };
+  };
+
+  // one bilinear sample of a region's field, through whichever four corners
+  // the flat resolved to
+  const sample = (D, T, p) => {
+    const fx = T.tx[p], fy = T.ty[p];
+    return (D[T.t00[p]] * (1 - fx) + D[T.t10[p]] * fx) * (1 - fy)
+         + (D[T.t01[p]] * (1 - fx) + D[T.t11[p]] * fx) * fy;
   };
 
   const buf = new Float64Array(NP);
@@ -1904,15 +1945,14 @@ function buildSurface3DPanorama(S, fit, opts) {
   const scratch = polishScratch(NP, polish);
   const fld = polish ? new Float32Array(NP) : null;
   for (const g of groups) {
-    const { tap, tx, ty, on, edge, EW } = groupTaps(g);
+    const T = groupTaps(g);
+    const { on, edge } = T;
     const layers = new Array(g.count);
     g.eachField((k, D) => {
       if (polish) {
         for (let p = 0; p < NP; p++) {
           if (!on[p]) { fld[p] = 0; continue; }
-          const q = tap[p], fx = tx[p], fy = ty[p];
-          fld[p] = (D[q] * (1 - fx) + D[q + 1] * fx) * (1 - fy)
-                 + (D[q + EW] * (1 - fx) + D[q + EW + 1] * fx) * fy;
+          fld[p] = sample(D, T, p);
         }
         smoothField(fld, cov, BW, BH, polish, scratch);
       }
@@ -1920,13 +1960,7 @@ function buildSurface3DPanorama(S, fit, opts) {
         const s = sil[p];
         if (!cov[p]) { buf[p] = s; continue; }
         if (!on[p]) { buf[p] = OFF_FLAT; continue; }
-        let d;
-        if (polish) d = fld[p];
-        else {
-          const q = tap[p], fx = tx[p], fy = ty[p];
-          d = (D[q] * (1 - fx) + D[q + 1] * fx) * (1 - fy)
-            + (D[q + EW] * (1 - fx) + D[q + EW + 1] * fx) * fy;
-        }
+        let d = polish ? fld[p] : sample(D, T, p);
         if (edge && edge[p] < d) d = edge[p];   // the board's own edge
         let b = d < s ? d : s;
         if (crest) {                            // snap seam crossings to the crest
@@ -3818,21 +3852,45 @@ function PaintGrid2D({ view, w, h, onPaint, activeColor, onStrokeEnd, onEditStar
 // Sky or board. The sky is a direction, the same from everywhere on the water;
 // a board is a thing at a distance, so it has parallax, it can be missed, and
 // its size is in world units rather than degrees.
+const TAB = (on) => ({ ...miniBtnBase,
+  background: on ? "#27424b" : "#1a232c", color: on ? "#dff1f6" : "#9fb0c0",
+  border: "1px solid " + (on ? "#3f7e8f" : "#26313c") });
+
 function PlaceEditor({ flat, yFar, onChange }) {
-  const plane = flat.place && flat.place.kind === "plane";
+  const kind = (flat.place && flat.place.kind) || "sky";
+  const plane = kind === "plane", floor = kind === "floor";
   const pl = plane ? flat.place : { distance: Math.round(yFar * 0.4), width: 40, height: 12 };
+  const fl = floor ? flat.place : { depth: 6, span: 1.6 };
   const set = (patch) => onChange({ kind: "plane", ...pl, ...patch });
+  const setF = (patch) => onChange({ kind: "floor", ...fl, ...patch });
   return (
     <div style={{ marginTop: 10 }}>
       <div style={{ display: "flex", gap: 6 }}>
-        <button onClick={() => onChange({ kind: "sky" })} style={{ ...miniBtnBase,
-          background: plane ? "#1a232c" : "#27424b", color: plane ? "#9fb0c0" : "#dff1f6",
-          border: "1px solid " + (plane ? "#26313c" : "#3f7e8f") }}>at the sky</button>
-        <button onClick={() => set({})} style={{ ...miniBtnBase,
-          background: plane ? "#27424b" : "#1a232c", color: plane ? "#dff1f6" : "#9fb0c0",
-          border: "1px solid " + (plane ? "#3f7e8f" : "#26313c") }}>standing at</button>
+        <button onClick={() => onChange({ kind: "sky" })}
+          style={TAB(kind === "sky")}>at the sky</button>
+        <button onClick={() => set({})} style={TAB(plane)}>standing at</button>
+        <button onClick={() => setF({})} style={TAB(floor)}>on the floor</button>
       </div>
-      {plane ? (
+      {floor ? (
+        <div style={{ marginTop: 8 }}>
+          <Slider label="depth below the surface" value={fl.depth} min={0.2}
+            max={40} step={0.2} onChange={(v) => setF({ depth: v })}
+            fmt={(v) => v + " units"} />
+          <Slider label="repeat every" value={fl.span} min={0.2} max={12} step={0.1}
+            onChange={(v) => setF({ span: v })} fmt={(v) => v + " units"} />
+          <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5,
+            fontFamily: "ui-monospace, monospace" }}>
+            A horizontal plane under the water — the bottom of the pool. It is the one
+            placement a backdrop at infinity cannot stand in for: a direction map answers the
+            same thing however deep the water is, so a grid on it would ripple but never
+            warp. Here the ray has to travel down to the floor, so it lands
+            depth&nbsp;×&nbsp;tan(refracted&nbsp;angle) off the point below it — and THAT is
+            the bow in the grout lines. It is linear in the depth, so a shallow floor is
+            nearly straight and a deep one swims. Needs refraction on to mean anything.
+            The floor repeats every {fl.span} units, so it never runs out under the frame.
+          </div>
+        </div>
+      ) : plane ? (
         <div style={{ marginTop: 8 }}>
           <Slider label="distance out" value={pl.distance} min={2} max={Math.max(20, yFar)}
             step={1} onChange={(v) => set({ distance: v })} fmt={(v) => v + " units"} />
@@ -3853,6 +3911,39 @@ function PlaceEditor({ flat, yFar, onChange }) {
           At infinity: the same from every point on the water, which is what a sky is.
         </div>
       )}
+    </div>
+  );
+}
+
+// The tile grid itself. Tile count and grout width are in the document's own
+// terms (tiles per repeat block); how big that lands in the water is the
+// floor's `span`, next door in PlaceEditor.
+function GridEditor({ content, onChange }) {
+  return (
+    <div style={{ marginTop: 10 }}>
+      <Slider label="tiles per repeat" value={content.tiles} min={1} max={24} step={1}
+        onChange={(v) => onChange({ tiles: v })} fmt={(v) => v + "x" + v} />
+      <Slider label="grout width" value={content.grout} min={0.02} max={0.4} step={0.01}
+        onChange={(v) => onChange({ grout: v })}
+        fmt={(v) => Math.round(v * 100) + "% of a tile"} />
+      <Slider label="colour variety" value={content.jitter == null ? 0.5 : content.jitter}
+        min={0} max={1} step={0.05} onChange={(v) => onChange({ jitter: v })}
+        fmt={(v) => (v === 0 ? "all one" : Math.round(v * 100) + "%")} />
+      <div style={{ display: "flex", gap: 4, flexWrap: "wrap", margin: "4px 0 8px" }}>
+        {(content.colors || []).map((c, i) => (
+          <ColorWell key={i} label="" value={c} onChange={(v) => {
+            const next = (content.colors || []).slice(); next[i] = v;
+            onChange({ colors: next });
+          }} />
+        ))}
+      </div>
+      <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5,
+        fontFamily: "ui-monospace, monospace" }}>
+        A tiled floor, stated rather than painted, so the grout stays thin however far you
+        zoom. It is two or three regions however many tiles there are — a region is keyed on
+        its colour — so the cut and the SVG stay small. Put it on the floor and turn
+        refraction on to see it warp.
+      </div>
     </div>
   );
 }
@@ -4744,10 +4835,12 @@ export default function App() {
     return next;
   }, [beginEdit, commitDoc]);
 
-  const addLayer = (content, name) => editDoc((d) => {
+  // `place` is optional: a layer that is born somewhere other than the sky
+  // (the pool floor) says so here rather than being added and then moved.
+  const addLayer = (content, name, place) => editDoc((d) => {
     const { doc: next, id } = addFlat(d, content, name, activeFlat);
     setActiveFlat(id);
-    return next;
+    return place ? updateFlat(next, id, { place }) : next;
   });
   const duplicateLayer = () => editDoc((d) => {
     const { doc: next, id } = duplicateFlat(d, activeFlat);
@@ -6012,7 +6105,11 @@ export default function App() {
                       onStrokeEnd={() => setSegDoc(docRef.current)}
                       onEditStart={() => { beginEdit("2d"); setDirty2d(true); }}
                       brushSize={brushSize} brushShape={brushShape} />
-                    {active.content.kind === "shapes" && (
+                    {active.content.kind === "grid" && (
+                    <GridEditor content={active.content} onChange={patchContent} />
+                  )}
+
+                  {active.content.kind === "shapes" && (
                       <ShapeOverlay items={active.content.items} selectedId={selectedShape}
                         onSelect={setSelectedShape}
                         onEditStart={() => { beginEdit("2d"); setDirty2d(true); }}
@@ -6041,6 +6138,9 @@ export default function App() {
                     <button style={miniBtn} title="A new layer of shapes you can drag"
                       onClick={() => { setSelectedShape(null);
                         addLayer(shapesContent([]), "Shapes"); }}>+ shapes</button>
+                    <button style={miniBtn} title="A tiled pool floor under the water"
+                      onClick={() => addLayer(gridContent(), "Pool floor",
+                        { kind: "floor", depth: 6, span: 1.6 })}>+ floor</button>
                     <button style={miniBtn} onClick={duplicateLayer}>copy</button>
                     <button style={{ ...miniBtn, color: doc.flats.length > 1 ? "#c98a7f" : "#4a5560" }}
                       onClick={removeLayer} disabled={doc.flats.length <= 1}>delete</button>
