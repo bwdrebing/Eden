@@ -18,6 +18,7 @@
 //  world. What shapes add is not a new pipeline; it is that the picture stops
 //  being the only copy of itself.
 // ------------------------------------------------------------------ //
+import { buildTextMask, textMaskAt, maskExtent } from "../textMask";
 
 // Silhouettes evaluated in a local box: u in [-1, 1] across the width, v in
 // [0, 1] from the base to the top. 0 = empty, 1 = primary color, 2 = accent.
@@ -65,7 +66,42 @@ export const STAMPS = {
   } },
 };
 
-export const SHAPE_KINDS = ["rect", "ellipse", "poly", ...Object.keys(STAMPS)];
+export const SHAPE_KINDS = ["rect", "ellipse", "poly", "text", ...Object.keys(STAMPS)];
+
+// ---- text ----------------------------------------------------------
+// A shape whose silhouette is a string. Everything else here is a formula in
+// (u, v); text is a rasterized signed distance field, because that is the
+// only honest way to get real type — see textMask.js.
+//
+// The mask hangs off the item rather than being stored in it: the codec
+// carries the string and the type it is set in, and `withTextMasks` puts the
+// mask back on the way in. That keeps a document plain data, which is what
+// lets it be a URL and what lets it cross to the render worker — the worker
+// has no fonts to set type with, so it must be handed the letters, not the
+// string. An item with no mask draws nothing.
+export const textStyleOf = (item) => ({
+  font: item.font, weight: item.weight, italic: item.italic, tracking: item.tracking,
+});
+
+const maskKey = (item) => JSON.stringify(
+  [item.text, item.font, item.weight, item.italic, item.tracking]);
+
+// One mask per distinct string-and-type, so dragging a text shape around does
+// not re-set it sixty times a second.
+const maskCache = new Map();
+export function textMaskFor(item) {
+  const key = maskKey(item);
+  if (maskCache.has(key)) return maskCache.get(key);
+  if (maskCache.size > 48) maskCache.clear();
+  const m = buildTextMask(item.text, textStyleOf(item));
+  maskCache.set(key, m);
+  return m;
+}
+
+// The shape's natural width:height, once its mask exists — what "fit the box
+// to the words" means for a string whose length nobody knew in advance.
+export const textAspect = (item) =>
+  (item.mask ? Math.max(0.05, maskExtent(item.mask).w / maskExtent(item.mask).h) : 3);
 
 let shapeSeq = 1;
 export const newShapeId = () => "s" + shapeSeq++;
@@ -79,11 +115,13 @@ export const shape = (type, patch = {}) => {
   const h = 0.15;
   return {
     id: newShapeId(), type,
+    ...(type === "text" ? { text: "Eden", font: "serif", weight: 600,
+                            italic: false, tracking: 0.06 } : {}),
     x: 0.5, y: 0.15,
     // a stamp's aspect is width:height of its silhouette, and the flat is
     // wider than it is tall, so the ratio has to come back through the grid
     // or a dock lands two thirds of the way across the sky
-    w: st ? h * st.aspect * (DOC_ASPECT) : 0.2,
+    w: st ? h * st.aspect * (DOC_ASPECT) : type === "text" ? 0.46 : 0.2,
     h: st ? h : 0.18,
     color: st ? st.tint[0] : "#141d33",
     color2: st ? st.tint[1] : "#9cc3e8",
@@ -123,6 +161,13 @@ export function shapeAt(item, fx, fy) {
   const halfW = item.w / 2;
   const u = (fx - item.x) / (halfW || 1e-9);              // -1..1 across
   const v = (fy - item.y) / (item.h || 1e-9);             // 0..1 up from the base
+  if (item.type === "text") {
+    if (!item.mask) return 0;
+    // the ink box is fitted to the shape's box, so a string sets to the
+    // rectangle you dragged rather than to whatever its own metrics came to
+    const e = maskExtent(item.mask);
+    return textMaskAt(item.mask, u * (e.w / 2) + e.cx, (v - 0.5) * e.h + e.cy) > 0 ? 1 : 0;
+  }
   if (item.type === "rect") return (Math.abs(u) <= 1 && v >= 0 && v <= 1) ? 1 : 0;
   if (item.type === "ellipse") {
     const dv = (v - 0.5) * 2;
@@ -207,7 +252,37 @@ export function shapeBox(item) {
            y0: item.y, y1: item.y + item.h };
 }
 
-export const shapeLabel = (item) => {
-  const st = stampOf(item);
-  return st ? item.type : item.type;
-};
+export const shapeLabel = (item) =>
+  (item.type === "text"
+    ? `"${String(item.text || "").split("\n")[0].slice(0, 14) || "text"}"`
+    : item.type);
+
+/**
+ * Hand every text shape in a document its mask, and hand back the document.
+ *
+ * MAIN THREAD ONLY: setting type needs a canvas and the platform's fonts, and
+ * the render worker has neither to be relied on. Call it wherever a document
+ * is about to be drawn or handed across, never inside a builder.
+ *
+ * Cached masks come back identical, so a document with nothing new in it is
+ * returned unchanged — which is what keeps the memos above it from thrashing.
+ */
+export function withTextMasks(doc) {
+  if (!doc || !doc.flats) return doc;
+  let changed = false;
+  const flats = doc.flats.map((f) => {
+    if (!f.content || f.content.kind !== "shapes") return f;
+    let touched = false;
+    const items = f.content.items.map((it) => {
+      if (it.type !== "text") return it;
+      const mask = textMaskFor(it);
+      if (mask === it.mask) return it;
+      touched = true;
+      return { ...it, mask };
+    });
+    if (!touched) return f;
+    changed = true;
+    return { ...f, content: { ...f.content, items } };
+  });
+  return changed ? { ...doc, flats } : doc;
+}

@@ -200,7 +200,7 @@ Content kinds, all producing the same thing — an ordered list of
 { kind: "ramp",    palette: "Treeline", from: 0, to: 1 }
 { kind: "stripes", axis: "up", anchor: 0, repeat: true,
                    bands: [ {color:"#9cc3e8", size:2}, {color:"#ffffff", size:1} ] }
-{ kind: "shapes",  items: [ {type:"rect"|"ellipse"|"poly"|"path", color, ...} ] }
+{ kind: "shapes",  items: [ {type:"rect"|"ellipse"|"poly"|"text", color, ...} ] }
 { kind: "raster",  w, h, palette:[hex], cells: Uint8Array }   // freehand, RLE'd in the URL
 { kind: "photo",   ... }                                       // existing extractor, per flat
 ```
@@ -315,6 +315,22 @@ repeater — band list, sizes in degrees, repeat toggle, anchor.
 move, handles to resize — the "move the thing I just placed" ask. The four
 hardcoded objects become shape presets on a flat, `stampObjects` and `tweakHex`
 are deleted, and the four-object cap goes with them.
+
+### Phase 4b — text — **landed**
+
+A `text` shape: a string set in the platform's own type, rasterized into a
+signed distance mask and fitted to the shape's box like any other silhouette
+(`textMask.js`). The water reflects it exactly as it reflects a dock — which is
+the point of putting it here, and also its limit: a reflected sign shreds on the
+ripples, so type that has to stay *readable* belongs on the surface instead, as
+the watermark (`S.mark`, contoured on the visible-surface raster).
+
+The one rule the kind adds: **a mask is built on the studio's thread and carried
+as data.** Setting type needs a canvas and fonts, and the render worker can be
+relied on for neither, so `withTextMasks` hydrates the document on its way out
+and a shape with no mask draws nothing. The URL carries the string and the type
+it is set in — never the mask, which is thousands of cells and derivable from
+those two.
 
 ### Phase 5 — depth — **landed**
 

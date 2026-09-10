@@ -99,7 +99,7 @@ scaled inside a fixed-size `<div>` gives a zoomed crop to screenshot.
   not.
 - **The video export renders frames, it does not record them.** `frameAt(t)` in
   the studio component rebuilds every phase-dependent piece of the picture —
-  segmentation, field spec, `buildSolid3D`, pen lines, buoy — at an arbitrary
+  segmentation, field spec, `buildSolid3D`, pen lines, the watermark — at an arbitrary
   wave phase, and `buildSvg(over, frame)` draws that instead of the memoized
   preview frame. Anything new that moves with `S.t` has to be added to *both*
   the memo and `frameAt`, or the video will quietly freeze that part of the
@@ -119,6 +119,30 @@ scaled inside a fixed-size `<div>` gives a zoomed crop to screenshot.
   a frequency of its own. Snapping costs tempo only, worst on the slowest
   train; `loopFit` measures it by baking the field at two instants rather than
   restating the formula.
+- **Text arrives as a field, and its letters are set on the main thread only.**
+  `textMask.js` turns a string into a signed distance mask — a plain array,
+  positive inside the ink — because that is the only form the rest of this
+  renderer can compose: the watermark is contoured by the same marching squares
+  as a color band, cut against the same wave silhouette, snapped at the same
+  crest seams. The glyphs come from a canvas and the platform's own fonts, so a
+  mask **must not be built inside a builder**: the render worker has no fonts to
+  rely on and might have no canvas, and it would come back with different type
+  or with none. The studio builds every mask (`markMask` for the watermark,
+  `withTextMasks` for a backdrop text shape) and hands it across as data. A
+  document in the URL carries the string and the type it is set in, never the
+  mask.
+- **The watermark is on the water; a text shape is across it.** `S.mark` is
+  contoured on the visible-surface raster, so the words ride the wave they sit
+  on and stop at the crest in front of them but never shred — that is what makes
+  them readable, and it is the whole point of the option. The 3D-solid pass
+  hands its own raster to `buildMarkOn`; every other mode builds one in
+  `buildMark`, where flat water needs only `MARK_FLAT_GN` mesh cells because a
+  plane projects exactly. A `text` shape in the backdrop is the opposite thing:
+  it stands in the panorama like a dock and the water reflects it, shredding and
+  all. The mark's field is in ground units and the raster counts pixels, so
+  `markScale` converts with ONE number taken at the mark's own place — a
+  per-pixel scale reads the ground coordinate across crest seams, where it
+  jumps, and would draw a hairline of watermark along every seam in the frame.
 - **The 3D-solid pass runs in a Web Worker in the browser** (`solidWorker.js`,
   reached through `solidBuilder.js`) and inline in tests, where jsdom has no
   workers and `package.json` maps the worker factory to a stub. The preview

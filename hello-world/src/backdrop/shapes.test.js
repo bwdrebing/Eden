@@ -1,4 +1,8 @@
-import { shape, shapeAt, shapeBox, rasterizeShapes, STAMPS, SHAPE_KINDS } from "./shapes";
+import {
+  shape, shapeAt, shapeBox, shapeLabel, shapeParts, rasterizeShapes,
+  withTextMasks, STAMPS, SHAPE_KINDS,
+} from "./shapes";
+import { barsMask } from "../textMarkFixture";
 import { compileBackdrop } from "./compile";
 import { backdropDoc, flat, shapesContent, rampContent, DOC_W, DOC_H } from "./document";
 
@@ -147,5 +151,80 @@ describe("shapes as regions", () => {
     const shapeRegions = [];
     for (let k = 0; k < b.count; k++) if (b.colorAt(k) === "#ff00ff") shapeRegions.push(k);
     expect(Math.max(...rampRegions)).toBeLessThan(Math.min(...shapeRegions));
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * A text shape
+ *
+ * Every other shape is a formula in (u, v) and can be evaluated anywhere;
+ * text is a rasterized mask, which means it can only be evaluated where
+ * someone has set the type. `withTextMasks` is that someone, and it runs on
+ * the studio's own thread — so the interesting cases are the two ends: an
+ * item that HAS a mask, and one that never got one because there was no
+ * canvas to make it with (jsdom here; the render worker in the field).
+ * ------------------------------------------------------------------ */
+describe("text shapes", () => {
+  const withMask = (patch) => ({
+    ...shape("text", { x: 0.5, y: 0.2, w: 0.4, h: 0.2, color: "#ff00ff", ...patch }),
+    mask: barsMask([[0.1, 0.45], [0.65, 1.0]], 0.72),
+  });
+
+  test("text is one of the shapes you can add", () => {
+    expect(SHAPE_KINDS).toContain("text");
+    const t = shape("text");
+    expect(t.text).toBeTruthy();
+    expect(t.font).toBe("serif");
+  });
+
+  // The ink box is fitted to the shape's box, so a fraction across the mask is
+  // the same fraction across the box, whatever box that is. The fixture's two
+  // bars run 0.1..0.45 and 0.65..1.0 of one em, and its ink box is that em.
+  const across = (t, u) => shapeAt(t, t.x + (u - 0.5) * t.w, 0.3);
+  const LEFT_BAR = 0.275, GAP = 0.55, RIGHT_BAR = 0.825;
+
+  test("the string sets to the box it was given, ink and gaps alike", () => {
+    const t = withMask();                       // 0.3..0.7 across, 0.2..0.4 up
+    // the gap between the words is inside the box and still empty, which is
+    // what makes this type rather than a rectangle
+    expect([across(t, LEFT_BAR), across(t, GAP), across(t, RIGHT_BAR)]).toEqual([1, 0, 1]);
+    expect(shapeAt(t, 0.5, 0.05)).toBe(0);      // below the base
+    expect(shapeAt(t, 0.5, 0.5)).toBe(0);       // above the top
+    expect(shapeAt(t, 0.1, 0.3)).toBe(0);       // left of the box
+  });
+
+  test("moving the box moves the words with it", () => {
+    const a = withMask({ x: 0.5 }), b = withMask({ x: 0.2 });
+    expect([across(a, LEFT_BAR), across(a, GAP)]).toEqual([1, 0]);
+    expect([across(b, LEFT_BAR), across(b, GAP)]).toEqual([1, 0]);
+    // and nothing is left behind where the words used to be
+    expect(shapeAt(b, a.x + (LEFT_BAR - 0.5) * a.w, 0.3)).toBe(0);
+  });
+
+  test("without a mask it draws nothing at all", () => {
+    // A text item that never reached `withTextMasks` — a worker's copy, or a
+    // browser with no canvas. Drawing its BOX instead would put a coloured
+    // slab in the sky where the words were meant to be, which is worse than
+    // nothing: the picture would differ between the two threads.
+    const bare = shape("text", { x: 0.5, y: 0.2, w: 0.4, h: 0.2 });
+    expect(bare.mask).toBeUndefined();
+    expect(shapeAt(bare, 0.5, 0.3)).toBe(0);
+    const { cells } = raster([bare]);
+    expect(cells.every((c) => c == null)).toBe(true);
+  });
+
+  test("withTextMasks hands back the same document when nothing needs setting", () => {
+    const doc = backdropDoc([flat(rampContent("Treeline"), "Sky")], DOC_W, DOC_H);
+    expect(withTextMasks(doc)).toBe(doc);
+  });
+
+  test("a text shape is one region, like a rect — no accent", () => {
+    expect(shapeParts(withMask()).map((p) => p.role)).toEqual(["body"]);
+    expect(shapeParts(withMask({ rim: 1 })).map((p) => p.role)).toEqual(["body", "rim"]);
+  });
+
+  test("the label is the words, so the layer list says which sign it is", () => {
+    expect(shapeLabel(shape("text", { text: "Eden\n2026" }))).toBe('"Eden"');
+    expect(shapeLabel(shape("rect"))).toBe("rect");
   });
 });

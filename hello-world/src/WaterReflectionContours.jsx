@@ -4,6 +4,7 @@ import { labelRegions, buildAdjacency, denoiseGrid, planCollapse } from "./paper
 import { useUrlSync } from "./urlSettings";
 import { extractPhotoStrip } from "./photoPalette";
 import { decodeEnv2d } from "./env2dCodec";
+import { buildTextMask, textMaskAt, maskExtent, MARK_FONTS } from "./textMask";
 import { emptyHistory, pushEdit, undo as undoHist, redo as redoHist, canUndo, canRedo }
   from "./backdropHistory";
 import { distTransform, blurField } from "./backdrop/field";
@@ -17,6 +18,7 @@ import {
 import { encodeDoc, decodeDoc } from "./backdrop/codec";
 import {
   STAMPS, SHAPE_KINDS, shape, shapesContent, shapeAt, shapeBox, shapeLabel,
+  withTextMasks, textMaskFor, textAspect, DOC_ASPECT,
 } from "./backdrop/shapes";
 import { compileBackdrop, COMPILE_SCALE } from "./backdrop/compile";
 import { PALETTES, BANDED_PALETTES, paletteStops, paletteColorAt, paletteNames }
@@ -419,8 +421,8 @@ function prepEmitter(em, S) {
   const phase = (om) => (S.loopPhase ? loopOmega(om * rate, S) * S.t : om * t);
 
   if (em.type === "point") {
-    // em.decay overrides the global reach — used by the buoy's scattered
-    // ripples, which should stay local to the hull
+    // em.decay overrides the global reach, for a source that should stay
+    // local rather than reach across the whole plane
     const decay = (em.decay ?? S.decay) / Math.max(0.6, em.size);
     const k0 = 2 * Math.PI / baseLambda;
     // the ring expands at this train's own phase speed omega/k, not the
@@ -724,7 +726,7 @@ function computeFit(S) {
 // camera roll: rotate the finished picture about the viewport center, scaled
 // up just enough that the rotated frame still covers the viewport (cover-fit,
 // like rotating a photo). Applied as one SVG group transform so every mode —
-// regions, pen lines, buoy, clips — rolls consistently.
+// regions, pen lines, the watermark, clips — rolls consistently.
 function rollTransform(rollDeg) {
   if (!rollDeg) return null;
   const r = (rollDeg * Math.PI) / 180;
@@ -937,121 +939,6 @@ function penProject(gx, gy, gz, S, fit) {
     rx = gx / Zc; ry = -Yc / Zc; depth = Zc;
   }
   return [fit.ox + fit.scale * rx, fit.oy + (fit.scaleY || fit.scale) * ry, depth];
-}
-
-// ---- floating object (buoy) ----------------------------------------
-// A sphere floating at the surface, drawn through the same camera as the
-// water. Visible shape = the spherical cap above the waterline; the hull
-// below z = 0 is clipped away by the projected sphere ∩ water-plane circle.
-// The reflection is the cap mirrored across the plane, wobbled by a
-// screen-space ripple and clipped to below the waterline.
-function buildBuoy(S, fit, obj) {
-  const r = obj.size;
-  let zc = r * (1 - 2 * obj.sub);              // center height from submersion
-  // ride the local wave (exaggerated, like pen-mode relief)
-  const bob = heightAt(obj.x, obj.y, S) * 10;
-  zc += Math.max(-0.3 * r, Math.min(0.3 * r, bob));
-  if (zc < -r * 0.98) return null;             // fully under -> nothing to draw
-  const syS = fit.scaleY || fit.scale;
-  const [cx, cy, Zc] = penProject(obj.x, obj.y, zc, S, fit);
-  let rx, ry;
-  if (S.perspective) {
-    rx = fit.scale * r / Zc; ry = syS * r / Zc;
-  } else {
-    rx = fit.scale * r / (S.xMax - S.xMin);
-    ry = syS * r / (S.yMax - S.yMin);
-  }
-  if (rx < 0.5) return null;
-
-  // waterline: the circle where the sphere crosses z = 0, projected
-  const rw = Math.sqrt(Math.max(0, r * r - zc * zc));
-  let ringD = "", nearD = "", clipAbove = null, clipBelow = null;
-  if (rw > 0.02) {
-    const NP = 40, ring = [];
-    for (let i = 0; i <= NP; i++) {
-      const th = (i / NP) * Math.PI * 2;
-      const [sx, sy] = penProject(obj.x + rw * Math.cos(th), obj.y + rw * Math.sin(th), 0, S, fit);
-      ring.push([sx, sy]);
-    }
-    ringD = "M" + ring.map((p) => p[0].toFixed(1) + " " + p[1].toFixed(1)).join(" L") + " Z";
-    if (S.perspective) {
-      // θ ∈ [π, 2π]: the near (camera-side) half of the waterline, left → right
-      const near = ring.slice(NP / 2);
-      nearD = "M" + near.map((p) => p[0].toFixed(1) + " " + p[1].toFixed(1)).join(" L");
-      const a = near[0], b = near[near.length - 1], L = 4000;
-      const arc = near.map((p) => "L" + p[0].toFixed(1) + " " + p[1].toFixed(1)).join(" ");
-      const lead = `M${(a[0] - L).toFixed(1)} ${a[1].toFixed(1)} ${arc} L${(b[0] + L).toFixed(1)} ${b[1].toFixed(1)}`;
-      clipAbove = `${lead} L${(b[0] + L).toFixed(1)} ${-L} L${(a[0] - L).toFixed(1)} ${-L} Z`;
-      clipBelow = `${lead} L${(b[0] + L).toFixed(1)} ${L} L${(a[0] - L).toFixed(1)} ${L} Z`;
-    }
-  }
-
-  // reflection: mirror the sphere across z = 0 (virtual image is farther from
-  // the camera, so it projects slightly smaller — correct for a plane mirror)
-  let reflD = null;
-  if (S.perspective) {
-    const [mx, my, mZc] = penProject(obj.x, obj.y, -zc, S, fit);
-    const mrx = fit.scale * r / mZc, mry = syS * r / mZc;
-    const strength = S.amp / 0.06;               // global ripple strength 0..1
-    const wAmp = Math.min(8, mrx * 0.25 * strength);
-    const wLen = Math.max(3, mry * 0.8);
-    const N = 60;
-    let d = "";
-    for (let i = 0; i <= N; i++) {
-      const a = (i / N) * Math.PI * 2;
-      const py = my + mry * Math.sin(a);
-      const px = mx + mrx * Math.cos(a)
-        + wAmp * Math.sin(((py - my) / wLen) * Math.PI * 2 + loopOmega(1.7, S) * S.t + 1.3);
-      d += (i === 0 ? "M" : "L") + px.toFixed(1) + " " + py.toFixed(1) + " ";
-    }
-    reflD = d + "Z";
-  }
-  return { cx, cy, rx, ry, ringD, nearD, clipAbove, clipBelow, reflD, ortho: !S.perspective };
-}
-
-// cel-shade bands: flat tones only, like the water's isobands. Each band is
-// the same ellipse shrunk and pushed toward the light, clipped to the ball
-// silhouette — the overlaps read as thick crescent color bands.
-// n = number of tones, lightDeg = where the light sits around the ball
-// (0° = above, 90° = right, 180° = below, 270° = left).
-const BUOY_RAMP = ["#7e150e", "#c02c1f", "#e8503c", "#ff8a66", "#ffd9b8"];
-function makeBuoyBands(n, lightDeg) {
-  const interp = d3.interpolateRgbBasis(BUOY_RAMP);
-  const a = (lightDeg * Math.PI) / 180;
-  const dx = Math.sin(a), dy = -Math.cos(a);
-  return d3.range(n).map((k) => {
-    const t = k / (n - 1);            // 0 = shadow base, 1 = glint
-    return {
-      f: 1 - 0.82 * Math.pow(t, 1.6), // radius factor
-      ox: 0.72 * t * dx,              // center offset, in units of rx/ry
-      oy: 0.72 * t * dy,
-      color: d3.color(interp(t)).formatHex(),
-    };
-  });
-}
-
-function buoyBandGeo(b, bands) {
-  return bands.map((band) => ({
-    cx: b.cx + band.ox * b.rx, cy: b.cy + band.oy * b.ry,
-    rx: b.rx * band.f, ry: b.ry * band.f, color: band.color,
-  }));
-}
-
-function buoySvg(b, bands) {
-  let s = `<defs>`;
-  if (b.clipAbove) s += `<clipPath id="buoyAbove"><path d="${b.clipAbove}"/></clipPath>`;
-  if (b.clipBelow) s += `<clipPath id="buoyBelow"><path d="${b.clipBelow}"/></clipPath>`;
-  s += `<clipPath id="buoyBall"><ellipse cx="${b.cx.toFixed(1)}" cy="${b.cy.toFixed(1)}" rx="${b.rx.toFixed(1)}" ry="${b.ry.toFixed(1)}"/></clipPath></defs>`;
-  if (b.reflD) s += `<g${b.clipBelow ? ' clip-path="url(#buoyBelow)"' : ""}>`
-    + `<path d="${b.reflD}" fill="#b03328" opacity="0.45"/></g>`;
-  s += `<g${b.clipAbove ? ' clip-path="url(#buoyAbove)"' : ""}><g clip-path="url(#buoyBall)">`
-    + buoyBandGeo(b, bands).map((e) =>
-        `<ellipse cx="${e.cx.toFixed(1)}" cy="${e.cy.toFixed(1)}" rx="${e.rx.toFixed(1)}" ry="${e.ry.toFixed(1)}" fill="${e.color}"/>`
-      ).join("")
-    + `</g></g>`;
-  if (b.nearD) s += `<path d="${b.nearD}" fill="none" stroke="#000" stroke-opacity="0.4" stroke-width="1.1"/>`;
-  if (b.ortho && b.ringD) s += `<path d="${b.ringD}" fill="none" stroke="#000" stroke-opacity="0.3" stroke-width="1"/>`;
-  return s;
 }
 
 // equally-spaced scan lines across the surface. Each line is split into
@@ -1705,6 +1592,147 @@ function gapRegion(R, iters, buf) {
   return contourToScreenPath(multi, BW, BH, iters);
 }
 
+// ---- the surface watermark -----------------------------------------
+// Text laid ON the water rather than reflected in it. A reflected object is
+// a thing across the lake and the water shows you its image, shredded by
+// every ripple between; a watermark is on the surface itself, so it stays
+// legible — it bends with the wave it sits on, and stops where a crest in
+// front of it starts, but it never breaks up.
+//
+// It gets that for free by being resolved where every other region already
+// is: at the front-most surface point each raster pixel sees. The raster
+// hands back that point's GROUND coordinate, the text's own signed distance
+// field (textMask.js) is asked there, and the answer is contoured by the same
+// marching squares, rounded by the same Chaikin, and cut against the same
+// wave silhouette and crest seams as a color band. So a trough tilts a
+// letter, a crest hides it, and the letter's edge is drawn to the same
+// standard as the water's own.
+//
+// The mask is built on the studio's thread and carried on S as plain data —
+// see textMask.js for why it must not be rebuilt on the far side.
+
+// where a ground point falls in the text's own em coordinates, and how far it
+// is from the ink, back in ground units
+function markSampler(S) {
+  const m = S.mark;
+  if (!m || !m.mask) return null;
+  const ext = maskExtent(m.mask);
+  const a = ((m.angle || 0) * Math.PI) / 180;
+  const ca = Math.cos(a), sa = Math.sin(a);
+  const s = Math.max(1e-4, m.size);
+  return (gx, gy) => {
+    const dx = gx - m.x, dy = gy - m.y;
+    // ground +y runs away from the camera and the text's +v runs up the
+    // frame, which is the same direction — so the string reads the way it
+    // was typed, lying on the water like something floated onto it
+    const u = (dx * ca + dy * sa) / s + ext.cx;
+    const v = (-dx * sa + dy * ca) / s + ext.cy;
+    return textMaskAt(m.mask, u, v) * s;
+  };
+}
+
+// Raster pixels to the ground unit, taken AT THE MARK — one number, not a
+// field. The sampler answers in ground units and everything downstream (the
+// silhouette, the crest snap, the polish blur) counts in pixels, so the two
+// have to be put on the same footing. A per-pixel scale would be exact, but
+// it reads the ground coordinate across crest seams, where it jumps: the
+// normalized field would cross zero along every seam in the frame and draw a
+// hairline of watermark there. The text is a local object, so a scale taken
+// at its own place in the frame is right where the field is ever read.
+function markScale(S, fit, BW) {
+  const m = S.mark, s = Math.max(1e-4, m.size);
+  const p0 = penProject(m.x, m.y, 0, S, fit);
+  const px = penProject(m.x + s, m.y, 0, S, fit);
+  const py = penProject(m.x, m.y + s, 0, S, fit);
+  const kx = Math.hypot(px[0] - p0[0], px[1] - p0[1]) / s;
+  const ky = Math.hypot(py[0] - p0[0], py[1] - p0[1]) / s;
+  const k = Math.sqrt(kx * ky) * (BW / VB_W);
+  return Number.isFinite(k) && k > 1e-6 ? k : 1;
+}
+
+// How far past a letter the field is carried, in raster pixels. Everything
+// beyond this is "outside" and nothing reads it, so clamping there keeps the
+// polish blur from dragging a boundary toward a number a hundred pixels away.
+// It is also the widest the outline can be drawn: past this there is no field
+// left to cut, and an outline that thick has swallowed the letters anyway.
+const MARK_REACH = 24;
+
+// The watermark on a surface raster that already exists: the 3D-solid pass
+// builds one to contour its color bands, and this rides it. `halo` is a
+// second contour of the same field a little outside the first — the outline
+// that keeps white type readable over white water, which is the whole reason
+// a watermark on the surface beats one in the backdrop.
+function buildMarkOn(S, fit, R, iters, buf, polish, scratch) {
+  const sample = markSampler(S);
+  if (!sample) return null;
+  const m = S.mark;
+  const { NP, cov } = R;
+  const k = markScale(S, fit, R.BW);
+  const gxf = rasterField(R, R.GX), gyf = rasterField(R, R.GY);
+  const field = new Float32Array(NP);
+  for (let p = 0; p < NP; p++) {
+    if (!cov[p]) continue;
+    const d = sample(gxf[p], gyf[p]) * k;
+    field[p] = d < -MARK_REACH ? -MARK_REACH : d > MARK_REACH ? MARK_REACH : d;
+  }
+  smoothField(field, cov, R.BW, R.BH, polish, scratch);
+  const out = [];
+  const halo = Math.min(MARK_REACH - 1, (m.halo || 0) * k);
+  if (halo > 0) {
+    const d = contourRegion(R, field, -halo, iters, buf);
+    if (d) out.push({ d, color: m.haloColor || "#0b1420" });
+  }
+  const d = contourRegion(R, field, 0, iters, buf);
+  if (d) out.push({ d, color: m.color || "#ffffff" });
+  return out.length ? out : null;
+}
+
+// Flat water is a plane, and a handful of mesh cells project a plane exactly
+// — the triangles interpolate in 1/depth, so nothing is gained by subdividing
+// it. Only a lifted surface needs the scene's own mesh.
+const MARK_FLAT_GN = 12;
+// …and even then, not all of it. A watermark is ONE local object with a smooth
+// outline, so past this the extra pixels and cells buy nothing anyone can see,
+// while the pass they cost lands on every animation frame in the modes that
+// come through here. (In 3D-solid mode this never runs: the picture's own
+// raster is already there, and the mark is cut on it at whatever width the
+// quality slider asked for.)
+const MARK_MAX_BW = 900, MARK_MAX_GN = 200;
+
+// The watermark for the modes that build no surface raster of their own: the
+// flat renders and pen mode. Same field, same cutter, its own raster.
+function buildMark(S, raster = {}) {
+  if (!markSampler(S)) return null;
+  const fit = computeFit(S);
+  prepField(S);
+  const lift = !!(S.surface3d && S.perspective);
+  const gN = lift ? Math.min(MARK_MAX_GN, raster.gN || 140) : MARK_FLAT_GN;
+  const BW = Math.min(MARK_MAX_BW, raster.BW || 420);
+  const polish = raster.polish || 0;
+  const R = rasterizeSurface(S, fit, gN, BW, lift, 0);
+  return buildMarkOn(S, fit, R, S.smooth || 0, new Float64Array(R.NP),
+    polish, polishScratch(R.NP, polish));
+}
+
+// Which sheet each pixel of the watermark belongs to, for the paper export:
+// 0 none, 1 the halo, 2 the ink. The same field the render contours, read at
+// the pixel instead of cut into a curve — the paper path works in pixels all
+// the way to its own region tracing.
+function markPaper(S, fit, R) {
+  const sample = markSampler(S);
+  if (!sample) return null;
+  const k = markScale(S, fit, R.BW);
+  const halo = (S.mark.halo || 0) * k;
+  const gxf = rasterField(R, R.GX), gyf = rasterField(R, R.GY);
+  const out = new Uint8Array(R.NP);
+  for (let p = 0; p < R.NP; p++) {
+    if (!R.cov[p]) continue;
+    const d = sample(gxf[p], gyf[p]) * k;
+    out[p] = d >= 0 ? 2 : (halo > 0 && d >= -halo ? 1 : 0);
+  }
+  return out;
+}
+
 // Preset / 1D path: one continuous scalar (the reflected elevation), contoured
 // at the palette's band boundaries into nested upper sets, plus the occluded
 // Fresnel bands. `scalarAt`/`fresAt` are sampled at ground points.
@@ -1728,7 +1756,8 @@ function buildSurface3D(S, fit, opts) {
     smoothField(ff, R.cov, R.BW, R.BH, polish, scratch);
     fres = fresThresholds.map((t) => contourRegion(R, ff, t, iters, buf));
   }
-  return { layers, fres, gap: gapRegion(R, iters, buf) };
+  return { layers, fres, gap: gapRegion(R, iters, buf),
+           mark: buildMarkOn(S, fit, R, iters, buf, polish, scratch) };
 }
 
 // 2D panorama path: no single scalar exists, so take the compiled backdrop's
@@ -1842,7 +1871,8 @@ function buildSurface3DPanorama(S, fit, opts) {
     fres = fresThresholds.map((t) => contourRegion(R, ff, t, iters, buf));
   }
   return { bg: backdrop.colorAt(0), layers: drawn, fres,
-           gap: gapRegion(R, iters, buf) };
+           gap: gapRegion(R, iters, buf),
+           mark: buildMarkOn(S, fit, R, iters, buf, polish, scratch) };
 }
 
 // The fields any surface-raster pass contours: one continuous scalar for
@@ -1924,8 +1954,8 @@ function buildSolid3D(S, fieldSpec, raster) {
     { uvAt, rayAt: fieldSpec.rayAt, backdrop, fresAt, fresThresholds, ...raster });
   // preset / paint1d: the wave silhouette does the occlusion. Lowest band
   // shows the background, exactly like the flat render, so no base layer.
-  const { layers, fres, gap } = buildSurface3D(S, fit, { scalarAt, thresholds, fresAt, fresThresholds, ...raster });
-  return { bg: cols[0], layers: layers.map((d, k) => ({ d, color: cols[k + 1] })), fres, gap };
+  const { layers, fres, gap, mark } = buildSurface3D(S, fit, { scalarAt, thresholds, fresAt, fresThresholds, ...raster });
+  return { bg: cols[0], layers: layers.map((d, k) => ({ d, color: cols[k + 1] })), fres, gap, mark };
 }
 
 // each color region is filled with nested rings that follow its edge shape
@@ -3075,6 +3105,7 @@ export {
   PNG_SCALES, PNG_DEFAULT, PNG_MAX_PIXELS, pngSize, sizedSvg, svgToPngBlob, svgToCanvas,
   SPEED_MIN, SPEED_MAX, EMITTER_RATE_DEFAULT,
   DISPERSION_DEFAULT, omegaAt, dispersionFor, loopOmega, loopFit,
+  buildMark, markSampler, markScale, MARK_FONTS,
 };
 
 // ---- layered-paper stack export -----------------------------------
@@ -3302,11 +3333,18 @@ function buildPaperImage(S, fit, opts) {
   const fw = fresAt
     ? paperPolish(rasterField(R, meshBlur(R, gridSamples(R, fresAt), coh, cbuf))) : null;
 
+  // the watermark is cut, not printed: its ink and its halo are two more
+  // sheets, laid over whatever the water was going to be there
+  const markP = markPaper(S, fit, R);
+  const markInk = markP ? idFor(S.mark.color || "#ffffff") : -1;
+  const markHalo = markP && S.mark.halo > 0 ? idFor(S.mark.haloColor || "#0b1420") : markInk;
+
   const grid = new Int32Array(NP);
   const counts = [];
   for (let p = 0; p < NP; p++) {
     let id;
     if (!cov[p]) id = bgId;                      // off the water: the mount
+    else if (markP && markP[p]) id = markP[p] === 2 ? markInk : markHalo;
     else if (gapF && gapF[p] > 0) id = gapId;    // inside a crest gap: cut through
     else {
       let c = colorOf(p);
@@ -3518,6 +3556,47 @@ function Slider({ label, value, min, max, step, onChange, fmt }) {
         onChange={(e) => onChange(parseFloat(e.target.value))}
         style={{ width: "100%", height: 24, cursor: "pointer" }} />
     </label>
+  );
+}
+
+// A line (or a few) of type to set. A textarea rather than an input because a
+// watermark is often two lines — a name over a date — and the mask takes the
+// newline as a line break.
+function TextField({ label, value, rows = 2, placeholder, onChange }) {
+  return (
+    <label style={{ display: "block", marginBottom: 10 }}>
+      <div style={{ fontSize: 11.5, letterSpacing: 0.3, color: "#9fb0c0", marginBottom: 4,
+        fontFamily: "ui-monospace, monospace" }}>{label}</div>
+      <textarea value={value} rows={rows} placeholder={placeholder}
+        onChange={(e) => onChange(e.target.value)} spellCheck={false}
+        style={{ width: "100%", boxSizing: "border-box", resize: "vertical",
+          padding: "7px 8px", borderRadius: 7, border: "1px solid #2b3945",
+          background: "#0d141b", color: "#e6eef5", fontSize: 13,
+          fontFamily: "ui-monospace, monospace", lineHeight: 1.4 }} />
+    </label>
+  );
+}
+
+// One of a short list of choices, as a row of buttons — for settings with too
+// few values to be worth a slider and too many to be a toggle.
+function Choice({ label, value, options, onChange }) {
+  return (
+    <div style={{ marginBottom: 10 }}>
+      <div style={{ fontSize: 11.5, letterSpacing: 0.3, color: "#9fb0c0", marginBottom: 4,
+        fontFamily: "ui-monospace, monospace" }}>{label}</div>
+      <div style={{ display: "flex", gap: 4 }}>
+        {options.map(([v, name]) => (
+          <button key={String(v)} onClick={() => onChange(v)}
+            style={{ flex: 1, padding: "6px 2px", borderRadius: 6, cursor: "pointer",
+              border: "1px solid " + (v === value ? "#f6e2b0" : "#2b3945"),
+              background: v === value ? "#26303a" : "#131a22",
+              color: v === value ? "#f6e2b0" : "#9fb0c0",
+              fontFamily: "ui-monospace, monospace", fontSize: 11 }}>
+            {name}
+          </button>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -3899,6 +3978,35 @@ function ShapesEditor({ content, selectedId, onSelect, onAdd, onPatch, onRemove,
                 style={layerNudge(true)}>×</button>
             </div>
           ))}
+        </div>
+      )}
+      {sel && sel.type === "text" && (
+        <div style={{ marginTop: 8 }}>
+          <TextField label="words" value={sel.text || ""} rows={2}
+            placeholder="a name, a sign, a date"
+            onChange={(t) => onPatch(sel.id, { text: t })} />
+          <Choice label="type" value={sel.font || "serif"}
+            options={MARK_FONTS.map((f) => [f[0], f[1]])}
+            onChange={(v) => onPatch(sel.id, { font: v })} />
+          <Choice label="weight" value={sel.weight || 600}
+            options={[[300, "Light"], [400, "Book"], [600, "Semi"], [800, "Bold"]]}
+            onChange={(v) => onPatch(sel.id, { weight: v })} />
+          <div style={{ display: "flex", gap: 5, marginBottom: 8 }}>
+            <button onClick={() => onPatch(sel.id, { italic: !sel.italic })}
+              style={{ ...miniBtnBase, flex: 1, padding: "6px 10px",
+                background: sel.italic ? "#27424b" : "#1a232c",
+                color: sel.italic ? "#dff1f6" : "#9fb0c0", fontStyle: "italic" }}>italic</button>
+            <button onClick={() => onPatch(sel.id, { tracking: 0 })}
+              style={{ ...miniBtnBase, flex: 1, padding: "6px 10px" }}>tight</button>
+            <button onClick={() => onPatch(sel.id, { tracking: 0.16 })}
+              style={{ ...miniBtnBase, flex: 1, padding: "6px 10px" }}>wide</button>
+          </div>
+          <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5, marginBottom: 6,
+            fontFamily: "ui-monospace, monospace" }}>
+            A sign across the water: the water reflects it like everything else on the
+            backdrop, so it stretches toward you and tears on the ripples. For type that
+            stays readable, use the watermark panel instead — that one lies on the surface.
+          </div>
         </div>
       )}
       {sel && (
@@ -4357,16 +4465,23 @@ export default function App() {
         az: -12, size: 4, color: "#241a12", color2: "#d64127" }]);
   const removeObject = (id) => setObjects((os) => os.filter((o) => o.id !== id));
 
-  // floating object (red buoy)
-  const [objOn, setObjOn] = useState(true);
-  const [objX, setObjX] = useState(0);
-  const [objY, setObjY] = useState(14);
-  const [objSize, setObjSize] = useState(1.2);
-  const [objSub, setObjSub] = useState(0.5);        // fraction of hull under water
-  const [objRipple, setObjRipple] = useState(0.9);  // scattered-wave strength
-  const [objRippleScale, setObjRippleScale] = useState(0.8);
-  const [objBands, setObjBands] = useState(5);      // cel-shade tone count
-  const [objLight, setObjLight] = useState(325);    // light direction, degrees
+  // The watermark: a line of type lying on the water. Everything here except
+  // the mask is a number or a string, because all of it travels in the URL;
+  // the mask is rasterized from the first four and rebuilt on the way back in.
+  const [markOn, setMarkOn] = useState(false);
+  const [markText, setMarkText] = useState("Eden");
+  const [markFont, setMarkFont] = useState("serif");
+  const [markWeight, setMarkWeight] = useState(600);
+  const [markItalic, setMarkItalic] = useState(false);
+  const [markTracking, setMarkTracking] = useState(0.08);  // letter spacing, ems
+  const [markX, setMarkX] = useState(0);          // where it sits, in ground units
+  const [markY, setMarkY] = useState(14);
+  const [markSize, setMarkSize] = useState(3);    // one em, in ground units
+  const [markAngle, setMarkAngle] = useState(0);  // turned on the water plane
+  const [markColor, setMarkColor] = useState("#ffffff");
+  const [markHalo, setMarkHalo] = useState(0.1);  // outline width, ground units
+  const [markHaloColor, setMarkHaloColor] = useState("#0b1420");
+
   const [eLo, setELo] = useState(-5), [eHi, setEHi] = useState(33);
   const [autoFit, setAutoFit] = useState(false);
   const [penMode, setPenMode] = useState(false);
@@ -4408,16 +4523,25 @@ export default function App() {
   const active = doc.flats[flatIndex(doc, activeFlat)] || doc.flats[doc.flats.length - 1];
   // what the canvas shows: every visible layer composited, live (the water
   // waits for the stroke to end, the canvas under the brush does not)
+  // Text shapes need their masks before anything can draw them, and a mask can
+  // only be set where the fonts are — this thread. Both copies of the document
+  // pass through here on their way out: the one the canvas paints and the one
+  // the water is built from, which is also the one that crosses to the render
+  // worker. The document itself stays plain data, so the URL codec never sees
+  // a mask. (Cached masks come back identical, so a document with no new text
+  // in it is handed straight back and nothing downstream rebuilds.)
+  const docLive = useMemo(() => withTextMasks(doc), [doc]);
+  const segDocSet = useMemo(() => withTextMasks(segDoc), [segDoc]);
   const docView = useMemo(() => {
-    const w = doc.w, h = doc.h;
+    const w = docLive.w, h = docLive.h;
     const cells = new Array(w * h).fill(null);
-    for (const f of doc.flats) {
+    for (const f of docLive.flats) {
       if (!f.visible) continue;
       const src = renderContent(f.content, w, h);
       for (let p = 0; p < w * h; p++) if (src[p] != null) cells[p] = src[p];
     }
     return cells;
-  }, [doc]);
+  }, [docLive]);
   // every edit that is not a brush stroke commits straight through
   const commitDoc = useCallback((next) => { setDoc(next); setSegDoc(next); }, []);
 
@@ -4556,10 +4680,12 @@ export default function App() {
     wakes: [wakes, setWakes],
     halfW: [halfW, setHalfW], yNear: [yNear, setYNear], yFar: [yFar, setYFar],
     reflMag: [reflMag, setReflMag], objects: [objects, setObjects],
-    objOn: [objOn, setObjOn], objX: [objX, setObjX], objY: [objY, setObjY],
-    objSize: [objSize, setObjSize], objSub: [objSub, setObjSub],
-    objRipple: [objRipple, setObjRipple], objRippleScale: [objRippleScale, setObjRippleScale],
-    objBands: [objBands, setObjBands], objLight: [objLight, setObjLight],
+    markOn: [markOn, setMarkOn], markText: [markText, setMarkText],
+    markFont: [markFont, setMarkFont], markWeight: [markWeight, setMarkWeight],
+    markItalic: [markItalic, setMarkItalic], markTracking: [markTracking, setMarkTracking],
+    markX: [markX, setMarkX], markY: [markY, setMarkY], markSize: [markSize, setMarkSize],
+    markAngle: [markAngle, setMarkAngle], markColor: [markColor, setMarkColor],
+    markHalo: [markHalo, setMarkHalo], markHaloColor: [markHaloColor, setMarkHaloColor],
     eLo: [eLo, setELo], eHi: [eHi, setEHi], autoFit: [autoFit, setAutoFit],
     penMode: [penMode, setPenMode], penCount: [penCount, setPenCount],
     penRelief: [penRelief, setPenRelief], penWidth: [penWidth, setPenWidth],
@@ -4630,13 +4756,26 @@ export default function App() {
   // Shapes: add, patch and remove all go through the document, so each is one
   // undo step. A drag is one step too — it opens on pointer-down and commits
   // on pointer-up, like a brush stroke.
+  // A text shape's width is not a free choice the way a rectangle's is — the
+  // words have proportions of their own, and a box that does not match them
+  // sets the type squashed. So the width follows the string and the height,
+  // whenever either changes. Dragging the corner handle is left alone: that is
+  // someone deciding to squash it, which is a legitimate thing to want.
+  const fitText = (it) => {
+    if (it.type !== "text") return it;
+    const mask = textMaskFor(it);
+    if (!mask) return it;
+    return { ...it, w: Math.min(0.98, it.h * textAspect({ ...it, mask }) * DOC_ASPECT) };
+  };
+  const RESETS_TEXT_FIT = ["text", "font", "weight", "italic", "tracking", "h"];
+
   const addShape = (type) => {
     // a stamp keeps its own colours; a plain shape takes the swatch in hand
-    const item = shape(type, {
+    const item = fitText(shape(type, {
       ...(STAMPS[type] ? {} : { color: activeColor }),
       points: type === "poly"
         ? [[0.35, 0.1], [0.5, 0.35], [0.65, 0.1]] : undefined,
-    });
+    }));
     setSelectedShape(item.id);
     editDoc((d) => updateFlat(d, activeFlat, {
       content: { ...d.flats[flatIndex(d, activeFlat)].content,
@@ -4644,10 +4783,15 @@ export default function App() {
     }));
   };
   const patchShape = (id, patch, live) => {
+    const refit = RESETS_TEXT_FIT.some((k) => k in patch);
     const apply = (d) => updateFlat(d, activeFlat, {
       content: { ...d.flats[flatIndex(d, activeFlat)].content,
         items: d.flats[flatIndex(d, activeFlat)].content.items
-          .map((i) => (i.id === id ? { ...i, ...patch } : i)) },
+          .map((i) => {
+            if (i.id !== id) return i;
+            const next = { ...i, ...patch };
+            return refit ? fitText(next) : next;
+          }) },
     });
     if (live) setDoc(apply);            // mid-drag: the canvas follows, the water waits
     else editDoc(apply);
@@ -4860,19 +5004,27 @@ export default function App() {
     decay: 0.18 - spread * 0.16,
     omega: 1.0,
     dispersion,
-    // waves scatter off the buoy's hull: a ring source pinned to the object,
-    // with a tight decay so the disturbance stays local
-    emitters: withWakes(objOn && objRipple > 0
-      ? [...emitters, { id: "buoy", on: true, type: "point", x: objX, y: objY,
-          size: Math.max(0.3, objSize * objRippleScale), amp: objRipple * 1.5, decay: 0.28 }]
-      : emitters, wakes),
-  }), [camS, wavelength, strength, sharp, spread, dispersion, emitters, wakes,
-       objOn, objX, objY, objSize, objRipple, objRippleScale]);
+    emitters: withWakes(emitters, wakes),
+  }), [camS, wavelength, strength, sharp, spread, dispersion, emitters, wakes]);
+
+  // The watermark's type, rasterized into a signed distance field. Built HERE
+  // — on the page's own thread, where the fonts are — and carried on S as
+  // plain data, so the render worker draws the same letters this thread would
+  // have (see textMask.js). Rebuilt only when the string or its type changes;
+  // moving, turning or recoloring the mark does not touch it.
+  const markMask = useMemo(
+    () => (markOn ? buildTextMask(markText, { font: markFont, weight: markWeight,
+      italic: markItalic, tracking: markTracking }) : null),
+    [markOn, markText, markFont, markWeight, markItalic, markTracking]);
+  const mark = useMemo(() => (markMask ? {
+    mask: markMask, x: markX, y: markY, size: markSize, angle: markAngle,
+    color: markColor, halo: markHalo, haloColor: markHaloColor,
+  } : null), [markMask, markX, markY, markSize, markAngle, markColor, markHalo, markHaloColor]);
 
   const S = useMemo(() => ({
-    ...waveS,
+    ...waveS, mark,
     t: animate ? tRef.current : manualTime,
-  }), [waveS, animate, speed, tRef.current, manualTime]);
+  }), [waveS, mark, animate, speed, tRef.current, manualTime]);
 
   const is2d = mode === "paint2d";
   const presetColors = useMemo(
@@ -4889,7 +5041,7 @@ export default function App() {
   // preset and 1D modes it is the same colors as rows, which is what an object
   // stamp and the drawn backdrop both need to sample.
   const baseEnv2d = useMemo(() => {
-    if (is2d) return flattenDoc(segDoc);
+    if (is2d) return flattenDoc(segDocSet);
     if (!objectsOn) return null;
     if (mode === "paint1d")
       return envFromRows((f) => envColors[Math.min(ENV_N - 1, Math.floor(f * ENV_N))],
@@ -4898,7 +5050,7 @@ export default function App() {
     const NB = presetColors.length;
     return envFromRows((f) => presetColors[Math.min(NB - 1, Math.floor(f * NB))],
       ENV2D_W, DERIVED_ENV_H);
-  }, [is2d, segDoc, objectsOn, mode, envColors, stops, palette, presetColors]);
+  }, [is2d, segDocSet, objectsOn, mode, envColors, stops, palette, presetColors]);
   const envEffective = useMemo(
     () => (use2d ? stampObjects(baseEnv2d, objects, azSpan, eLo, eHi) : null),
     [use2d, baseEnv2d, objects, azSpan, eLo, eHi]);
@@ -4914,15 +5066,15 @@ export default function App() {
     // preset and 1D modes have no document, so they wrap the panorama their
     // palette or strip derives.
     if (!is2d) return docFromPanorama(envEffective);
-    if (!objectsOn) return segDoc;
+    if (!objectsOn) return segDocSet;
     // objects are still stamped rather than placed; they ride on top as their
     // own transparent layer instead of being baked into everything below
-    const blank = { w: segDoc.w, h: segDoc.h,
-      cells: new Array(segDoc.w * segDoc.h).fill(null) };
+    const blank = { w: segDocSet.w, h: segDocSet.h,
+      cells: new Array(segDocSet.w * segDocSet.h).fill(null) };
     const stamped = stampObjects(blank, objects, azSpan, eLo, eHi);
     return backdropDoc(
-      [...segDoc.flats, flat(rasterContent(stamped), "Objects")], segDoc.w, segDoc.h);
-  }, [use2d, is2d, segDoc, objectsOn, objects, azSpan, eLo, eHi, envEffective]);
+      [...segDocSet.flats, flat(rasterContent(stamped), "Objects")], segDocSet.w, segDocSet.h);
+  }, [use2d, is2d, segDocSet, objectsOn, objects, azSpan, eLo, eHi, envEffective]);
 
   // The compiled form, for this thread: the region list and its distance
   // fields depend on what is painted, not on where the camera is or what the
@@ -5157,6 +5309,14 @@ export default function App() {
   // the crest gaps ride on top of every layer, in whatever shows through a
   // hole in the picture — the page background, unless asked for another color
   const drawGap = solid3d && surf3d ? surf3d.gap : null;
+  // The watermark comes out of the 3D-solid pass with the rest of the picture,
+  // because it is cut on that pass's own raster. Every other mode builds no
+  // such raster, so it gets one of its own — flat water is a plane, so that is
+  // a handful of mesh cells and it costs next to nothing.
+  const makeMark = useCallback(
+    (St) => (solid3d ? null : buildMark(St, solidRaster)), [solid3d, solidRaster]);
+  const flatMark = useMemo(() => makeMark(S), [makeMark, S]);
+  const drawMark = solid3d ? (surf3d ? surf3d.mark : null) : flatMark;
   const fresIdx = useMemo(
     () => (fresOn && drawFres ? d3.range(fresBands) : [0]),
     [fresOn, drawFres, fresBands]);
@@ -5164,16 +5324,6 @@ export default function App() {
   // occluded layers, the flat modes their own
   const regionCount = penMode ? penLines.length
     : (solid3d ? drawLayers.length + 1 : use2d ? seg.count : layers.length + 1) * fresIdx.length;
-
-  // floating buoy: projected cap + waterline clip + mirrored reflection
-  const makeBuoy = useCallback((S) => {
-    if (!objOn) return null;
-    const fit = computeFit(S);
-    prepField(S);
-    return buildBuoy(S, fit, { x: objX, y: objY, size: objSize, sub: objSub });
-  }, [objOn, objX, objY, objSize, objSub]);
-  const buoy = useMemo(() => makeBuoy(S), [makeBuoy, S]);
-  const buoyShade = useMemo(() => makeBuoyBands(objBands, objLight), [objBands, objLight]);
 
   // auto-fit the elevation range to the actual reflected φ, so steep/near water
   // never silently clamps to one band. φ min/max don't depend on eLo/eHi, so
@@ -5192,8 +5342,8 @@ export default function App() {
   // the video export walks through. Color, camera roll, Fresnel banding and
   // the rest do not move with the phase, so they stay closed over.
   const liveFrame = {
-    seg, fresPaths, penLines, buoy,
-    drawLayers, drawFres, drawBg, drawGap, bgFill, gapFill,
+    seg, fresPaths, penLines,
+    drawLayers, drawFres, drawBg, drawGap, drawMark, bgFill, gapFill,
   };
   // The 3D solid pass at any phase, through the worker when there is one —
   // the video export's frames come this way, and the page stays usable while
@@ -5211,8 +5361,8 @@ export default function App() {
   const frameAt = async (t, loopPhase = 0) => {
     const St = { ...S, t, loopPhase };
     if (penMode) {
-      // pen mode has no filled regions at all: lines, the buoy, and paper
-      return { ...liveFrame, penLines: makePenLines(St), buoy: makeBuoy(St) };
+      // pen mode has no filled regions at all: lines, the watermark, and paper
+      return { ...liveFrame, penLines: makePenLines(St), drawMark: makeMark(St) };
     }
     // the flat build only where it is what gets drawn (see flatNeeded)
     const geomT = !solid3d && !use2d ? buildGeometry(St) : null;
@@ -5226,23 +5376,28 @@ export default function App() {
     // print, and the export retrace would multiply a minutes-long render by
     // the frame count for edges nobody will pause on
     const solidT = solid3d ? await buildSolidAt(St, solidRaster) : null;
+    // the watermark rides the surface, so it moves with the phase like
+    // everything else here — built at this frame's own instant, never carried
+    // over from the preview
+    const markT = solid3d ? solidT.mark : makeMark(St);
     return {
-      seg: segT, fresPaths: fresT, penLines: null, buoy: makeBuoy(St),
+      seg: segT, fresPaths: fresT, penLines: null,
       drawLayers: solid3d ? solidT.layers : layersT,
       drawFres: solid3d ? solidT.fres : fresT,
       drawBg: solid3d ? solidT.bg : bgT,
       drawGap: solid3d ? solidT.gap : null,
+      drawMark: markT,
       bgFill: bgFillT, gapFill: crestGapColor || bgFillT,
     };
   };
 
   // `over` is an alternate { bg, layers, fres } for the filled regions — the
   // export retrace at a wider raster. Everything else about the picture (roll,
-  // Fresnel banding, buoy, background) is unchanged, so the file matches what
+  // Fresnel banding, background) is unchanged, so the file matches what
   // is on screen; only the outlines are resolved finer.
   const buildSvg = (over, frame) => {
     const F = frame || liveFrame;
-    const { seg, fresPaths, penLines, buoy, bgFill, gapFill } = F;
+    const { seg, fresPaths, penLines, bgFill, gapFill } = F;
     // the drawn backdrop does not move with the waves, so every frame of a
     // video export shares the one the preview built
     const svgSky = penMode ? null : skyLayers;
@@ -5250,14 +5405,18 @@ export default function App() {
     const svgFres = over ? over.fres : F.drawFres;
     const svgBg = over ? over.bg : F.drawBg;
     const svgGap = over ? over.gap : F.drawGap;
-    const buoyStr = buoy ? buoySvg(buoy, buoyShade) : "";
+    // the watermark is cut on the same raster the regions are, so an export
+    // retrace brings its own — resolved as finely as everything else in the file
+    const svgMark = over && over.mark !== undefined ? over.mark : F.drawMark;
+    const markStr = (svgMark || []).map(
+      (l) => `<path d="${l.d}" fill="${l.color}" fill-rule="evenodd"/>`).join("");
     const rollOpen = rollTf ? `<g transform="${rollTf}">` : `<g>`;
     if (penMode) {
       let body = `<rect width="${VB_W}" height="${VB_H}" fill="${bgFill}"/>` + rollOpen;
       penLines.forEach((l) => {
         body += `<path d="${l.d}" fill="none" stroke="${l.color}" stroke-width="${penWidth}" stroke-linecap="round" stroke-linejoin="round"/>`;
       });
-      body += buoyStr + `</g>`;
+      body += markStr + `</g>`;
       return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${VB_W} ${VB_H}">${body}</svg>`;
     }
     let body = `<rect width="${VB_W}" height="${VB_H}" fill="${bgFill}"/>` + rollOpen;
@@ -5289,7 +5448,7 @@ export default function App() {
         });
         body += `</g>`;
       });
-      body += buoyStr + `</g>`;
+      body += markStr + `</g>`;
       return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${VB_W} ${VB_H}"><defs>${defs}</defs>${body}</svg>`;
     }
     // layered paths, preset & 2D alike. With Fresnel on, the geometry is
@@ -5313,7 +5472,7 @@ export default function App() {
       body += `</g>`;
     });
     if (svgGap) body += `<path d="${svgGap}" fill="${gapFill}" fill-rule="evenodd"/>`;
-    body += `</g>` + buoyStr + `</g>`;
+    body += `</g>` + markStr + `</g>`;
     return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${VB_W} ${VB_H}">${defs ? `<defs>${defs}</defs>` : ""}${body}</svg>`;
   };
   const saveBlob = (blob, name) => {
@@ -5660,35 +5819,12 @@ export default function App() {
                   </g>
                 </>
               )}
-              {buoy && (
-                <g>
-                  <defs>
-                    {buoy.clipAbove && <clipPath id="buoyAboveP"><path d={buoy.clipAbove} /></clipPath>}
-                    {buoy.clipBelow && <clipPath id="buoyBelowP"><path d={buoy.clipBelow} /></clipPath>}
-                    <clipPath id="buoyBallP">
-                      <ellipse cx={buoy.cx} cy={buoy.cy} rx={buoy.rx} ry={buoy.ry} />
-                    </clipPath>
-                  </defs>
-                  {buoy.reflD && (
-                    <g clipPath={buoy.clipBelow ? "url(#buoyBelowP)" : undefined}>
-                      <path d={buoy.reflD} fill="#b03328" opacity={0.45} />
-                    </g>
-                  )}
-                  <g clipPath={buoy.clipAbove ? "url(#buoyAboveP)" : undefined}>
-                    <g clipPath="url(#buoyBallP)">
-                      {buoyBandGeo(buoy, buoyShade).map((e, i) => (
-                        <ellipse key={i} cx={e.cx} cy={e.cy} rx={e.rx} ry={e.ry} fill={e.color} />
-                      ))}
-                    </g>
-                  </g>
-                  {buoy.nearD && (
-                    <path d={buoy.nearD} fill="none" stroke="#000" strokeOpacity={0.4} strokeWidth={1.1} />
-                  )}
-                  {buoy.ortho && buoy.ringD && (
-                    <path d={buoy.ringD} fill="none" stroke="#000" strokeOpacity={0.3} strokeWidth={1} />
-                  )}
-                </g>
-              )}
+              {/* the watermark last: it lies on the water, over every region
+                  and every crest gap, and it rolls with the frame like the
+                  rest of the picture */}
+              {drawMark && drawMark.map((l, i) => (
+                <path key={`mk${i}`} d={l.d} fill={l.color} fillRule="evenodd" />
+              ))}
               </g>
             </svg>
             <div style={{ position: "absolute", left: 12, bottom: 10, fontSize: 10.5,
@@ -6160,6 +6296,56 @@ export default function App() {
             </div>
 
             <div style={panel}>
+              <div style={heading}>Watermark on the water</div>
+              <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 10, lineHeight: 1.5,
+                fontFamily: "ui-monospace, monospace" }}>
+                Type lying on the surface itself — not a reflection. It bends with the wave it
+                sits on and stops where a nearer crest hides the water behind it, but it never
+                shreds, so it stays readable where a reflected sign would not.
+              </div>
+              <Toggle label="Watermark" value={markOn} onChange={setMarkOn} />
+              {markOn && (
+                <div style={{ marginTop: 8 }}>
+                  <TextField label="text" value={markText} onChange={setMarkText}
+                    placeholder="a name, a title, a date" />
+                  <Choice label="type" value={markFont} onChange={setMarkFont}
+                    options={MARK_FONTS.map((f) => [f[0], f[1]])} />
+                  <Choice label="weight" value={markWeight} onChange={setMarkWeight}
+                    options={[[300, "Light"], [400, "Book"], [600, "Semi"], [800, "Bold"]]} />
+                  <Toggle label="Italic" value={markItalic} onChange={setMarkItalic} />
+                  <Slider label="letter spacing" value={markTracking} min={-0.05} max={0.5} step={0.01}
+                    onChange={setMarkTracking} fmt={(v) => v.toFixed(2) + " em"} />
+                  <Slider label="size" value={markSize} min={0.4} max={Math.max(2, halfW / 2)} step={0.1}
+                    onChange={setMarkSize} fmt={(v) => v.toFixed(1) + " units/em"} />
+                  <Slider label="position ← →" value={markX} min={-halfW} max={halfW} step={0.5}
+                    onChange={setMarkX} fmt={(v) => (v === 0 ? "center" : v.toFixed(1))} />
+                  <Slider label="distance (near → far)" value={markY} min={yNear} max={yFar} step={0.5}
+                    onChange={setMarkY} fmt={(v) => v.toFixed(1)} />
+                  <Slider label="turn" value={markAngle} min={-90} max={90} step={1}
+                    onChange={setMarkAngle} fmt={(v) => v + "\u00b0"} />
+                  <Slider label="outline" value={markHalo} min={0} max={0.6} step={0.01}
+                    onChange={setMarkHalo}
+                    fmt={(v) => (v === 0 ? "off" : v.toFixed(2) + " units")} />
+                  <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 8 }}>
+                    <ColorWell label="ink" value={markColor} onChange={setMarkColor} />
+                    {markHalo > 0 && (
+                      <ColorWell label="outline" value={markHaloColor} onChange={setMarkHaloColor} />
+                    )}
+                  </div>
+                  <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5,
+                    fontFamily: "ui-monospace, monospace" }}>
+                    Size is one em in the water's own units, so a watermark laid far out reads
+                    smaller through the same camera as everything else. The outline is a second
+                    cut of the same field a little outside the letters — it is what keeps pale
+                    type legible over the pale water of a specular band.
+                    {!markMask && markText.trim() ? " (This browser gave no canvas to set type on,"
+                      + " so nothing is drawn.)" : ""}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div style={panel}>
               <div style={heading}>Objects across the water</div>
               <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 10, lineHeight: 1.5,
                 fontFamily: "ui-monospace, monospace" }}>
@@ -6185,40 +6371,6 @@ export default function App() {
                   fontFamily: "ui-monospace, monospace" }}>
                   Objects sit on the waterline and are sized in degrees of reflected elevation;
                   the panorama they land in is in <b>What the water sees</b>, above.
-                </div>
-              )}
-            </div>
-
-            <div style={panel}>
-              <div style={heading}>Floating buoy (in frame)</div>
-              <Toggle label="Red buoy" value={objOn} onChange={setObjOn} />
-              {objOn && (
-                <div style={{ marginTop: 6 }}>
-                  <Slider label="position ← →" value={objX} min={-halfW + 1} max={halfW - 1} step={0.5}
-                    onChange={setObjX} fmt={(v) => (v === 0 ? "center" : v.toFixed(1))} />
-                  <Slider label="distance (near → far)" value={objY} min={5} max={yFar - 3} step={0.5}
-                    onChange={setObjY} fmt={(v) => v.toFixed(1)} />
-                  <Slider label="size" value={objSize} min={0.4} max={3} step={0.1}
-                    onChange={setObjSize} fmt={(v) => v.toFixed(1)} />
-                  <Slider label="submersion" value={objSub} min={0.08} max={0.92} step={0.02}
-                    onChange={setObjSub} fmt={(v) => Math.round(v * 100) + "%"} />
-                  <Slider label="shading bands" value={objBands} min={2} max={8} step={1}
-                    onChange={setObjBands} />
-                  <Slider label="light direction" value={objLight} min={0} max={360} step={5}
-                    onChange={setObjLight}
-                    fmt={(v) => v + "° " + ["↑","↗","→","↘","↓","↙","←","↖"][Math.round(v / 45) % 8]} />
-                  <Slider label="scattered ripples" value={objRipple} min={0} max={2} step={0.05}
-                    onChange={setObjRipple} fmt={(v) => (v === 0 ? "off" : v.toFixed(2))} />
-                  {objRipple > 0 && (
-                    <Slider label="scattered wavelength" value={objRippleScale} min={0.3} max={2} step={0.05}
-                      onChange={setObjRippleScale} fmt={(v) => v.toFixed(2) + "×"} />
-                  )}
-                  <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5,
-                    fontFamily: "ui-monospace, monospace" }}>
-                    The hull below the waterline is hidden; the cap above it mirrors into the
-                    water. Scattered ripples are waves bouncing off the hull — they bend the
-                    color regions around the buoy and animate with the rest of the surface.
-                  </div>
                 </div>
               )}
             </div>
@@ -6329,7 +6481,7 @@ export default function App() {
                   fmt={(v) => `${v.toFixed(2)} \u00b7 ${(v * PHASE_PER_SEC).toFixed(1)} phase/s`} />
                 <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5, marginTop: -4,
                   fontFamily: "ui-monospace, monospace" }}>
-                  One clock drives every emitter, the buoy and its reflection, and this is
+                  One clock drives every emitter and everything that rides the surface, and this is
                   its rate — for the animation above and for the video export alike. Turning
                   it down and the video length up is how you get the same stretch of water
                   to unfold slowly: a {vidPlan.seconds.toFixed(1)} s export covers

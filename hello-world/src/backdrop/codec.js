@@ -20,6 +20,9 @@ import { DOC_VERSION, backdropDoc, flat, rampContent, stripesContent } from "./d
 import { shapesContent, shape, SHAPE_KINDS } from "./shapes";
 
 const MAX_PALETTE = 64;
+// a watermark is a name or a title, not an essay — and the whole document has
+// to fit in a URL
+export const MAX_TEXT = 120;
 export const MAX_DOC_LEN = 12000;
 
 // ---- raster cells, run-length encoded ------------------------------
@@ -100,6 +103,14 @@ export function encodeDoc(doc) {
         d: (it.color2 || "").replace(/^#/, ""),
         m: it.rim ? 1 : 0,
         ...(it.points ? { g: it.points.map((q) => q.map((v) => Math.round(v * 1e4) / 1e4)) } : {}),
+        // A text shape carries the string and the type it is set in, never
+        // the mask those two produce — the mask is thousands of cells, and it
+        // is rebuilt from exactly this on the way back in (withTextMasks).
+        ...(it.type === "text"
+          ? { s: String(it.text || "").slice(0, MAX_TEXT), ff: it.font || "serif",
+              fw: it.weight | 0, fi: it.italic ? 1 : 0,
+              ft: Math.round((it.tracking || 0) * 1e3) / 1e3 }
+          : {}),
       })) });
     }
     else if (c.kind === "stripes") {
@@ -143,6 +154,13 @@ export function decodeDoc(s) {
           color2: /^[0-9a-f]{6}$/i.test(String(it.d)) ? "#" + it.d : "#9cc3e8",
           rim: it.m ? 1 : 0,
           ...(Array.isArray(it.g) ? { points: it.g } : {}),
+          ...(it.t === "text"
+            ? { text: typeof it.s === "string" ? it.s.slice(0, MAX_TEXT) : "",
+                font: typeof it.ff === "string" ? it.ff : "serif",
+                weight: it.fw > 0 ? it.fw : 600,
+                italic: !!it.fi,
+                tracking: Number.isFinite(it.ft) ? it.ft : 0 }
+            : {}),
         }));
       content = shapesContent(items);
     } else if (f.k === "p") {
