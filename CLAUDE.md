@@ -82,9 +82,12 @@ scaled inside a fixed-size `<div>` gives a zoomed crop to screenshot.
   edge polish blurs the field before the regions are cut, which is what takes
   the last of the raster grid off a distant outline — and, with it, any glint
   only a few raster pixels across. The PNG path rasterizes the preview's own
-  geometry instead (no polish, no mesh stand-down; it keeps only the width
-  multiplier, which resolves rather than smooths), so it is where fidelity to
-  the preview lives. Keep it that way.
+  geometry instead (no *export* polish, no mesh stand-down; it keeps only the
+  width multiplier, which resolves rather than smooths), so it is where fidelity
+  to the preview lives. Keep it that way. The scene's own `antialiasing` is not
+  an export step and does come through — it is part of the picture that was on
+  screen. `polishPlan` is the one place that says which outputs blur by how
+  much; add an output there rather than picking a number at its call site.
 - **A wave's speed is not a free parameter.** With "Speed follows wavelength"
   on (`S.dispersion`, the default for a new scene), every train takes its
   frequency from its own wavenumber through `omegaAt` — deep-water dispersion,
@@ -103,7 +106,12 @@ scaled inside a fixed-size `<div>` gives a zoomed crop to screenshot.
   not better.
 - **Smoothing that acts on the traced path cannot fix a jagged edge**; Chaikin
   already converges to the spline of that polyline. The field is where to act
-  (see `smoothField`), before the topology is decided.
+  (see `smoothField`), before the topology is decided. Two settings drive that
+  one operator: the scene's `antialiasing` (`ANTIALIAS`), which the preview and
+  everything built from it run, and the SVG's `edge polish` (`EXPORT_POLISH`),
+  which the file adds on top. Both are counted in raster pixels and neither
+  scales with `BW` — a pass is sigma = sqrt(2N/3) pixels of the very grid whose
+  aliasing it removes, so one step means one thing at every raster.
 - **The three pen styles are not the same kind of thing.** `buildPenLines` and
   `buildPenConcentric` work in ground space and do their own hidden-line pass;
   `buildPenHatch` works in *screen* space, on the same `rasterizeSurface` pass
@@ -121,6 +129,18 @@ scaled inside a fixed-size `<div>` gives a zoomed crop to screenshot.
   export retrace), for the same reason the PNG is: fidelity to what was on
   screen. `videoExport.js` drives WebCodecs, `mp4.js` is the container.
   `frameAt` is async: its 3D-solid pass goes through the worker below.
+- **"Perfect loop" is the one thing the video does that the preview does not.**
+  `S.loopPhase` — a span in phase units, 0 for off — rounds every wave
+  component's frequency to a whole number of cycles in that span (`loopOmega`),
+  which is what makes the field periodic and the clip close. It reaches only
+  the frames written to the file: `frameAt` takes it as an argument rather than
+  reading it off `S`, so the preview keeps the scene's true timing. Off, every
+  phase term is the arithmetic it always was, down to the bit — that is what
+  `videoLoop.test.js` pins first, and any new time-dependent term has to keep
+  it, which means routing through `loopOmega` rather than multiplying `S.t` by
+  a frequency of its own. Snapping costs tempo only, worst on the slowest
+  train; `loopFit` measures it by baking the field at two instants rather than
+  restating the formula.
 - **The 3D-solid pass runs in a Web Worker in the browser** (`solidWorker.js`,
   reached through `solidBuilder.js`) and inline in tests, where jsdom has no
   workers and `package.json` maps the worker factory to a stub. The preview

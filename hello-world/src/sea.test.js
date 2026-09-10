@@ -1,6 +1,8 @@
 import {
   prepField, heightAt, slopeAt, WATER_MOODS, SEA_N_DEFAULT, SPECTRUM_N_REF, omegaAt,
+  NOISE_PERIOD, buildSolid3D, RASTER_LEVELS, reflectAt,
 } from "./WaterReflectionContours";
+import { GRAZING_RIPPLES, buildScene } from "./sceneFixtures";
 
 /* ------------------------------------------------------------------ *
  * The sea emitter, and the two fixes to the older ones
@@ -23,7 +25,7 @@ const scene = (emitters, over = {}) => prepField({
   emitters, ...over,
 });
 // a point on that plane, from fractions of it
-const at = (S, u, v) => [S.xMin + u * (S.xMax - S.xMin), S.yMin + v * (S.yMax - S.yMin)];
+const at2 = (S, u, v) => [S.xMin + u * (S.xMax - S.xMin), S.yMin + v * (S.yMax - S.yMin)];
 
 const sea = (over = {}) => ({
   id: 1, on: true, type: "sea", x: 0, y: 20, dir: 90, size: 1.7, amp: 1.2,
@@ -65,7 +67,7 @@ describe("sea: the analytic slope is the gradient of the height", () => {
       for (let j = 0; j < 7; j++) for (let i = 0; i < 7; i++) {
         // deliberately off the lattice lines of the gust noise, and spread
         // across the plane so the range fade and both envelopes vary
-        const [gx, gy] = at(S, 0.07 + i * 0.131, 0.05 + j * 0.137);
+        const [gx, gy] = at2(S, 0.07 + i * 0.131, 0.05 + j * 0.137);
         const [hx, hy] = slopeAt(gx, gy, S);
         const nx = (heightAt(gx + h, gy, S) - heightAt(gx - h, gy, S)) / (2 * h);
         const ny = (heightAt(gx, gy + h, S) - heightAt(gx, gy - h, S)) / (2 * h);
@@ -84,7 +86,7 @@ describe("sea: the analytic slope is the gradient of the height", () => {
     const S = scene([sea({ chop: 0.6, patch: 0.6, group: 0.6 })], { perspective: false });
     const h = 1e-5;
     for (const uv of [[0.31, 0.12], [0.55, 0.44], [0.78, 0.81]]) {
-      const [gx, gy] = at(S, uv[0], uv[1]);
+      const [gx, gy] = at2(S, uv[0], uv[1]);
       const [hx, hy] = slopeAt(gx, gy, S);
       const nx = (heightAt(gx + h, gy, S) - heightAt(gx - h, gy, S)) / (2 * h);
       const ny = (heightAt(gx, gy + h, S) - heightAt(gx, gy - h, S)) / (2 * h);
@@ -122,7 +124,7 @@ describe("sea: the controls do what their labels say", () => {
     const rmsHeight = (S) => {
       let sum = 0;
       for (let i = 0; i < 900; i++) {
-        const [gx, gy] = at(S, ((i % 30) + 0.5) / 30, (Math.floor(i / 30) + 0.5) / 30);
+        const [gx, gy] = at2(S, ((i % 30) + 0.5) / 30, (Math.floor(i / 30) + 0.5) / 30);
         sum += Math.pow(heightAt(gx, gy, S), 2);
       }
       return Math.sqrt(sum / 900);
@@ -140,7 +142,7 @@ describe("sea: the controls do what their labels say", () => {
       for (let cj = 0; cj < 6; cj++) for (let ci = 0; ci < 6; ci++) {
         let s = 0;
         for (let j = 0; j < 5; j++) for (let i = 0; i < 5; i++) {
-          const [gx, gy] = at(S, (ci * 5 + i + 0.5) / 30, (cj * 5 + j + 0.5) / 30);
+          const [gx, gy] = at2(S, (ci * 5 + i + 0.5) / 30, (cj * 5 + j + 0.5) / 30);
           const [hx, hy] = slopeAt(gx, gy, S);
           s += hx * hx + hy * hy;
         }
@@ -186,7 +188,75 @@ describe("sea: the controls do what their labels say", () => {
     const kp = ((2 * Math.PI) / 2.8) / 1.7;   // scene ripple scale / emitter size
     const S = scene([]);
     const e = scene([sea({ group: 0.9 })], { t: 4 })._ems[0];
-    expect(e.gcg).toBeCloseTo(0.5 * (omegaAt(kp, S) / kp) * 4, 9);
+    const cg = 0.5 * (omegaAt(kp, S) / kp);
+    // one phase term per beat rather than one shared shift of the position, so
+    // a loop can round each on its own; with no loop asked for they are exactly
+    // the translation they used to be
+    expect(e.gp1).toBeCloseTo(e.gl1 * cg * 4, 9);
+    expect(e.gp2).toBeCloseTo(e.gl2 * cg * 4, 9);
+  });
+
+  test("each part that carries time closes a loop on its own", () => {
+    // A sea depends on t in three different shapes, and only one of them is the
+    // plain phase term the loop was built for. Checked apart so a regression
+    // says which: the ladder is sinusoids, the gust field is a noise translated
+    // downwind, and the groups are two slow beats travelling along the wind.
+    const parts = [
+      ["the component ladder", { chop: 0, patch: 0, group: 0 }],
+      ["the Gerstner warp", { chop: 0.7, patch: 0, group: 0 }],
+      ["the gust field", { chop: 0, patch: 0.85, group: 0 }],
+      ["the group beats", { chop: 0, patch: 0, group: 0.9 }],
+      ["all of it at once", { chop: 0.6, patch: 0.7, group: 0.8 }],
+    ];
+    for (const [, over] of parts) {
+      for (const T of [8, 12, 25.5]) {
+        const at = (t) => {
+          const S = scene([sea(over)], { t, loopPhase: T });
+          const out = [];
+          for (let i = 0; i < 9; i++) for (let j = 0; j < 9; j++) {
+            const [gx, gy] = at2(S, i / 8, j / 8);
+            const [hx, hy] = slopeAt(gx, gy, S);
+            out.push(heightAt(gx, gy, S), hx, hy);
+          }
+          return out;
+        };
+        const a = at(0), b = at(T), c = at(3 * T);
+        const worst = (p, q) => Math.max(...p.map((v, i) => Math.abs(v - q[i])));
+        expect(worst(a, b)).toBeLessThan(1e-12);
+        // periodic, not merely arranged to agree at one instant
+        expect(worst(a, c)).toBeLessThan(1e-11);
+      }
+    }
+  });
+
+  test("with no loop asked for the sea is bit-for-bit what it was", () => {
+    // the loop threads through the phase of every component and both envelopes,
+    // so getting this wrong changes every scene that never asked for a loop
+    for (const t of [0, 0.37, 4.2, 17.15]) {
+      const none = scene([sea({ chop: 0.6, patch: 0.7, group: 0.8 })], { t })._ems[0];
+      for (const off of [undefined, 0, null, false]) {
+        const e = scene([sea({ chop: 0.6, patch: 0.7, group: 0.8 })],
+          { t, loopPhase: off })._ems[0];
+        expect(e.PH).toEqual(none.PH);
+        expect([e.nou, e.gp1, e.gp2]).toEqual([none.nou, none.gp1, none.gp2]);
+      }
+    }
+  });
+
+  test("a loop leaves the gust patches where they are rather than racing them", () => {
+    // A gust field crosses a fraction of a period in a normal clip, so the
+    // rounding that closes the loop takes it to a standstill — which is the
+    // intended trade, and the reason it is not held to a whole turn the way a
+    // wave train is. What must not happen is the patches being sent a whole
+    // period across the frame to satisfy the loop.
+    const em = sea({ patch: 0.85, chop: 0, group: 0 });
+    const free = scene([em], { t: 12 })._ems[0];
+    const looped = scene([em], { t: 12, loopPhase: 12 })._ems[0];
+    // its natural travel over the loop is well under one period...
+    expect(Math.abs(free.nou)).toBeLessThan(NOISE_PERIOD / 2);
+    // ...so the loop holds it still, rather than rounding it up to a full one
+    // (abs because the rounding keeps the drift's sign, giving -0 downwind)
+    expect(Math.abs(looped.nou)).toBe(0);
   });
 
   test("patch and group envelopes travel with the clock", () => {
@@ -298,4 +368,36 @@ describe("the water moods", () => {
     expect(SEA_N_DEFAULT).toBeGreaterThanOrEqual(12);
     expect(SEA_N_DEFAULT).toBeLessThanOrEqual(96);
   });
+});
+
+/* ------------------------------------------------------------------ *
+ * The loop, all the way through the tracer
+ *
+ * The field closing is the property that matters, but it is not the property
+ * the viewer sees — what they see is the traced, contoured picture. Main held
+ * its own loop work to that standard on GRAZING_RIPPLES; a sea earns the same
+ * check, since it is the emitter with parts that do not close for free.
+ * ------------------------------------------------------------------ */
+describe("a sea scene's drawn picture closes, not only its field", () => {
+  test("the last frame of a loop traces byte-identically to the first", () => {
+    const m = WATER_MOODS.find((w) => w.name === "Fresh breeze");
+    const T = 12;
+    // the saved scene's camera and painted sky, with a sea in front of it
+    const draw = (t, loopPhase) => {
+      const g = buildScene({ ...GRAZING_RIPPLES, emitters: m.emitters,
+        wavelength: m.wavelength, strength: m.strength, sharp: m.sharp,
+        spread: m.spread, quality: 60, dispersion: true });
+      const S = { ...g.S, t, loopPhase };
+      // the field spec samples the scene being drawn, so it has to be rebuilt
+      // against this S rather than reused from the one buildScene made
+      const spec = { ...g.fieldSpec, scalarAt: (gx, gy) =>
+        (Math.asin(Math.max(-1, Math.min(1, reflectAt(gx, gy, S)[2]))) * 180) / Math.PI };
+      const L = RASTER_LEVELS[0];
+      return buildSolid3D(S, spec, { gN: L.gN, BW: L.BW })
+        .layers.map((l) => l.d).join("|");
+    };
+    expect(draw(T, T)).toBe(draw(0, T));
+    // and without the loop the same frame is a different picture
+    expect(draw(T, 0)).not.toBe(draw(0, 0));
+  }, 600000);
 });

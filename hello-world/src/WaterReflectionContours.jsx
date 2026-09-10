@@ -26,6 +26,7 @@ import {
   VIDEO_FPS, VIDEO_MIN_SEC, VIDEO_MAX_SEC, VIDEO_DEFAULT_SEC,
   VIDEO_SCALES, VIDEO_DEFAULT_SCALE, videoSize, framePlan,
   videoSupported, encodeMp4, formatDuration, etaSeconds, PHASE_PER_SEC,
+  VIDEO_LOOP_DEFAULT_PHASE, loopSeconds, loopPhaseRange,
 } from "./videoExport";
 
 /* ------------------------------------------------------------------ *
@@ -88,6 +89,84 @@ const DISPERSION_DEFAULT = true;
 // Angular frequency of a component of wavenumber kk under the scene's rule.
 function omegaAt(kk, S) {
   return S.dispersion ? S.omega * Math.sqrt(kk / S.k) : S.omega;
+}
+
+// A clip that loops: every train back where it started, at the same instant.
+//
+// Time reaches this field in exactly one shape — a phase term -omega*t inside
+// a sine, one per component — so the whole surface is a finite sum of
+// sinusoids in t, and it is periodic only if every one of those frequencies
+// shares a period. It does not: with dispersion on omega goes as sqrt(k), and
+// the square roots of a jittered ladder of wavelengths are never commensurate.
+// So the last frame of an export lands on a picture unrelated to the first,
+// and the clip pops on repeat.
+//
+// The fix is to make them commensurate: over a loop of T phase units, round
+// each component's frequency to the nearest whole number of cycles in T.
+//
+//     omega -> round(omega*T / 2pi) * 2pi/T
+//
+// What that costs is bounded and it is all tempo. Every wavenumber, heading,
+// amplitude, decay, ring center and random seed is untouched, so the picture
+// at t = 0 is the one the scene already had, to the bit — the snap scales the
+// phase term, and at t = 0 there is no phase term. What moves is *when* a
+// crest arrives: a train completing n cycles in the loop has its frequency
+// shifted by at most 1/(2n), so the error is worst on the slowest train and
+// falls away as the loop lengthens. `loopFit` measures it for a given scene.
+//
+// A train that was already frozen (`rate` 0) stays frozen. One too slow to
+// finish half a cycle in the loop is held at one cycle rather than rounded to
+// none: a single train stopping dead while the rest of the water moves reads
+// as a broken renderer, where a swell running fast reads as a fast swell.
+//
+// Off — no loop asked for — the frequency passes through untouched, and every
+// caller below is arranged so the arithmetic is the arithmetic it always was.
+function loopOmega(om, S) {
+  const T = S.loopPhase;
+  if (!T || !om) return om;
+  const n = Math.round(Math.abs(om * T) / (2 * Math.PI));
+  return (Math.sign(om) * Math.max(1, n) * 2 * Math.PI) / T;
+}
+
+// What a loop of `T` phase units would cost this scene, measured off the baked
+// field rather than restated from the formula above: bake the emitters at two
+// instants one unit of clock apart with no loop on, read each component's
+// frequency off the phase it advanced, and report the worst snap. Measuring
+// the field is what keeps this honest if an emitter type ever changes how it
+// derives its frequency — the reading follows, where a second copy of the
+// formula would quietly drift.
+//
+// Returns the component count, the slowest frequency in the scene, and `worst`
+// — the largest relative frequency shift the loop imposes, as a fraction.
+function loopFit(S, T) {
+  const a = prepField({ ...S, t: 0, loopPhase: 0 });
+  const b = prepField({ ...S, t: 1, loopPhase: 0 });
+  const oms = [];
+  a._ems.forEach((e, i) => {
+    const B = b._ems[i];
+    if (e.type === "point") oms.push(B.wt - e.wt);
+    else if (e.type === "swell") oms.push(e.ph0 - B.ph0);
+    else if (e.type === "rings") for (let j = 0; j < e.M; j++) oms.push(e.PH[j] - B.PH[j]);
+    else if (e.type === "spectrum") for (let j = 0; j < e.N; j++) oms.push(e.PH[j] - B.PH[j]);
+    else if (e.type === "sea") {
+      for (let j = 0; j < e.N; j++) oms.push(e.PH[j] - B.PH[j]);
+      // its group envelope is a pair of slow trains and gets rounded like any
+      // other, so it belongs in the reading. The gust drift does not: it is
+      // allowed to round to a standstill (see prepSea), and counting a
+      // standstill as a frequency error would swamp a figure that is about how
+      // far the *waves* were moved.
+      oms.push(B.gp1 - e.gp1, B.gp2 - e.gp2);
+    }
+    // a wake carries no phase term at all: it is already the same every frame
+  });
+  const live = oms.map(Math.abs).filter((o) => o > 1e-12);
+  if (!live.length || !(T > 0)) return { components: live.length, slowest: 0, worst: 0 };
+  let worst = 0;
+  for (const om of live) {
+    const n = (om * T) / (2 * Math.PI);
+    worst = Math.max(worst, Math.abs(Math.max(1, Math.round(n)) - n) / n);
+  }
+  return { components: live.length, slowest: Math.min(...live), worst };
 }
 
 // What the rule does to one emitter, in the terms the panel talks in: a train
@@ -220,36 +299,52 @@ const RIPPLE_EPS = 1 / 8;   // in wavelengths
 // Deterministic from position alone — no state, no seeding — which is what
 // lets the preview, the worker, the PNG and the video all see the same
 // patches on the same water.
-function vhash(ix, iy) {
-  const x = Math.sin(ix * 127.1 + iy * 311.7) * 43758.5453;
+// The lattice wraps along x with this many cells, always — see fbm below for
+// why it wraps at all. Wide against the few cells a frame spans, so the repeat
+// is off the edge of any picture rather than a pattern in it.
+const NOISE_PERIOD = 16;
+function vhash(ix, iy, per) {
+  const wx = ((ix % per) + per) % per;
+  const x = Math.sin(wx * 127.1 + iy * 311.7) * 43758.5453;
   return x - Math.floor(x);
 }
 // writes [value, d/dx, d/dy]; value is in 0..1
 const VN_OUT = [0, 0, 0];
-function vnoise(x, y, out) {
+function vnoise(x, y, per, out) {
   const ix = Math.floor(x), iy = Math.floor(y);
   const fx = x - ix, fy = y - iy;
   const sx = fx * fx * (3 - 2 * fx), sy = fy * fy * (3 - 2 * fy);
   const dsx = 6 * fx * (1 - fx), dsy = 6 * fy * (1 - fy);
-  const a = vhash(ix, iy), b = vhash(ix + 1, iy);
-  const c = vhash(ix, iy + 1), d = vhash(ix + 1, iy + 1);
+  const a = vhash(ix, iy, per), b = vhash(ix + 1, iy, per);
+  const c = vhash(ix, iy + 1, per), d = vhash(ix + 1, iy + 1, per);
   const u = b - a, v = c - a, w = a - b - c + d;
   out[0] = a + u * sx + v * sy + w * sx * sy;
   out[1] = (u + w * sy) * dsx;
   out[2] = (v + w * sx) * dsy;
 }
-// three octaves of it, still with the gradient
+// Three octaves of it, still with the gradient — and periodic in x with period
+// NOISE_PERIOD. That periodicity is what makes a *drifting* gust field able to
+// close a loop at all: the waves under it are sinusoids and can have their
+// frequencies snapped, but a plain infinite noise translated along the wind
+// never returns to where it started, however the speed is chosen. Give it a
+// spatial period and the drift only has to cover a whole number of them.
+//
+// So the octaves step by exactly 2 rather than by 2.03: the wrap has to land on
+// a lattice cell at every octave, which needs per*f to stay a whole number.
+// The per-octave offsets keep the octaves from lining up on that lattice, and
+// being fractional they do not disturb the wrap — shifting a coordinate does
+// not change the period it repeats with.
 const FBM_OUT = [0, 0, 0];
 function fbm(x, y, out) {
   let v = 0, gx = 0, gy = 0, amp = 1, norm = 0, f = 1;
   let px = x, py = y;
   for (let o = 0; o < 3; o++) {
-    vnoise(px, py, VN_OUT);
+    vnoise(px, py, NOISE_PERIOD * f, VN_OUT);
     v += amp * VN_OUT[0];
     gx += amp * f * VN_OUT[1];
     gy += amp * f * VN_OUT[2];
     norm += amp;
-    amp *= 0.5; f *= 2.03;
+    amp *= 0.5; f *= 2;
     px = x * f + 7.1 * (o + 1); py = y * f + 3.7 * (o + 1);
   }
   out[0] = v / norm; out[1] = gx / norm; out[2] = gy / norm;
@@ -491,7 +586,7 @@ const SEA_PATCH_MIN_LAM = 3;
 // Groups are a property of the wave train itself, so these stay in wavelengths.
 const SEA_GROUP_L1 = 6.5, SEA_GROUP_L2 = 10.7;
 
-function prepSea(em, S, A, t) {
+function prepSea(em, S, A, t, phase, rate) {
   const lamP = (2 * Math.PI / S.k) * em.size;      // the dominant wavelength
   const kp = 2 * Math.PI / lamP;
   const N = Math.max(12, Math.min(96, (em.detail | 0) || SEA_N_DEFAULT));
@@ -531,7 +626,7 @@ function prepSea(em, S, A, t) {
     // wavelength instead of measuring itself against an arbitrary k = 1
     const om = omegaAt(k, S);
     K.push(k); DX.push(Math.cos(th)); DY.push(Math.sin(th)); AMP.push(a);
-    PH.push(rand1(i * 2 + 2) * Math.PI * 2 - om * t);
+    PH.push(rand1(i * 2 + 2) * Math.PI * 2 - phase(om));
     AA.push(aaCoef(k, S));
     slopeVar += (a * k) * (a * k);
   }
@@ -550,7 +645,36 @@ function prepSea(em, S, A, t) {
   const wx = Math.cos(wind), wy = Math.sin(wind);
   const ns = 1 / Math.max(SEA_PATCH_MIN_LAM * lamP,
     SEA_PATCH_FRAC * Math.max(S.xMax - S.xMin, S.yMax - S.yMin));
-  const nox = -wx * 0.5 * cp * t * ns, noy = -wy * 0.5 * cp * t * ns;
+  // How far the gust field has blown downwind by now, in lattice cells. The
+  // noise is sampled in the wind's own frame (u downwind, v across), so this
+  // translation is the whole of what time does to it, and the field is periodic
+  // in u — which is what lets a loop close at all, since a translated noise
+  // cannot otherwise return to where it started however the speed is picked.
+  //
+  // Counted as an angle, one turn to one spatial period, so closing the loop is
+  // the same rounding every train gets. One difference, and it is deliberate: a
+  // whole turn is not forced. loopOmega holds a train to at least one cycle
+  // because a train stopped dead among moving water reads as a broken renderer
+  // — but a gust field crosses only a fraction of a period in a normal clip, so
+  // rounding that up would send the patches racing across the frame. Rounded to
+  // none they stand still for the loop, which reads as still air over water
+  // that is still moving.
+  const omGust = (Math.PI * cp * ns) / NOISE_PERIOD;   // 2pi * (0.5 * cp * ns) / period
+  let gustAng = omGust * t;
+  if (S.loopPhase) {
+    const o = omGust * rate;
+    const n = Math.round(Math.abs(o * S.loopPhase) / (2 * Math.PI));
+    gustAng = ((Math.sign(o) * n * 2 * Math.PI) / S.loopPhase) * S.t;
+  }
+  const nou = -(gustAng / (2 * Math.PI)) * NOISE_PERIOD;
+  // Groups: two beats along the wind, each carried at the group speed. They get
+  // a phase term apiece rather than one shared translation of the position,
+  // because a loop has to round each frequency on its own and one translation
+  // cannot serve two. With no loop this is the same arithmetic as translating
+  // was, and the two are different wavelengths, so travelling at slightly
+  // different speeds is if anything the more honest reading of them.
+  const gl1 = (2 * Math.PI) / (SEA_GROUP_L1 * lamP);
+  const gl2 = (2 * Math.PI) / (SEA_GROUP_L2 * lamP);
   // The remap window that turns the noise into patches: raising patchiness
   // slides it up (more of the water falls in the glassy tail) and narrows it
   // (the edge of a gust patch gets more definite).
@@ -564,10 +688,8 @@ function prepSea(em, S, A, t) {
   // steepened the water instead of opening glass in it. This way the control
   // means what it says: how much of the water the wind has left alone.
   return { type: "sea", K, DX, DY, AMP, PH, AA, N, chop,
-    patch, group, ns, nox, noy, lo, hi,
-    wx, wy, gcg: 0.5 * cp * t,
-    gl1: (2 * Math.PI) / (SEA_GROUP_L1 * lamP),
-    gl2: (2 * Math.PI) / (SEA_GROUP_L2 * lamP) };
+    patch, group, ns, nou, lo, hi, wx, wy, gl1, gl2,
+    gp1: phase(gl1 * 0.5 * cp), gp2: phase(gl2 * 0.5 * cp) };
 }
 
 // Evaluate one prepped sea at a ground point into SEA_OUT — the height, and
@@ -597,21 +719,27 @@ function seaAt(e, gx, gy, slope) {
   // gust patches: 1 where the wind is on this water, 1−patch where it is not
   let M = 1, Mx = 0, My = 0;
   if (e.patch > 0) {
-    fbm(gx * e.ns + e.nox, gy * e.ns + e.noy, FBM_OUT);
+    // sampled in the wind's frame: u downwind (the axis the field drifts along
+    // and repeats in), v across it
+    const u = (gx * e.wx + gy * e.wy) * e.ns + e.nou;
+    const v = (gy * e.wx - gx * e.wy) * e.ns;
+    fbm(u, v, FBM_OUT);
     const w = 1 / (e.hi - e.lo), tt = (FBM_OUT[0] - e.lo) * w;
     M = 1 - e.patch + e.patch * smoothstep01(tt);
+    // back out of that frame for the gradient
     const c = e.patch * dsmoothstep01(tt) * w * e.ns;
-    Mx = c * FBM_OUT[1]; My = c * FBM_OUT[2];
+    Mx = c * (FBM_OUT[1] * e.wx - FBM_OUT[2] * e.wy);
+    My = c * (FBM_OUT[1] * e.wy + FBM_OUT[2] * e.wx);
   }
   // groups on the long ones: two incommensurate beats along the wind, riding
   // downwind at the group speed, so sets roll through instead of standing still
   let G = 1, Gx = 0, Gy = 0;
   if (e.group > 0) {
-    const p = gx * e.wx + gy * e.wy - e.gcg;
-    const s1 = Math.sin(e.gl1 * p + 0.7), s2 = Math.sin(e.gl2 * p + 2.1);
+    const p = gx * e.wx + gy * e.wy;
+    const a1 = e.gl1 * p - e.gp1 + 0.7, a2 = e.gl2 * p - e.gp2 + 2.1;
+    const s1 = Math.sin(a1), s2 = Math.sin(a2);
     const beat = 0.5 + 0.5 * s1 * s2;
-    const dbeat = 0.5 * (e.gl1 * Math.cos(e.gl1 * p + 0.7) * s2
-      + e.gl2 * Math.cos(e.gl2 * p + 2.1) * s1);
+    const dbeat = 0.5 * (e.gl1 * Math.cos(a1) * s2 + e.gl2 * Math.cos(a2) * s1);
     G = 1 - e.group + e.group * (0.35 + 1.3 * beat);
     const c = e.group * 1.3 * dbeat;
     Gx = c * e.wx; Gy = c * e.wy;
@@ -686,6 +814,14 @@ function prepEmitter(em, S) {
   const t = S.t * rate;
   const q = S.sharp || 0;   // Stokes-style crest sharpening, 2nd harmonic weight
 
+  // How far one component of this train has turned by now. With no loop asked
+  // for that is the frequency against the geared clock, exactly as it has
+  // always been computed. With one, the gearing is folded into the frequency
+  // *before* it is snapped — what a loop has to land on is the rate the field
+  // actually turns at, not the rate before the trim — and the snapped
+  // frequency then runs against the scene's own clock.
+  const phase = (om) => (S.loopPhase ? loopOmega(om * rate, S) * S.t : om * t);
+
   if (em.type === "point") {
     // em.decay overrides the global reach — used by the buoy's scattered
     // ripples, which should stay local to the hull
@@ -693,15 +829,15 @@ function prepEmitter(em, S) {
     const k0 = 2 * Math.PI / baseLambda;
     // the ring expands at this train's own phase speed omega/k, not the
     // clock's — a wide ripple spreads faster than a tight one
-    return { type: "point", x: em.x, y: em.y, k0, A, decay, wt: omegaAt(k0, S) * t,
+    return { type: "point", x: em.x, y: em.y, k0, A, decay, wt: phase(omegaAt(k0, S)),
       e2: Math.pow(RIPPLE_EPS * baseLambda, 2) };
   }
-  if (em.type === "sea") return prepSea(em, S, A, t);
+  if (em.type === "sea") return prepSea(em, S, A, t, phase, rate);
   if (em.type === "swell") {
     const a = (em.dir * Math.PI) / 180;
     const k0 = 2 * Math.PI / baseLambda;
     return { type: "swell", k0, Dx: Math.cos(a), Dy: Math.sin(a), A,
-      ph0: -omegaAt(k0, S) * t, q, aa: aaCoef(k0, S) };
+      ph0: -phase(omegaAt(k0, S)), q, aa: aaCoef(k0, S) };
   }
   if (em.type === "wake") {
     // λ₀ is the vessel's length, read straight off the control in scene units
@@ -746,7 +882,7 @@ function prepEmitter(em, S) {
       AMP.push(A * (0.6 + 0.7 * rand1(i * 7 + 3)));
       // each source spreads at the rate its own wavelength earns it, so a
       // varied field stops pulsing in unison the moment the rule is on
-      PH.push(rand1(i * 11 + 4) * Math.PI * 2 - omegaAt(ki, S) * t);
+      PH.push(rand1(i * 11 + 4) * Math.PI * 2 - phase(omegaAt(ki, S)));
       E2.push(Math.pow(RIPPLE_EPS * lam, 2));    // rounds off the cone tip
     }
     return { type: "rings", M, CX, CY, K, AMP, PH, E2, dec };
@@ -780,7 +916,7 @@ function prepEmitter(em, S) {
     // longer waves carry more energy; 1/√N so the count resolves the field
     // rather than fading it (see SPECTRUM_N_REF)
     AMP.push(A * (lam / baseLambda) * 1.5 / Math.sqrt(SPECTRUM_N_REF * N));
-    PH.push(rand1(i * 2 + 2) * Math.PI * 2 - om * t);
+    PH.push(rand1(i * 2 + 2) * Math.PI * 2 - phase(om));
     AA.push(aaCoef(ki, S));
   }
   return { type: "spectrum", K, DX, DY, AMP, PH, AA, N, q };
@@ -1280,7 +1416,7 @@ function buildBuoy(S, fit, obj) {
       const a = (i / N) * Math.PI * 2;
       const py = my + mry * Math.sin(a);
       const px = mx + mrx * Math.cos(a)
-        + wAmp * Math.sin(((py - my) / wLen) * Math.PI * 2 + S.t * 1.7 + 1.3);
+        + wAmp * Math.sin(((py - my) / wLen) * Math.PI * 2 + loopOmega(1.7, S) * S.t + 1.3);
       d += (i === 0 ? "M" : "L") + px.toFixed(1) + " " + py.toFixed(1) + " ";
     }
     reflD = d + "Z";
@@ -2569,6 +2705,51 @@ const RASTER_LEVELS = [
 ];
 const RASTER_DEFAULT = 1;   // "normal"
 
+// Antialiasing: how much of the raster's own grid to take off the edges,
+// before the regions are cut, on whatever raster the picture is being drawn at.
+//
+// A region boundary is a curve through one marching-squares crossing per raster
+// pixel. Wherever the reflection varies faster than a pixel — which is the far
+// half of any grazing frame, where one pixel spans several wavelengths — the
+// field beats against that grid and the traced edge zigzags at pixel scale:
+// staircases along a crest, slivers either side of a seam, one-pixel specks.
+// Raising "3D surface detail" makes each stair smaller but never removes one,
+// and at the top step there is nothing left to raise.
+//
+// So this is the same operator the SVG's edge polish uses (smoothField), moved
+// in front of the preview rather than kept for the way out: it smooths the
+// FIELD, before the topology is decided, which is the only place a jagged
+// contour can be reached at all (a filter on the traced path cannot — Chaikin
+// already converges to that polyline's spline).
+//
+// The passes are counted in RASTER pixels and deliberately do not scale with
+// the raster: a pass is a 3-tap box blur each way, so N of them is sigma =
+// sqrt(2N/3) pixels of the very grid whose aliasing this is, and one setting
+// therefore means one thing — "blur out the grid" — at draft and at max alike.
+// What the raster changes is the price. At max a pixel sits far below any real
+// feature and the blur costs almost nothing visible; at draft a bright ribbon
+// IS a pixel or two wide, and it leaves with the aliasing. That is why this is
+// off by default, and why even the top step is a handful of passes.
+//
+// The steps were picked by rendering the saved grazing-ripples scene at max and
+// looking at the far third of the frame. One pass is the smallest kernel there
+// is (sigma 0.82px) and already takes the staircase off the region boundaries
+// while a filament one raster pixel wide survives, dotted, as it was. Three
+// straightens the boundaries properly and costs that filament. Six is a poster
+// setting: very clean, and the small bright glints are gone.
+const ANTIALIAS = [
+  { name: "off",    passes: 0 },
+  { name: "light",  passes: 1 },
+  { name: "medium", passes: 3 },
+  { name: "strong", passes: 6 },
+];
+// Off, so that every scene saved before this existed — and every new one until
+// it is asked for — keeps exactly the edges it had. There is no legacy entry on
+// `useUrlSync` for the same reason: the default already is the old behaviour.
+const ANTIALIAS_DEFAULT = 0;
+const antialiasAt = (q) =>
+  ANTIALIAS[Math.max(0, Math.min(ANTIALIAS.length - 1, Math.round(q) || 0))];
+
 // Export detail: the raster the *exported* SVG is traced on, as a multiple of
 // the preview's.
 //
@@ -2621,6 +2802,11 @@ const EXPORT_MESH_FLOOR = 110;   // "draft"'s mesh: the coarsest that still hold
 // Light is the default because at export width it takes the aliasing and little
 // else; strong is for a still that has to hold up very large, at the price of
 // the thinnest ribbons.
+//
+// Same operator as ANTIALIAS above, and the two ADD: the scene's antialiasing
+// is part of the picture on screen, so the file carries it and this is the
+// extra the file asks for on top. That is also why an export is only worth a
+// retrace when the total exceeds what the preview already ran.
 const EXPORT_POLISH = [
   { name: "off",    passes: 0 },
   { name: "light",  passes: 3 },
@@ -2632,6 +2818,19 @@ function exportRaster(level, mult, meshF = 1) {
     gN: Math.max(Math.min(level.gN, EXPORT_MESH_FLOOR), Math.round(level.gN * meshF)),
     BW: Math.min(EXPORT_MAX_BW, Math.round(level.BW * mult)),
   };
+}
+
+// How many polish passes each output runs, from the scene's antialiasing and
+// the SVG's own edge-polish step. In one place because these have to agree:
+// the preview is the picture, the PNG, the video frames and the paper stack are
+// that same picture in another medium, and only the SVG adds anything — so an
+// output that quietly picked a different number would be a file that does not
+// match what was on screen. `retrace` says whether the SVG's total is more than
+// the preview already ran, which is the only reason to pay for one.
+function polishPlan(aaPasses, exportPasses) {
+  const svg = aaPasses + exportPasses;
+  return { preview: aaPasses, png: aaPasses, paper: aaPasses, svg,
+           retrace: svg > aaPasses };
 }
 
 // ---- PNG export ---------------------------------------------------
@@ -2647,11 +2846,15 @@ function exportRaster(level, mult, meshF = 1) {
 //
 // A raster output has no such problem. There is no outline to wobble, only
 // pixels, and the ones along an edge get averaged by the rasterizer rather than
-// decided by it. So this path runs no polish and no mesh stand-down: it is the
-// preview's own geometry at print size. The one export step it does keep is the
-// width multiplier, which resolves the same picture finer rather than smoothing
-// it — and which the larger scales need, since a preview-raster stair is as
-// many output pixels tall as the scale makes it.
+// decided by it. So this path runs no EXPORT polish and no mesh stand-down: it
+// is the preview's own geometry at print size. The one export step it does keep
+// is the width multiplier, which resolves the same picture finer rather than
+// smoothing it — and which the larger scales need, since a preview-raster stair
+// is as many output pixels tall as the scale makes it.
+//
+// The scene's own antialiasing is a different thing and does come through: it
+// is not a step on the way out, it is part of the picture that was on screen,
+// and this file's whole job is to be that picture.
 const PNG_SCALES = [2, 3, 4, 6];
 const PNG_DEFAULT = 2;     // 4x — 3040 x 2000
 // Safari, on iOS especially, hands back a blank canvas past ~16.7M pixels
@@ -3278,15 +3481,16 @@ export {
   DERIVED_ENV_H, ENV2D_W, DEFAULT_EMITTERS,
   computeFit, cell2ground, heightAt, clampLift, penProject, reflectAt,
   withWakes, newWake, WAKE_ANGLE_DEG, prepField, slopeAt,
-  WATER_MOODS, SEA_N_DEFAULT, SPECTRUM_N_REF,
+  WATER_MOODS, SEA_N_DEFAULT, SPECTRUM_N_REF, NOISE_PERIOD,
   buildSurface3D, buildSurface3DPanorama, buildSolid3D, fieldSpecFor, crestField,
   buildPenLines, buildPenConcentric, buildPenHatch, HATCH_AIMS,
-  RASTER_LEVELS, RASTER_DEFAULT, EXPORT_MULTS, EXPORT_DEFAULT, EXPORT_MAX_BW,
-  EXPORT_MESHES, EXPORT_MESH_DEFAULT, EXPORT_MESH_FLOOR, exportRaster,
+  RASTER_LEVELS, RASTER_DEFAULT, ANTIALIAS, ANTIALIAS_DEFAULT, antialiasAt,
+  EXPORT_MULTS, EXPORT_DEFAULT, EXPORT_MAX_BW,
+  EXPORT_MESHES, EXPORT_MESH_DEFAULT, EXPORT_MESH_FLOOR, exportRaster, polishPlan,
   EXPORT_POLISH, EXPORT_POLISH_DEFAULT, smoothField,
   PNG_SCALES, PNG_DEFAULT, PNG_MAX_PIXELS, pngSize, sizedSvg, svgToPngBlob, svgToCanvas,
   SPEED_MIN, SPEED_MAX, EMITTER_RATE_DEFAULT,
-  DISPERSION_DEFAULT, omegaAt, dispersionFor,
+  DISPERSION_DEFAULT, omegaAt, dispersionFor, loopOmega, loopFit,
 };
 
 // ---- layered-paper stack export -----------------------------------
@@ -3446,9 +3650,17 @@ function buildPaperImage(S, fit, opts) {
           scalarAt, thresholds, cols,      // preset / 1D palettes: one scalar
           uvAt, rayAt, backdrop,           // painted panorama: reflected u,v
           gap = 0, gapColor,               // crest gaps, as in the SVG
+          polish = 0,                      // the scene's antialiasing, as in the SVG
           fresAt, fresBands, deepMix } = opts;
   const R = rasterizeSurface(S, fit, gN, BW, lift, gap);
   const { NP, cov } = R;
+  // Antialiasing, on the fields a pixel's color is read from rather than on the
+  // colors themselves — the same place and the same operator the contour path
+  // uses, which is what keeps a cut line on the edge the render draws. A blur
+  // of a color index would invent colors between two papers; a blur of the
+  // reflected coordinate, or of the banded scalar, only moves the boundary.
+  const paperScratch = polishScratch(NP, polish);
+  const paperPolish = (f) => { smoothField(f, cov, R.BW, R.BH, polish, paperScratch); return f; };
 
   const idOf = new Map(), palette = [];
   const idFor = (c) => {
@@ -3481,7 +3693,9 @@ function buildPaperImage(S, fit, opts) {
         if (uv) { su[q] = uv[0] * g.EW; sv[q] = uv[1] * g.EH; sh[q] = 1; }
       }
       meshBlur(R, su, coh, cbuf); meshBlur(R, sv, coh, cbuf);
-      return { fu: rasterField(R, su), fv: rasterField(R, sv),
+      // fh is a presence mask — whether this board is there at all — so it is
+      // left hard; blurring it would fade a board's own edge into the one behind
+      return { fu: paperPolish(rasterField(R, su)), fv: paperPolish(rasterField(R, sv)),
                fh: plane ? rasterField(R, sh) : null, g };
     }).reverse();
     colorOf = (p) => {
@@ -3494,7 +3708,7 @@ function buildPaperImage(S, fit, opts) {
       return backdrop.bg;
     };
   } else {
-    const fs = rasterField(R, meshBlur(R, gridSamples(R, scalarAt), coh, cbuf));
+    const fs = paperPolish(rasterField(R, meshBlur(R, gridSamples(R, scalarAt), coh, cbuf)));
     colorOf = (p) => {
       let k = 0;
       for (const t of thresholds) { if (fs[p] >= t) k++; else break; }
@@ -3502,7 +3716,7 @@ function buildPaperImage(S, fit, opts) {
     };
   }
   const fw = fresAt
-    ? rasterField(R, meshBlur(R, gridSamples(R, fresAt), coh, cbuf)) : null;
+    ? paperPolish(rasterField(R, meshBlur(R, gridSamples(R, fresAt), coh, cbuf))) : null;
 
   const grid = new Int32Array(NP);
   const counts = [];
@@ -4525,6 +4739,7 @@ export default function App() {
   const [manualTime, setManualTime] = useState(0); // scrub the wave phase when not animating
   const [lowPower, setLowPower] = useState(false);  // cap resolution + throttle animation
   const [rasterQ, setRasterQ] = useState(RASTER_DEFAULT); // 3D surface resolution step
+  const [antialiasQ, setAntialiasQ] = useState(ANTIALIAS_DEFAULT); // edge antialiasing step
   const [exportQ, setExportQ] = useState(EXPORT_DEFAULT);  // export raster, x preview
   const [exportMeshQ, setExportMeshQ] = useState(EXPORT_MESH_DEFAULT); // export mesh step
   const [exportPolishQ, setExportPolishQ] = useState(EXPORT_POLISH_DEFAULT); // export edge polish
@@ -4533,6 +4748,11 @@ export default function App() {
   const [pngBusy, setPngBusy] = useState(false);           // retrace + rasterize, same pause
   const [vidSec, setVidSec] = useState(VIDEO_DEFAULT_SEC); // video length, seconds
   const [vidQ, setVidQ] = useState(VIDEO_DEFAULT_SCALE);   // video frame size, x the SVG frame
+  // Perfect loop: make the field periodic over `vidLoopPhase` phase units and
+  // render exactly one period. Off by default, and off is the old export down
+  // to the arithmetic — see `loopOmega`.
+  const [vidLoop, setVidLoop] = useState(false);
+  const [vidLoopPhase, setVidLoopPhase] = useState(VIDEO_LOOP_DEFAULT_PHASE);
   const [vidBusy, setVidBusy] = useState(false);           // one frame at a time, for minutes
   const [vidProg, setVidProg] = useState(null);            // { done, total, startedAt }
   const [quality, setQuality] = useState(() =>
@@ -4766,10 +4986,12 @@ export default function App() {
     animate: [animate, setAnimate], speed: [speed, setSpeed],
     dispersion: [dispersion, setDispersion], quality: [quality, setQuality],
     manualTime: [manualTime, setManualTime], lowPower: [lowPower, setLowPower],
-    rasterQ: [rasterQ, setRasterQ], exportQ: [exportQ, setExportQ],
+    rasterQ: [rasterQ, setRasterQ], antialiasQ: [antialiasQ, setAntialiasQ],
+    exportQ: [exportQ, setExportQ],
     exportMeshQ: [exportMeshQ, setExportMeshQ],
     exportPolishQ: [exportPolishQ, setExportPolishQ], pngQ: [pngQ, setPngQ],
     vidSec: [vidSec, setVidSec], vidQ: [vidQ, setVidQ],
+    vidLoop: [vidLoop, setVidLoop], vidLoopPhase: [vidLoopPhase, setVidLoopPhase],
     advanced: [advanced, setAdvanced], emitters: [emitters, setEmitters],
     wakes: [wakes, setWakes],
     halfW: [halfW, setHalfW], yNear: [yNear, setYNear], yFar: [yFar, setYFar],
@@ -5034,6 +5256,17 @@ export default function App() {
   // low power pins the 3D pass to "draft" — the battery saver has the last word
   const rasterLevel = RASTER_LEVELS[
     Math.max(0, Math.min(RASTER_LEVELS.length - 1, lowPower ? 0 : rasterQ))];
+  // How much of that raster's own grid to blur off the edges before they are
+  // cut. Not capped by low power: the passes are a handful of blurs over the
+  // raster against a contour of every layer, so it is noise beside the pass it
+  // rides on — and draft, which low power pins to, is where the grid shows most.
+  const antialias = antialiasAt(antialiasQ);
+  const exportPolish = EXPORT_POLISH[
+    Math.max(0, Math.min(EXPORT_POLISH.length - 1, exportPolishQ))];
+  // ...and what each output does with it. Up here, above the preview raster,
+  // because the preview is the first thing that reads it.
+  const polish = useMemo(() => polishPlan(antialias.passes, exportPolish.passes),
+    [antialias, exportPolish]);
 
   // The half of the scene that has nothing to do with the waves: where the
   // camera is, how the picture is framed, and how the backdrop maps into it.
@@ -5302,8 +5535,14 @@ export default function App() {
   // Only the newest request waits: settings changed mid-build replace the
   // queued build instead of piling up behind it. Where there is no worker
   // (tests, a browser without them) the pass runs inline, as it always did.
+  //
+  // The antialiasing step rides here rather than on the way out: it is what is
+  // on screen, so it is what the video frames and the PNG carry too — all three
+  // build from this one raster — and what the SVG's own edge polish adds to.
   const solidRaster = useMemo(
-    () => ({ gN: rasterLevel.gN, BW: rasterLevel.BW, gap: crestGap }), [rasterLevel, crestGap]);
+    () => ({ gN: rasterLevel.gN, BW: rasterLevel.BW, gap: crestGap,
+             polish: polish.preview }),
+    [rasterLevel, crestGap, polish]);
   // undefined until mounted: not yet known whether there is a worker, so the
   // first paint builds nothing rather than one slow inline frame
   const [builder, setBuilder] = useState(undefined);
@@ -5404,8 +5643,13 @@ export default function App() {
   const buildSolidAt = (St, raster) => (builder
     ? builder.build(St, specOpts, raster)
     : Promise.resolve(buildSolid3D(St, makeFieldSpec(St), raster)));
-  const frameAt = async (t) => {
-    const St = { ...S, t };
+  // `loopPhase` is passed in rather than read off S because it is the video
+  // export's alone: the preview animates on the scene's true frequencies, and
+  // only the frames written to the file are snapped to close a loop. Frame 0
+  // is identical either way — the snap scales a phase term, and at t = 0 there
+  // is none — so the clip still starts on exactly the picture on screen.
+  const frameAt = async (t, loopPhase = 0) => {
+    const St = { ...S, t, loopPhase };
     if (penMode) {
       // pen mode has no filled regions at all: lines, the buoy, and paper
       return { ...liveFrame, penLines: makePenLines(St), buoy: makeBuoy(St) };
@@ -5537,16 +5781,17 @@ export default function App() {
   };
   const exportMult = EXPORT_MULTS[Math.max(0, Math.min(EXPORT_MULTS.length - 1, exportQ))];
   const exportMesh = EXPORT_MESHES[Math.max(0, Math.min(EXPORT_MESHES.length - 1, exportMeshQ))];
-  const exportPolish = EXPORT_POLISH[Math.max(0, Math.min(EXPORT_POLISH.length - 1, exportPolishQ))];
+  // The file carries the scene's antialiasing — it is the picture on screen —
+  // and the export's edge polish on top of it.
   const exportAt = solid3d
-    ? { ...exportRaster(rasterLevel, exportMult, exportMesh.f), polish: exportPolish.passes,
-        gap: crestGap }
+    ? { ...exportRaster(rasterLevel, exportMult, exportMesh.f),
+        polish: polish.svg, gap: crestGap }
     : null;
   // a retrace is only worth its seconds when it would actually differ from what
-  // is already on screen — a wider raster, a stood-down mesh, a polish pass the
-  // preview never runs, or any combination
+  // is already on screen — a wider raster, a stood-down mesh, polish passes
+  // beyond the ones the preview already ran, or any combination
   const exportRetrace = !!exportAt
-    && (exportAt.BW > rasterLevel.BW || exportAt.gN < rasterLevel.gN || exportAt.polish > 0);
+    && (exportAt.BW > rasterLevel.BW || exportAt.gN < rasterLevel.gN || polish.retrace);
   const downloadSVG = () => {
     if (exporting || pngBusy) return;
     if (!exportRetrace) { emitSvg(null); return; }
@@ -5566,13 +5811,17 @@ export default function App() {
   // PNG at `pngQ`: the preview's geometry, drawn by the browser at several
   // times the frame. It keeps the export's width multiplier — that step
   // resolves the same picture finer, and the bigger the output the more it is
-  // needed — and deliberately skips the mesh and polish steps, which change the
-  // picture to protect a vector edge this file does not have. Same pause as the
-  // SVG export when a retrace is involved, then one async rasterize.
+  // needed — and deliberately skips the mesh and edge-polish steps, which
+  // change the picture to protect a vector edge this file does not have. Same
+  // pause as the SVG export when a retrace is involved, then one async
+  // rasterize.
   const pngAt = pngSize(PNG_SCALES[Math.max(0, Math.min(PNG_SCALES.length - 1, pngQ))]);
   const pngRetrace = solid3d && exportMult > 1;
+  // the scene's own antialiasing comes along (it is part of the picture); the
+  // export's polish step does not
   const pngGeom = pngRetrace
-    ? { ...exportRaster(rasterLevel, exportMult), polish: 0, gap: crestGap } : null;
+    ? { ...exportRaster(rasterLevel, exportMult), polish: polish.png, gap: crestGap }
+    : null;
   const showPng = (blob, name) => {
     let url = null;
     try {
@@ -5616,7 +5865,18 @@ export default function App() {
   // never the frames still to come in this one.
   const vidAt = videoSize(VIDEO_SCALES[Math.max(0, Math.min(VIDEO_SCALES.length - 1, vidQ))],
     VB_W, VB_H);
-  const vidPlan = framePlan(vidSec, speed);
+  // The loop control is bounded by what the clip is allowed to be, so a loop
+  // once asked for is always one the file can actually hold; the stored value
+  // is left alone and clamped here, so moving Speed and moving it back gets
+  // the number the scene was saved with.
+  const loopRange = loopPhaseRange(speed);
+  const loopPhase = vidLoop
+    ? Math.min(loopRange.max, Math.max(loopRange.min, vidLoopPhase))
+    : 0;
+  const vidPlan = framePlan(vidSec, speed, VIDEO_FPS, loopPhase);
+  // what that loop costs this scene in tempo — measured, not predicted
+  const loopCost = useMemo(() => (loopPhase ? loopFit(waveS, loopPhase) : null),
+    [waveS, loopPhase]);
   const showVid = (blob, name, plan, out) => {
     let url = null;
     try {
@@ -5649,7 +5909,8 @@ export default function App() {
     try {
       const out = await encodeMp4({
         width: vidAt.w, height: vidAt.h, fps: plan.fps, count: plan.count,
-        renderFrame: async (i) => svgToCanvas(buildSvg(null, await frameAt(plan.phaseAt(i))),
+        renderFrame: async (i) => svgToCanvas(
+          buildSvg(null, await frameAt(plan.phaseAt(i), plan.loopPhase)),
           vidAt.w, vidAt.h, vidCanvasRef.current),
         onProgress: (done, total) => setVidProg({ done, total, startedAt }),
         cancelled: () => vidCancelRef.current,
@@ -5678,6 +5939,7 @@ export default function App() {
     const image = buildPaperImage(S, fit, {
       gN: rasterLevel.gN, BW: Math.min(rasterLevel.BW, PAPER_MAX_BW),
       lift: surface3d && perspective,      // the render's own 3D-solid rule
+      polish: polish.paper,                // and its antialiasing
       gap: solid3d ? crestGap : 0, gapColor: crestGapColor,
       bgColor: bgFill, fresBands, deepMix: mixDeep,
       ...fieldSpec,
@@ -5872,7 +6134,7 @@ export default function App() {
             <div style={{ position: "absolute", left: 12, bottom: 10, fontSize: 10.5,
               color: "#6d808f", fontFamily: "ui-monospace, monospace", letterSpacing: 0.5 }}>
               {penMode ? `${penStyle === "rings" ? "rings" : penStyle === "hatch" ? `hatch ${penHatchAngle}\u00b0\u00b1${penHatchSpread}\u00b0` : penCount + " lines"} · ${penLines.length} pens${S.perspective && penRelief > 0 ? " · 3D" : ""}${penHidden || penStyle === "hatch" ? " · hidden-line" : ""}`
-                : solid3d ? `${drawLayers.length + 1} regions · ${S.nx}×${S.ny} sample grid · 3D ${rasterLevel.name} ${rasterLevel.BW}px${rendering ? " · rendering…" : ""}`
+                : solid3d ? `${drawLayers.length + 1} regions · ${S.nx}×${S.ny} sample grid · 3D ${rasterLevel.name} ${rasterLevel.BW}px${antialias.passes ? ` · aa ${antialias.name}` : ""}${rendering ? " · rendering…" : ""}`
                 : `${regionCount} regions · ${S.nx}×${S.ny} sample grid${surface3d && perspective ? " · 3D" : ""}`}
             </div>
             <button onClick={() => setCamDrag((v) => !v)}
@@ -6634,6 +6896,33 @@ export default function App() {
                     + " cut lines get finer than paper and scissors care about."}
                   {lowPower && rasterQ > 0 && " Low power mode is holding this at draft."}
                 </div>
+                <Slider label="antialiasing" value={antialiasQ} min={0} max={ANTIALIAS.length - 1}
+                  step={1} onChange={setAntialiasQ}
+                  fmt={(v) => {
+                    const a = ANTIALIAS[v];
+                    return a.passes ? `${a.name} · ${a.passes} passes` : a.name;
+                  }} />
+                <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 10, lineHeight: 1.5,
+                  fontFamily: "ui-monospace, monospace" }}>
+                  Detail above sets how fine a stair is; this is what removes one. An edge is
+                  cut at one crossing per raster pixel, so out where the reflection turns over
+                  faster than a pixel the boundary zigzags against that grid — staircases along
+                  a far crest, slivers either side of a seam, specks a pixel across. This blurs
+                  the field first, before the shapes are decided, which is the only place a
+                  jagged contour can be reached: the bands stay parallel and a pinched-off
+                  speck leaves cleanly instead of as a stray ring.
+                  {" It is a smoothing pass, so it is not free — the thinnest bright ribbons"
+                    + " fatten and can break into dots, and the finer the raster the less of"
+                    + " that you pay. Light at " + RASTER_LEVELS[RASTER_LEVELS.length - 1].name
+                    + " costs almost nothing visible; at draft it will soften the picture"
+                    + " itself."}
+                  {solid3d
+                    ? " Everything built from what is on screen carries it: the preview, the"
+                      + " PNG, the video frames, the paper stack — and the SVG, whose own edge"
+                      + " polish adds to it."
+                    : " The 3D wave surface is off, so this only reaches the layered-paper"
+                      + " export, which is cut from the same kind of raster."}
+                </div>
               </div>
             )}
 
@@ -6783,14 +7072,18 @@ export default function App() {
                   }} />
                 <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5,
                   fontFamily: "ui-monospace, monospace" }}>
-                  Smooths the field the regions are cut from, just before they are cut. What is
-                  left on a far edge once the raster is as wide as it goes is the reflection
-                  varying faster than one pixel, and this is the step that reaches it — before
-                  the shapes are decided, so the bands stay parallel and a pinched-off speck
-                  leaves cleanly rather than as a stray ring. Light takes the crawl and little
-                  else. Strong goes further and starts to cost you the thinnest ribbons, which
-                  fatten or break into dots — worth it for a still that has to hold up very
-                  large, not much else.
+                  The same step as <b>antialiasing</b> under Range &amp; quality, and this is the
+                  extra the file gets on top of it: smoothing the field the regions are cut
+                  from, just before they are cut. What is left on a far edge once the raster is
+                  as wide as it goes is the reflection varying faster than one pixel, and this
+                  is what reaches it — before the shapes are decided, so the bands stay
+                  parallel and a pinched-off speck leaves cleanly rather than as a stray ring.
+                  Light takes the crawl and little else. Strong goes further and starts to cost
+                  you the thinnest ribbons, which fatten or break into dots — worth it for a
+                  still that has to hold up very large, not much else.
+                  {polish.preview > 0
+                    && ` This scene already antialiases at ${polish.preview}, so the file is`
+                       + ` traced at ${polish.svg}.`}
                 </div>
               </div>
             )}
@@ -6827,8 +7120,9 @@ export default function App() {
                   can hand you. The steps above smooth the vector outline so it survives
                   being magnified — edge polish especially, which blurs the field before
                   the regions are cut and takes the smallest glints and highlights with
-                  it. A raster has no outline to smooth, so the PNG runs neither polish
-                  nor the mesh stand-down: it draws the preview's own geometry{pngRetrace
+                  it. A raster has no outline to smooth, so the PNG runs neither that
+                  polish nor the mesh stand-down: it draws the preview's own geometry —
+                  antialiasing included, since that is part of what is on screen{pngRetrace
                     ? `, retraced at ${exportRaster(rasterLevel, exportMult).BW}px so the edges are resolved for a file this wide.`
                     : "."} Reach for it when the SVG loses something you can see on screen.
                 </>
@@ -6877,18 +7171,47 @@ export default function App() {
             )}
 
             <div style={{ marginTop: 14, marginBottom: 8 }}>
-              <Slider label="video length" value={vidSec} min={VIDEO_MIN_SEC} max={VIDEO_MAX_SEC}
-                step={0.5} onChange={setVidSec}
-                fmt={(v) => {
-                  const p = framePlan(v, speed);
-                  return `${p.seconds.toFixed(1)} s \u00b7 ${p.count} frames`;
-                }} />
+              {vidLoop ? (
+                <Slider label="loop length (phase)" value={loopPhase}
+                  min={loopRange.min} max={loopRange.max}
+                  step={0.1} onChange={setVidLoopPhase}
+                  fmt={(v) => `${v.toFixed(1)} \u00b7 ${loopSeconds(v, speed).toFixed(1)} s`} />
+              ) : (
+                <Slider label="video length" value={vidSec} min={VIDEO_MIN_SEC} max={VIDEO_MAX_SEC}
+                  step={0.5} onChange={setVidSec}
+                  fmt={(v) => {
+                    const p = framePlan(v, speed);
+                    return `${p.seconds.toFixed(1)} s \u00b7 ${p.count} frames`;
+                  }} />
+              )}
               <Slider label="video size" value={vidQ} min={0} max={VIDEO_SCALES.length - 1}
                 step={1} onChange={setVidQ}
                 fmt={(v) => {
                   const sz = videoSize(VIDEO_SCALES[v], VB_W, VB_H);
                   return `${sz.w} \u00d7 ${sz.h}`;
                 }} />
+              <Toggle label="Perfect loop" value={vidLoop} onChange={setVidLoop} />
+              <div style={{ fontSize: 10, color: "#6d808f", marginTop: -2, lineHeight: 1.5,
+                fontFamily: "ui-monospace, monospace" }}>
+                {vidLoop ? <>
+                  The clip is exactly one loop of {loopPhase.toFixed(1)} phase units, and the
+                  water is retuned to close it: every wave train is rounded to a whole number
+                  of cycles in that span, so the last frame runs back into the first with no
+                  jump. Sizes, headings and amplitudes are untouched — the first frame is the
+                  picture on screen — but the trains' tempos shift
+                  {loopCost ? <> by up to {(loopCost.worst * 100).toFixed(1)}% across
+                    the {loopCost.components} of them in this scene</> : null}, worst on the
+                  longest swell. Lengthen the loop, or raise Speed, and that falls away.
+                  {loopCost && loopCost.worst > 0.1 ? <span style={{ color: "#e0a37a" }}>
+                    {" "}Over 10%: this scene's slowest train barely turns inside the loop,
+                    so it will visibly run fast. A longer loop is the fix.</span> : null}
+                  {" "}The preview keeps the scene's true timing, so what this changes is
+                  only what is written to the file.
+                </> : <>
+                  Off, the file is the animation as it stands, which does not repeat: the last
+                  frame lands wherever the phase got to, and the clip pops when it loops.
+                </>}
+              </div>
             </div>
             <button onClick={exportVideo} disabled={vidBusy || pngBusy || exporting}
               title="Render the animation frame by frame and write it as an MP4"

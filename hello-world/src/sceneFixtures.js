@@ -447,6 +447,12 @@ export function buildScene(settings) {
     sharp: g.sharp,
     decay: 0.18 - g.spread * 0.16,
     omega: 1.0, t: g.manualTime,
+    // The video export's perfect-loop span, exactly as `frameAt` puts it on a
+    // frame's S: 0 is no loop, and no loop is the timing this renderer has
+    // always had. Here so a test can render the fixture through the loop the
+    // way the studio does — the field spec closes over this S, so a loop set
+    // on a copy afterwards would move the surface and leave the color behind.
+    loopPhase: g.loopPhase || 0,
     // Both fixtures were saved before "speed follows wavelength" existed, and
     // neither carries the key — so, exactly as the studio does with a link
     // that predates it, they render under the old timing and stay the
