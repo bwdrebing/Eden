@@ -611,17 +611,123 @@ function slopeAt(gx, gy, S) {
   return [hx, hy];
 }
 
+// The unit surface normal at a ground point: the wave slope, optionally
+// pitched toward the camera.
+//
+// `surfaceTilt` rotates the normal about the x-axis, from the water's own
+// up (0) to the camera's central axis (1) — the surface turned to face the
+// lens. It moves the NORMAL only, never the projection, which is the whole
+// point: cell2ground, rawProject, computeFit and every camera control go on
+// treating the water as the z = 0 plane, so the framing, the horizon and the
+// export path are untouched by it. Physically it is a cheat — the surface is
+// lit as though tilted while still being drawn flat — and it is the cheat
+// that lets "turn the water to face the camera" be a slider instead of a
+// second renderer.
+//
+// Worth knowing before reaching for it: for REFLECTION the tilt buys nothing
+// in detail (a mirror deflects the ray by exactly twice the normal tilt at
+// every incidence, so sensitivity is flat at 2.0). For REFRACTION it costs
+// detail — see refractAt.
+function normalAt(gx, gy, S) {
+  const [hx, hy] = slopeAt(gx, gy, S);
+  let nx = -hx, ny = -hy, nz = 1;
+  const nl = Math.hypot(nx, ny, nz); nx /= nl; ny /= nl; nz /= nl;
+  const tilt = S.surfaceTilt || 0;
+  if (tilt) {
+    const a = tilt * (Math.PI / 2 - S.pitch);   // 1 => normal along the view axis
+    const c = Math.cos(a), sn = Math.sin(a);
+    const ry = ny * c - nz * sn, rz = ny * sn + nz * c;
+    ny = ry; nz = rz;
+  }
+  return [nx, ny, nz];
+}
+
+// The unit view ray from the camera to a ground point.
+function viewAt(gx, gy, S) {
+  const vx = gx, vy = gy, vz = -S.H;
+  const vl = Math.hypot(vx, vy, vz);
+  return [vx / vl, vy / vl, vz / vl];
+}
+
 // full reflected direction (unit) — gives both elevation and azimuth.
 // 4th component = cos of the incidence angle (view ray vs surface normal),
 // which sets the Fresnel reflectance at this point.
 function reflectAt(gx, gy, S) {
-  const [hx, hy] = slopeAt(gx, gy, S);
-  let nx = -hx, ny = -hy, nz = 1;
-  const nl = Math.hypot(nx, ny, nz); nx /= nl; ny /= nl; nz /= nl;
-  let vx = gx, vy = gy, vz = -S.H;
-  const vl = Math.hypot(vx, vy, vz); vx /= vl; vy /= vl; vz /= vl;
+  const [nx, ny, nz] = normalAt(gx, gy, S);
+  const [vx, vy, vz] = viewAt(gx, gy, S);
   const d = vx * nx + vy * ny + vz * nz;
   return [vx - 2 * d * nx, vy - 2 * d * ny, vz - 2 * d * nz, -d];
+}
+
+// Air -> water refraction (Snell), the same shape of answer reflectAt gives:
+// a unit direction plus the incidence cosine, so it drops into every place
+// the reflected direction is sampled. The ray leaves DOWNWARD, into the
+// water, which is what puts the backdrop underneath the surface: the same
+// panorama, read at negative elevation.
+//
+// Two properties of this map decide how a refracted scene has to be set up,
+// and both are the opposite of the reflected case:
+//
+//   * It COMPRESSES elevation. Every transmitted ray lies inside Snell's
+//     window — within 48.6° of straight down — however grazing the view. So
+//     a refracted frame spans roughly 2.5x less elevation than the reflected
+//     one it replaces, and wants a correspondingly NARROWER eLo..eHi window —
+//     about 19° where the reflected scene used 39°. That is the window's job,
+//     not `reflMag`'s: the angular zoom saturates fast over a range this
+//     narrow, clipping the far field to one flat band. Azimuth is NOT
+//     compressed — refraction bends in the plane of incidence, so horizontal
+//     structure comes through at nearly full width.
+//
+//   * Its sensitivity RISES with incidence. A normal tilt of d deflects the
+//     transmitted ray by 0.25d looking straight down, but 0.94d at 87°
+//     grazing (against a flat 2.0d for reflection at any angle). Grazing
+//     water is therefore where refraction shows the MOST wavelet detail, not
+//     the least — the whole Snell cone swings with the surface. This is why
+//     `surfaceTilt` toward the camera makes a refracted scene flatter, and
+//     why it defaults to 0.
+const ETA_AW = 1 / 1.333;                        // air -> water
+function refractAt(gx, gy, S) {
+  const [nx, ny, nz] = normalAt(gx, gy, S);
+  const [vx, vy, vz] = viewAt(gx, gy, S);
+  // Entering the DENSER medium, so there is no total internal reflection:
+  // 1 - eta^2(1 - ci^2) is positive for every real incidence, and the only
+  // guard needed is the backfacing one below.
+  //
+  // At the grazing far field the view ray does run into the back of a
+  // wavelet — at 87° incidence anything sloping more than 3° away is turned
+  // from the camera — and there ci goes negative. Clamping it to 0 (the
+  // grazing limit, the critical-angle ray about that facet's normal) keeps
+  // the answer inside the transmitted family and continuous with its
+  // neighbours. Handing back the REFLECTED ray instead, as the obvious
+  // "can't refract this" fallback does, drops near-horizontal rays into a
+  // field that otherwise spans -56°..-38°: the far half of the frame fills
+  // with speckle that no amount of edge polish can take out, because it is
+  // in the field rather than in the raster.
+  let ci = -(vx * nx + vy * ny + vz * nz);
+  let ux = vx, uy = vy, uz = vz;
+  if (ci < 0) {
+    // Slide the ray down to the grazing limit IN the incidence plane rather
+    // than just clamping the cosine: Snell's formula below is an identity in
+    // ci = -(u . n), so clamping one side of it and not the other returns a
+    // vector that is neither unit-length nor inside the window. Dropping the
+    // backfacing component and renormalizing gives the true grazing ray, and
+    // hands the formula the ci it actually has.
+    const d = -ci;                                   // = v . n, positive here
+    ux = vx - d * nx; uy = vy - d * ny; uz = vz - d * nz;
+    const ul = Math.hypot(ux, uy, uz) || 1;
+    ux /= ul; uy /= ul; uz /= ul;
+    ci = 0;
+  }
+  const f = ETA_AW * ci - Math.sqrt(1 - ETA_AW * ETA_AW * (1 - ci * ci));
+  return [ETA_AW * ux + f * nx, ETA_AW * uy + f * ny, ETA_AW * uz + f * nz, ci];
+}
+
+// What the water shows at a ground point: the sky it mirrors, or the backdrop
+// beneath it seen through the surface. Every field the renderer contours goes
+// through here, so the mode reaches the preview, the 3D solid, the pen paths,
+// the video frames, the paper stack and the SVG export by construction.
+function surfaceDirAt(gx, gy, S) {
+  return S.refract ? refractAt(gx, gy, S) : reflectAt(gx, gy, S);
 }
 
 // Schlick Fresnel for water (R0 ≈ 0.02): the fraction of light NOT reflected
@@ -1861,7 +1967,7 @@ function fieldSpecFor(S, opts) {
   const mag = S.reflMag || 1;
   // occluded Fresnel: the deep-water weight at the front-most surface point,
   // contoured into the same bands the flat path clips with
-  const fresAt = fresOn ? (gx, gy) => fresnelDeepW(reflectAt(gx, gy, S)[3]) : null;
+  const fresAt = fresOn ? (gx, gy) => fresnelDeepW(surfaceDirAt(gx, gy, S)[3]) : null;
   const fresThresholds = fresOn ? d3.range(1, fresBands).map((k) => k / fresBands) : null;
   if (use2d) {
     // arbitrary backdrop colors have no single scalar to contour, so the
@@ -1876,16 +1982,16 @@ function fieldSpecFor(S, opts) {
     const place = makeSkyPlace({ eLo: S.eLo, eHi: S.eHi, azSpan, mag,
       EW: backdrop.EW, EH: backdrop.EH });
     const uvAt = (gx, gy) => {
-      const [phi, psi] = rayAngles(reflectAt(gx, gy, S));
+      const [phi, psi] = rayAngles(surfaceDirAt(gx, gy, S));
       return [place.col(place.clampAz(psi)), place.row(phi)];
     };
     // a flat standing at a distance needs the ray, not just where the sky
     // mapping sends it, so hand that through as well
-    const rayAt = (gx, gy) => reflectAt(gx, gy, S);
+    const rayAt = (gx, gy) => surfaceDirAt(gx, gy, S);
     return { uvAt, rayAt, backdrop, fresAt, fresThresholds };
   }
   const scalarAt = (gx, gy) =>
-    Math.asin(Math.max(-1, Math.min(1, reflectAt(gx, gy, S)[2]))) * 180 / Math.PI;
+    Math.asin(Math.max(-1, Math.min(1, surfaceDirAt(gx, gy, S)[2]))) * 180 / Math.PI;
   return { scalarAt, thresholds: bandThresholds(S, cols.length), cols, fresAt, fresThresholds };
 }
 
@@ -1900,7 +2006,7 @@ function elevationRange(S) {
   let lo = Infinity, hi = -Infinity;
   for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
     const [gx, gy] = cell2ground(i + 0.5, j + 0.5, S);
-    const v = Math.asin(Math.max(-1, Math.min(1, reflectAt(gx, gy, S)[2]))) * 180 / Math.PI;
+    const v = Math.asin(Math.max(-1, Math.min(1, surfaceDirAt(gx, gy, S)[2]))) * 180 / Math.PI;
     if (v < lo) lo = v; if (v > hi) hi = v;
   }
   return { lo, hi };
@@ -2670,7 +2776,7 @@ function buildGeometry(S) {
   for (let j = 0; j < ny; j++) {
     for (let i = 0; i < nx; i++) {
       const [gx, gy] = cell2ground(i + 0.5, j + 0.5, S);
-      const R = reflectAt(gx, gy, S);
+      const R = surfaceDirAt(gx, gy, S);
       const v = Math.asin(Math.max(-1, Math.min(1, R[2]))) * 180 / Math.PI;
       values[j * nx + i] = v;
       if (wVals) wVals[j * nx + i] = fresnelDeepW(R[3]);
@@ -2893,7 +2999,7 @@ function buildSegmentation(S, backdrop, azSpan) {
     for (let i = 0; i < nx; i++) {
       const p = j * nx + i;
       const [gx, gy] = cell2ground(i + 0.5, j + 0.5, S);
-      const R = reflectAt(gx, gy, S);
+      const R = surfaceDirAt(gx, gy, S);
       const [phi, psi0] = rayAngles(R);
       fF[p] = phi;
       fG[p] = place.clampAz(psi0);
@@ -3065,6 +3171,7 @@ export {
   paletteStops, paletteColorAt, PALETTES, BANDED_PALETTES,
   DERIVED_ENV_H, ENV2D_W, DEFAULT_EMITTERS,
   computeFit, cell2ground, heightAt, clampLift, penProject, reflectAt,
+  refractAt, surfaceDirAt, normalAt,
   withWakes, newWake, WAKE_ANGLE_DEG, prepField, slopeAt,
   buildSurface3D, buildSurface3DPanorama, buildSolid3D, fieldSpecFor, crestField,
   buildPenLines, buildPenConcentric, buildPenHatch, HATCH_AIMS,
@@ -4369,6 +4476,22 @@ export default function App() {
   const [objLight, setObjLight] = useState(325);    // light direction, degrees
   const [eLo, setELo] = useState(-5), [eHi, setEHi] = useState(33);
   const [autoFit, setAutoFit] = useState(false);
+  // Refraction: the backdrop moves UNDER the surface and the water is read
+  // through it rather than off it. `surfaceTilt` turns the surface toward the
+  // camera (0 = the water's own level, 1 = square to the lens).
+  const [refract, setRefract] = useState(false);
+  const [surfaceTilt, setSurfaceTilt] = useState(0);
+  // Switching between reflection and refraction moves the picture to a
+  // completely different part of the sphere — reflected rays go up and span
+  // roughly -5°..45° here, refracted ones all go down and live between about
+  // -57° and -38°. Carrying the old window across leaves the water reading one
+  // flat color, which looks like the mode is broken rather than mis-framed. So
+  // the switch takes the window with it, to a default that frames the new
+  // mode; auto-fit, if it is on, refines it on the next pass anyway.
+  const toggleRefract = (on) => {
+    setRefract(on);
+    if (on) { setELo(-58); setEHi(-36); } else { setELo(-5); setEHi(33); }
+  };
   const [penMode, setPenMode] = useState(false);
   const [penCount, setPenCount] = useState(48);   // number of scan lines
   const [penRelief, setPenRelief] = useState(45);  // 3D height exaggeration
@@ -4460,6 +4583,11 @@ export default function App() {
   const [activeColor, setActiveColor] = useState("#11324a");
   // draw the backdrop itself above the horizon, not only its reflection
   const [showBackdrop, setShowBackdrop] = useState(false);
+  // ...which only means anything while the backdrop is above the water. Under
+  // it there is nothing above the horizon to look straight at, so the whole
+  // feature — the drawn regions AND the reframing that makes room for them —
+  // stands down in refraction rather than drawing the seabed into the sky.
+  const skyVisible = showBackdrop && !refract;
   // Custom paint chits — extra swatches pinned by hand or lifted from a photo
   // palette. Session-lived (not serialized), deduped against the built-in
   // SWATCHES and each other so a chit stays easy to re-select all session.
@@ -4576,11 +4704,18 @@ export default function App() {
     brushShape: [brushShape, setBrushShape], bdoc: [docCode, restoreDoc],
     env2d: [null, restoreEnv2d],                 // read-only: pre-layers links
     showBackdrop: [showBackdrop, setShowBackdrop],
+    refract: [refract, setRefract], surfaceTilt: [surfaceTilt, setSurfaceTilt],
   }, {
     // A saved link that carries no `dispersion` was written before the rule
     // existed, and its author picked a frozen moment under the old timing.
     // Reopen it under the old timing.
     dispersion: false,
+    // Every scene saved before refraction existed is a reflected one, off a
+    // surface lying level. Both defaults already say so, but they are named
+    // here too: these are the values that reproduce such a link, and a later
+    // change to the defaults must not quietly re-render it.
+    refract: false,
+    surfaceTilt: 0,
   });
 
   // Switching modes must never destroy work. A pristine buffer picks up the
@@ -4840,14 +4975,15 @@ export default function App() {
     pitch: (pitchDeg * Math.PI) / 180,
     bands, perspective, eLo, eHi, zoom, panX, panY, smooth, coherence, rectOutput,
     surface3d, waveScale, bandFractions, fresOn, fresBands, reflMag,
+    refract, surfaceTilt,
     // showing the backdrop reframes the picture to include sky, so it belongs
     // here: every path that fits the water reads it from S. Pen mode draws no
     // backdrop, so it must not be reframed for one either.
-    skyPad: showBackdrop && !penMode ? SKY_PAD : 0,
+    skyPad: skyVisible && !penMode ? SKY_PAD : 0,
   }), [effQuality, steep, pitchDeg, bands, perspective,
        halfW, yNear, yFar, eLo, eHi, zoom, panX, panY, smooth, coherence, rectOutput,
        surface3d, waveScale, bandFractions, fresOn, fresBands, reflMag,
-       showBackdrop, penMode]);
+       refract, surfaceTilt, skyVisible, penMode]);
 
   // The scene minus the instant: everything about the water except what phase
   // the waves are at. Split out for the same reason camS was — something wants
@@ -4945,13 +5081,13 @@ export default function App() {
   // window or the painting moves. Painted backdrops go through their regions;
   // preset and 1D ones band a single scalar, exactly as the water does.
   const skyLayers = useMemo(() => {
-    if (!showBackdrop || penMode) return null;
+    if (!skyVisible || penMode) return null;
     const fit = computeFit(camS);
     if (use2d) return buildSkyRegions(camS, fit, backdrop, azSpan);
     const cols = mode === "paint1d" ? colors1d : presetColors;
     if (!cols || !cols.length) return null;
     return buildSkyBands(camS, fit, bandThresholds(camS, cols.length), cols);
-  }, [showBackdrop, penMode, use2d, backdrop, camS, azSpan, mode, colors1d, presetColors]);
+  }, [skyVisible, penMode, use2d, backdrop, camS, azSpan, mode, colors1d, presetColors]);
 
   // The flat builders draw the picture only in the flat modes. In 3D solid the
   // occluded raster pass (surf3d) replaces every one of their outputs, and pen
@@ -5017,7 +5153,7 @@ export default function App() {
       const { w: EW, h: EH, cells } = envEffective;
       const az = azSpan;
       colorAt = (gx, gy) => {
-        const R = reflectAt(gx, gy, S);
+        const R = surfaceDirAt(gx, gy, S);
         const phi = Math.asin(Math.max(-1, Math.min(1, R[2]))) * 180 / Math.PI;
         let psi = Math.atan2(R[0], R[1]) * 180 / Math.PI; psi = psi < -az ? -az : psi > az ? az : psi;
         let v = magFrac((phi - S.eLo) / ((S.eHi - S.eLo) || 1), mag); v = v < 0 ? 0 : v > 1 ? 1 : v;
@@ -5030,7 +5166,7 @@ export default function App() {
       const NB = cols.length;
       const fr = S.bandFractions;
       colorAt = (gx, gy) => {
-        const R = reflectAt(gx, gy, S);
+        const R = surfaceDirAt(gx, gy, S);
         const phi = Math.asin(Math.max(-1, Math.min(1, R[2]))) * 180 / Math.PI;
         let v = magFrac((phi - S.eLo) / ((S.eHi - S.eLo) || 1), mag); v = v < 0 ? 0 : v >= 1 ? 0.999999 : v;
         let c;
@@ -6058,12 +6194,53 @@ export default function App() {
                 most of why the elevation sliders read as unknowable. */}
             <div style={panel}>
               <div style={heading}>What the water sees</div>
+              <Toggle label="Refraction (backdrop under the water)" value={refract}
+                onChange={toggleRefract} />
+              <div style={{ fontSize: 9.5, color: "#6d808f", margin: "2px 0 12px", lineHeight: 1.5,
+                fontFamily: "ui-monospace, monospace" }}>
+                {refract
+                  ? "The backdrop sits BELOW the surface and the water is read through it:"
+                    + " each sample bends the view ray into the water (Snell, n = 1.333) instead"
+                    + " of mirroring it into the sky. Everything else is unchanged — same camera,"
+                    + " same painting, same contours, same exports."
+                    + " Two things behave differently and are worth knowing. Every refracted ray"
+                    + " lands inside Snell's window, so the frame spans roughly 2.5x less"
+                    + " elevation than the reflected one — fit the window below (the ⤢ button, or"
+                    + " auto-fit) rather than reaching for “reflection detail”, which saturates"
+                    + " fast on a range this narrow. And the detail is strongest where the view is"
+                    + " most grazing — the far half of the frame, the opposite of reflection,"
+                    + " which carries the same detail everywhere."
+                  : "The water mirrors a backdrop above it. Turn this on to sink the backdrop"
+                    + " beneath the surface and look through the water at it instead."}
+              </div>
+              {refract && (
+                <>
+                  <Slider label="surface tilt (turn the water toward the camera)"
+                    value={surfaceTilt} min={0} max={1} step={0.01}
+                    onChange={setSurfaceTilt}
+                    fmt={(v) => (v === 0 ? "level (physical)" : v >= 1 ? "square to the lens"
+                      : Math.round(v * 100) + "%")} />
+                  <div style={{ fontSize: 9.5, color: "#6d808f", margin: "2px 0 12px", lineHeight: 1.5,
+                    fontFamily: "ui-monospace, monospace" }}>
+                    Rotates the surface NORMAL toward the lens without touching the projection,
+                    so the framing, the horizon and every camera control stay exactly as they are.
+                    It widens the elevation the frame covers — but it costs wavelet detail, and
+                    a lot of it: a normal tilt deflects a refracted ray by 0.94x at 87° grazing
+                    and only 0.25x head-on, so turning the water to face you trades roughly 4x
+                    of the ripple contrast for that wider ramp. 0 is both the physical answer and
+                    the detailed one; raise it for a flatter, more graphic read.
+                  </div>
+                </>
+              )}
               <Toggle label="Show the backdrop itself" value={showBackdrop}
                 onChange={setShowBackdrop} />
               <div style={{ fontSize: 9.5, color: "#6d808f", margin: "2px 0 12px", lineHeight: 1.5,
                 fontFamily: "ui-monospace, monospace" }}>
                 {penMode
                   ? "Not in pen mode — the pen styles draw the water's own lines."
+                  : refract
+                  ? "Not in refraction — the backdrop is under the water, so there is nothing"
+                    + " above the horizon to draw it on."
                   : showBackdrop
                     ? "The frame pulls back to the horizon and the backdrop is drawn where the"
                       + " camera looks straight at it — same colors, same edges, the same regions"
@@ -6094,9 +6271,14 @@ export default function App() {
                       fontFamily: "ui-monospace, monospace", fontSize: 11, margin: "2px 0 12px" }}>
                     ⤢ fit the window to the water ({reach.lo.toFixed(0)}° – {reach.hi.toFixed(0)}°)
                   </button>
-                  <Slider label="elevation low (waterline end)" value={eLo} min={-5} max={60} step={1}
+                  {/* Refracted rays all point DOWN — inside Snell's window, so
+                      never shallower than about -41° — so the window that frames
+                      them is a negative one, and the sliders have to reach it. */}
+                  <Slider label={refract ? "elevation low (deep end)" : "elevation low (waterline end)"}
+                    value={eLo} min={refract ? -90 : -5} max={refract ? -20 : 60} step={1}
                     onChange={setELo} fmt={(v) => v + "°"} />
-                  <Slider label="elevation high (sky end)" value={eHi} min={8} max={90} step={1}
+                  <Slider label={refract ? "elevation high (shallow end)" : "elevation high (sky end)"}
+                    value={eHi} min={refract ? -85 : 8} max={refract ? 0 : 90} step={1}
                     onChange={setEHi} fmt={(v) => v + "°"} />
                 </>
               )}
