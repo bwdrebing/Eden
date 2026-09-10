@@ -60,9 +60,12 @@ scaled inside a fixed-size `<div>` gives a zoomed crop to screenshot.
   edge polish blurs the field before the regions are cut, which is what takes
   the last of the raster grid off a distant outline — and, with it, any glint
   only a few raster pixels across. The PNG path rasterizes the preview's own
-  geometry instead (no polish, no mesh stand-down; it keeps only the width
-  multiplier, which resolves rather than smooths), so it is where fidelity to
-  the preview lives. Keep it that way.
+  geometry instead (no *export* polish, no mesh stand-down; it keeps only the
+  width multiplier, which resolves rather than smooths), so it is where fidelity
+  to the preview lives. Keep it that way. The scene's own `antialiasing` is not
+  an export step and does come through — it is part of the picture that was on
+  screen. `polishPlan` is the one place that says which outputs blur by how
+  much; add an output there rather than picking a number at its call site.
 - **A wave's speed is not a free parameter.** With "Speed follows wavelength"
   on (`S.dispersion`, the default for a new scene), every train takes its
   frequency from its own wavenumber through `omegaAt` — deep-water dispersion,
@@ -81,7 +84,12 @@ scaled inside a fixed-size `<div>` gives a zoomed crop to screenshot.
   not better.
 - **Smoothing that acts on the traced path cannot fix a jagged edge**; Chaikin
   already converges to the spline of that polyline. The field is where to act
-  (see `smoothField`), before the topology is decided.
+  (see `smoothField`), before the topology is decided. Two settings drive that
+  one operator: the scene's `antialiasing` (`ANTIALIAS`), which the preview and
+  everything built from it run, and the SVG's `edge polish` (`EXPORT_POLISH`),
+  which the file adds on top. Both are counted in raster pixels and neither
+  scales with `BW` — a pass is sigma = sqrt(2N/3) pixels of the very grid whose
+  aliasing it removes, so one step means one thing at every raster.
 - **The three pen styles are not the same kind of thing.** `buildPenLines` and
   `buildPenConcentric` work in ground space and do their own hidden-line pass;
   `buildPenHatch` works in *screen* space, on the same `rasterizeSurface` pass
