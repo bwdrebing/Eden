@@ -16,7 +16,8 @@
 //  document that will not fit (a smoothed layer with thousands of colours)
 //  encodes to null rather than writing a megabyte into someone's URL.
 // ------------------------------------------------------------------ //
-import { DOC_VERSION, backdropDoc, flat, rampContent, stripesContent } from "./document";
+import { DOC_VERSION, backdropDoc, flat, rampContent, stripesContent, gridContent }
+  from "./document";
 import { shapesContent, shape, SHAPE_KINDS } from "./shapes";
 
 const MAX_PALETTE = 64;
@@ -89,7 +90,18 @@ export function encodeDoc(doc) {
     if (f.place && f.place.kind === "plane") {
       head.q = [f.place.distance, f.place.width, f.place.height];
     }
+    // the floor carries a depth and a repeat, and nothing else
+    if (f.place && f.place.kind === "floor") {
+      head.o = [f.place.depth, f.place.span];
+    }
     if (c.kind === "ramp") flats.push({ ...head, k: "r", p: c.palette });
+    // a grid is four numbers and its colours, whatever grid it is rendered onto
+    else if (c.kind === "grid") {
+      flats.push({ ...head, k: "g", t: c.tiles | 0,
+        w: Math.round(c.grout * 1e3) / 1e3,
+        j: Math.round((c.jitter == null ? 0.5 : c.jitter) * 1e3) / 1e3,
+        b: (c.colors || []).map((x) => x.replace(/^#/, "")) });
+    }
     else if (c.kind === "shapes") {
       // a shape is its statement: type, box, colours. Four numbers and two
       // hexes, whatever resolution it ends up rendered at
@@ -145,6 +157,14 @@ export function decodeDoc(s) {
           ...(Array.isArray(it.g) ? { points: it.g } : {}),
         }));
       content = shapesContent(items);
+    } else if (f.k === "g") {
+      const cols = (Array.isArray(f.b) ? f.b : [])
+        .filter((x) => /^[0-9a-f]{6}$/i.test(String(x))).map((x) => "#" + x);
+      content = gridContent(
+        Math.max(1, f.t | 0),
+        Number.isFinite(f.w) ? f.w : 0.12,
+        cols.length ? cols : null,
+        Number.isFinite(f.j) ? f.j : 0.5);
     } else if (f.k === "p") {
       const env = decodeCells(f.c);
       if (!env) return null;
@@ -153,7 +173,9 @@ export function decodeDoc(s) {
     if (!content) return null;
     const place = Array.isArray(f.q) && f.q.length === 3 && f.q.every(Number.isFinite)
       ? { kind: "plane", distance: f.q[0], width: f.q[1], height: f.q[2] }
-      : { kind: "sky" };
+      : Array.isArray(f.o) && f.o.length === 2 && f.o.every(Number.isFinite)
+        ? { kind: "floor", depth: f.o[0], span: f.o[1] }
+        : { kind: "sky" };
     flats.push({ ...flat(content, name), visible, place });
   }
   const first = flats.find((f) => f.content.kind === "raster");

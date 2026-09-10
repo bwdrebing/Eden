@@ -50,6 +50,26 @@ export const rampContent = (palette) => ({ kind: "ramp", palette });
 export const stripesContent = (bands, repeat = true, anchor = 0) =>
   ({ kind: "stripes", bands, repeat, anchor });
 
+// A tiled floor: square tiles of `tiles` per document block, separated by
+// grout `grout` wide as a fraction of a tile. This is the pool bottom, and it
+// is STATED rather than painted — so, like shapes, it renders onto the
+// compiler's finer grid instead of the brush's, which is what lets a grout
+// line be thin without the document being enormous.
+//
+// Two properties exist for the repeating floor it is meant to sit on (see
+// makeFloorPlace), and both are load-bearing rather than cosmetic:
+//
+//   * the block is offset by HALF a tile, so the document's edges cut through
+//     the middle of a tile and never along a grout line.
+//   * per-tile colour is keyed on the tile's index within the block, so the
+//     copy of a tile on the far side of a seam is the same colour as the one
+//     it continues.
+export const gridContent = (tiles = 8, grout = 0.12, colors = null, jitter = 0.5) =>
+  ({ kind: "grid", tiles, grout, colors: colors || GRID_COLORS, jitter });
+
+export const GRID_COLORS = ["#2e6f9e", "#3f86b4", "#57a0c6", "#1f5c88"];
+export const GRID_GROUT = "#cfe4ef";
+
 export const rasterContent = (env) =>
   ({ kind: "raster", w: env.w, h: env.h, cells: env.cells });
 
@@ -144,6 +164,31 @@ export function renderContent(content, w = DOC_W, h = DOC_H, rowScale = 1) {
     }
     return out;
   }
+  if (content.kind === "grid") {
+    const out = new Array(w * h);
+    const N = Math.max(1, content.tiles | 0);
+    const g = Math.min(0.45, Math.max(0, content.grout));
+    const cols = content.colors && content.colors.length ? content.colors : GRID_COLORS;
+    const jit = content.jitter == null ? 0.5 : content.jitter;
+    for (let r = 0; r < h; r++) {
+      for (let c = 0; c < w; c++) {
+        // half-tile offset: the block's edges land mid-tile, not on grout
+        const u = (c + 0.5) / w * N + 0.5, v = (r + 0.5) / h * N + 0.5;
+        const iu = Math.floor(u), iv = Math.floor(v);
+        const fu = u - iu, fv = v - iv;
+        // distance into the tile from its nearest edge, in tile fractions
+        const d = Math.min(fu, 1 - fu, fv, 1 - fv);
+        if (d < g / 2) { out[r * w + c] = GRID_GROUT; continue; }
+        // keyed on the WITHIN-BLOCK tile index so the repeat is seamless
+        const ti = ((iu % N) + N) % N, tj = ((iv % N) + N) % N;
+        const hsh = (ti * 73856093) ^ (tj * 19349663);
+        const pick = jit <= 0 ? 0
+          : Math.abs(hsh + (hsh >> 13)) % Math.max(1, Math.round(cols.length * jit) || 1);
+        out[r * w + c] = cols[pick % cols.length];
+      }
+    }
+    return out;
+  }
   if (content.kind === "shapes") {
     return rasterizeShapes(content.items, w, h, () => 0).cells;
   }
@@ -175,7 +220,14 @@ export const kindLabel = (content) =>
     : content.kind === "stripes" ? (content.repeat ? "repeat" : "bands")
       : content.kind === "shapes" ? `${content.items.length} shape`
         + (content.items.length === 1 ? "" : "s")
-        : "painted";
+        : content.kind === "grid" ? `${content.tiles}x${content.tiles} tiles`
+          : "painted";
+
+// Content that is STATED rather than painted, and so is worth rendering onto
+// the compiler's finer grid: a brush stroke has no detail below the cell it
+// was painted in, but a grid line or a shape edge has as much as you ask for.
+export const isStatedContent = (content) =>
+  !!content && (content.kind === "shapes" || content.kind === "grid");
 
 export const docHasShapes = (doc) =>
   doc.flats.some((f) => f.visible && f.content.kind === "shapes");

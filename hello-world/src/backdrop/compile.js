@@ -32,9 +32,9 @@
 // ------------------------------------------------------------------ //
 import * as d3 from "d3";
 import { distTransform, blurField } from "./field";
-import { renderContent, docHasShapes } from "./document";
+import { renderContent, docHasShapes, isStatedContent } from "./document";
 import { rasterizeShapes } from "./shapes";
-import { makePlanePlace } from "./place";
+import { makePlanePlace, makeFloorPlace } from "./place";
 
 export const MAX_REGIONS = 160;
 // A shape layer is stated, not painted, so it can be rendered onto a finer
@@ -76,6 +76,20 @@ function flattenKeyed(doc, EW, EH, flats, fillHoles) {
       });
       for (let p = 0; p < EW * EH; p++) {
         if (sc[p] != null) { cells[p] = sc[p]; labels[p] = sk[p]; }
+      }
+    } else if (isStatedContent(f.content)) {
+      // Stated content (a tile grid) is not painted, so the argument below
+      // does not apply to it: it has as much detail as the grid it is asked
+      // for, and a grout line wants to be thin. Render it at the compiler's
+      // resolution and key it by colour like any other flat — a tiled floor
+      // is two or three regions (grout, and each tile colour), not one per
+      // tile, because colour is what a region is keyed on.
+      const src = renderContent(f.content, EW, EH, 1);
+      for (let p = 0; p < EW * EH; p++) {
+        const v = src[p];
+        if (v == null) continue;
+        cells[p] = v;
+        labels[p] = keyFor(`${li}:c:${v}`, v, li, -1);
       }
     } else {
       // Colour-keyed layers are authored at the document's own resolution —
@@ -215,13 +229,22 @@ function groupOf(stack, place) {
 export function compileBackdrop(doc, opts = {}) {
   // shapes render onto a finer grid than the brush paints on; everything else
   // compiles at the resolution it was authored at
-  const scale = opts.scale || (docHasShapes(doc) ? COMPILE_SCALE : 1);
+  const stated = docHasShapes(doc) || doc.flats.some((f) => isStatedContent(f.content));
+  const scale = opts.scale || (stated ? COMPILE_SCALE : 1);
   const EW = doc.w * scale, EH = doc.h * scale;
 
-  const sky = doc.flats.filter((f) => !f.place || f.place.kind !== "plane");
-  const boards = doc.flats.filter((f) => f.place && f.place.kind === "plane");
+  const placed = (f, k) => f.place && f.place.kind === k;
+  const sky = doc.flats.filter((f) => !placed(f, "plane") && !placed(f, "floor"));
+  const boards = doc.flats.filter((f) => placed(f, "plane"));
+  // A floor is under everything, so it goes in first and every other flat
+  // draws over it.
+  const floors = doc.flats.filter((f) => placed(f, "floor"));
 
   const groups = [];
+  floors.forEach((f) => {
+    const st = stackRegions(doc, EW, EH, [f], true);
+    if (st) groups.push(groupOf(st, makeFloorPlace(f.place)));
+  });
   const skyStack = sky.length ? stackRegions(doc, EW, EH, sky, true) : null;
   // the sky is a flat at infinity, and saying so keeps the group list
   // self-describing: every group has a distance, and they come out sorted
