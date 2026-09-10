@@ -40,6 +40,13 @@ const everyType = (t, loopPhase, extra = {}) => ({
       amp: 1.2, spread: 0, roughness: 0, detail: 8 },
     { id: 5, on: true, type: "wake", x: -3, y: 20, dir: 30, scale: 5,
       amp: 0.6, len: 8, detail: 0.3, angle: 19.5 },
+    // every part of a sea that moves is switched on here: the component ladder,
+    // the Gerstner warp that rides it, the gust field that drifts downwind and
+    // the group beats that travel along it. Three different ways of depending
+    // on t, and a loop has to close all three.
+    { id: 6, on: true, type: "sea", x: 0, y: 12, dir: 70, size: 1.1,
+      amp: 0.8, spread: 50, roughness: 0.6, detail: 20,
+      chop: 0.5, patch: 0.7, group: 0.6 },
   ],
   ...extra,
 });
@@ -130,8 +137,14 @@ test("the saved scenes close too, under both timing rules", () => {
       // what it would have done without the loop: nowhere near its own start.
       // This is the artifact the option exists to remove, so it is worth
       // holding onto the fact that it is a large one.
+      //
+      // Half the field's own rms rather than all of it, because the rms is a
+      // generous yardstick on HARBOR_WAKE: that scene is mostly a wake and two
+      // long swells, and a wake carries no phase term at all, so a good share
+      // of its rms is static by construction and can never pop however long
+      // the clip runs. GRAZING_RIPPLES clears this by six to eight times.
       const popped = sample({ ...base, t: T, loopPhase: 0 });
-      expect(worstDiff(at0, popped)).toBeGreaterThan(rms(at0));
+      expect(worstDiff(at0, popped)).toBeGreaterThan(0.5 * rms(at0));
     }
   }
 });
@@ -175,6 +188,19 @@ test("prepped constants other than the phase are untouched by the loop", () => {
     if (e.type === "swell") {
       expect(f.k0).toBe(e.k0);
       expect([f.Dx, f.Dy, f.A, f.q, f.aa]).toEqual([e.Dx, e.Dy, e.A, e.q, e.aa]);
+    }
+    if (e.type === "sea") {
+      expect(f.K).toEqual(e.K);                   // the ladder
+      expect(f.DX).toEqual(e.DX);                 // headings
+      expect(f.DY).toEqual(e.DY);
+      expect(f.AMP).toEqual(e.AMP);               // energy per rung
+      expect(f.AA).toEqual(e.AA);
+      expect([f.chop, f.patch, f.group, f.ns, f.lo, f.hi, f.wx, f.wy, f.gl1, f.gl2])
+        .toEqual([e.chop, e.patch, e.group, e.ns, e.lo, e.hi, e.wx, e.wy, e.gl1, e.gl2]);
+      // the three that carry time: the ladder's phases, the gust field's
+      // travel downwind, and each group beat's own phase
+      expect(f.PH).not.toEqual(e.PH);
+      expect([f.nou, f.gp1, f.gp2]).not.toEqual([e.nou, e.gp1, e.gp2]);
     }
     // a wake has no phase term at all, so a loop is nothing to it
     if (e.type === "wake") expect(f).toEqual(e);

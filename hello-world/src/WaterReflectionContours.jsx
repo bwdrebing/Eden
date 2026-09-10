@@ -45,6 +45,16 @@ const SPEED_MAX = 1.5;
 // swell can roll under fast chop. 1 is the clock itself; 0 freezes that train
 // without freezing the scene.
 const EMITTER_RATE_DEFAULT = 1;
+// The spectrum emitter divides each component's amplitude by the component
+// count, which means turning its "detail" up made the water *flatter* — the
+// control resolved the field and faded it at the same time, and no setting of
+// the strength slider fixed that, because the two interacted. The components
+// span a fixed number of octaves however many there are, so each one stands
+// for a band of width ∝ 1/N and its amplitude should go as 1/√N, not 1/N.
+// Anchored at this count, so a scene saved at about this detail — which is
+// where the defaults and every scene in the repo sit — renders as it did, and
+// only the scaling either side of it changes.
+const SPECTRUM_N_REF = 16;
 
 // Dispersion: how fast a train runs is not a free choice.
 //
@@ -138,6 +148,15 @@ function loopFit(S, T) {
     else if (e.type === "swell") oms.push(e.ph0 - B.ph0);
     else if (e.type === "rings") for (let j = 0; j < e.M; j++) oms.push(e.PH[j] - B.PH[j]);
     else if (e.type === "spectrum") for (let j = 0; j < e.N; j++) oms.push(e.PH[j] - B.PH[j]);
+    else if (e.type === "sea") {
+      for (let j = 0; j < e.N; j++) oms.push(e.PH[j] - B.PH[j]);
+      // its group envelope is a pair of slow trains and gets rounded like any
+      // other, so it belongs in the reading. The gust drift does not: it is
+      // allowed to round to a standstill (see prepSea), and counting a
+      // standstill as a frequency error would swamp a figure that is about how
+      // far the *waves* were moved.
+      oms.push(B.gp1 - e.gp1, B.gp2 - e.gp2);
+    }
     // a wake carries no phase term at all: it is already the same every frame
   });
   const live = oms.map(Math.abs).filter((o) => o > 1e-12);
@@ -180,6 +199,47 @@ const DEFAULT_EMITTERS = [
   { id: 3, on: true, type: "spectrum", x: 0, y: 20, dir: 90,  size: 1.7, amp: 1.9,  spread: 17, roughness: 0.15, detail: 19 },
 ];
 
+// Named starting points for the water itself. Getting a lake or an open sea to
+// read took tuning three emitters across seven sliders each, with the controls
+// interacting — so these are the four answers, as whole emitter stacks plus the
+// global surface settings they were tuned against. Nothing else is touched:
+// camera, palette and elevation range survive, so a mood can be tried on the
+// scene you already have.
+const WATER_MOODS = [
+  { name: "Glassy lake",
+    note: "still water, a few ripple rings, the odd breath of wind",
+    wavelength: 1.6, strength: 0.4, sharp: 0, spread: 0.45,
+    emitters: [
+      { id: 1, on: true, type: "sea", x: 0, y: 20, dir: 110, size: 0.7, amp: 0.7,
+        spread: 65, roughness: 0.55, detail: 48, chop: 0.3, patch: 0.8, group: 0.2 },
+      { id: 2, on: true, type: "rings", x: 0, y: 20, dir: 90, size: 1.8, amp: 0.45,
+        spread: 25, roughness: 0.35, detail: 5 },
+    ] },
+  { name: "Light air",
+    note: "cat's paws — gust patches crossing otherwise smooth water",
+    wavelength: 1.6, strength: 0.45, sharp: 0, spread: 0.4,
+    emitters: [
+      { id: 1, on: true, type: "sea", x: 0, y: 20, dir: 115, size: 0.9, amp: 1.05,
+        spread: 60, roughness: 0.6, detail: 56, chop: 0.45, patch: 0.55, group: 0.3 },
+    ] },
+  { name: "Fresh breeze",
+    note: "a developed wind sea: short crests, fine texture all over",
+    wavelength: 2.4, strength: 0.7, sharp: 0, spread: 0.3,
+    emitters: [
+      { id: 1, on: true, type: "sea", x: 0, y: 20, dir: 95, size: 1.4, amp: 1.25,
+        spread: 45, roughness: 0.75, detail: 64, chop: 0.7, patch: 0.25, group: 0.5 },
+    ] },
+  { name: "Ocean swell",
+    note: "a long swell rolling under wind chop at an angle to it",
+    wavelength: 3, strength: 0.8, sharp: 0.2, spread: 0.25,
+    emitters: [
+      { id: 1, on: true, type: "swell", x: 0, y: 20, dir: 80, size: 3.4, amp: 1.5,
+        spread: 25, roughness: 0.3, detail: 12, rate: 0.45 },
+      { id: 2, on: true, type: "sea", x: 0, y: 20, dir: 120, size: 0.9, amp: 0.9,
+        spread: 50, roughness: 0.7, detail: 56, chop: 0.6, patch: 0.4, group: 0.6 },
+    ] },
+];
+
 // quick-pick colors for the environment painter: treeline/earth → sunset → sky
 const SWATCHES = [
   "#080d09", "#0f1f13", "#1d3b22", "#2f5734", "#4a4030", "#6b4a2e",
@@ -215,10 +275,82 @@ function mergeChits(existing, colors) {
 //   swell    = one long straight-crested wave train
 //   spectrum = a wind field: many straight waves around a heading,
 //              weighted toward long wavelengths, + a roughness control
+//   sea      = the same idea done properly: amplitudes drawn from a real
+//              wave spectrum, headings spread so crests are short, and two
+//              envelopes (gust patches, wave groups) that vary it across the
+//              water. See the block above prepSea for what each part is for.
 function rand1(i) {
   const x = Math.sin(i * 12.9898 + 7.13) * 43758.5453;
   return x - Math.floor(x);
 }
+
+// Ripple sources — point and rings — are sin(k·r) about a centre, and r has a
+// cone tip there: the height is fine but the *gradient* flips direction across
+// the point, which renders as a dark dot at every source. Rounding r over a
+// fraction of a wavelength removes the tip without touching the ripple: the
+// field becomes f(√(r²+ε²)), whose gradient is f'·(dx/rs, dy/rs) — the same
+// expression with rs in place of r, which is the whole of the fix below.
+const RIPPLE_EPS = 1 / 8;   // in wavelengths
+
+// ---- smooth value noise, with its gradient --------------------------
+// The gust field below multiplies wave amplitudes, so it lands in both the
+// height and the slope: slopeAt needs ∂n/∂x and ∂n/∂y, not just n. A value
+// lattice with the smoothstep fade is C¹, so both come out in closed form.
+// Deterministic from position alone — no state, no seeding — which is what
+// lets the preview, the worker, the PNG and the video all see the same
+// patches on the same water.
+// The lattice wraps along x with this many cells, always — see fbm below for
+// why it wraps at all. Wide against the few cells a frame spans, so the repeat
+// is off the edge of any picture rather than a pattern in it.
+const NOISE_PERIOD = 16;
+function vhash(ix, iy, per) {
+  const wx = ((ix % per) + per) % per;
+  const x = Math.sin(wx * 127.1 + iy * 311.7) * 43758.5453;
+  return x - Math.floor(x);
+}
+// writes [value, d/dx, d/dy]; value is in 0..1
+const VN_OUT = [0, 0, 0];
+function vnoise(x, y, per, out) {
+  const ix = Math.floor(x), iy = Math.floor(y);
+  const fx = x - ix, fy = y - iy;
+  const sx = fx * fx * (3 - 2 * fx), sy = fy * fy * (3 - 2 * fy);
+  const dsx = 6 * fx * (1 - fx), dsy = 6 * fy * (1 - fy);
+  const a = vhash(ix, iy, per), b = vhash(ix + 1, iy, per);
+  const c = vhash(ix, iy + 1, per), d = vhash(ix + 1, iy + 1, per);
+  const u = b - a, v = c - a, w = a - b - c + d;
+  out[0] = a + u * sx + v * sy + w * sx * sy;
+  out[1] = (u + w * sy) * dsx;
+  out[2] = (v + w * sx) * dsy;
+}
+// Three octaves of it, still with the gradient — and periodic in x with period
+// NOISE_PERIOD. That periodicity is what makes a *drifting* gust field able to
+// close a loop at all: the waves under it are sinusoids and can have their
+// frequencies snapped, but a plain infinite noise translated along the wind
+// never returns to where it started, however the speed is chosen. Give it a
+// spatial period and the drift only has to cover a whole number of them.
+//
+// So the octaves step by exactly 2 rather than by 2.03: the wrap has to land on
+// a lattice cell at every octave, which needs per*f to stay a whole number.
+// The per-octave offsets keep the octaves from lining up on that lattice, and
+// being fractional they do not disturb the wrap — shifting a coordinate does
+// not change the period it repeats with.
+const FBM_OUT = [0, 0, 0];
+function fbm(x, y, out) {
+  let v = 0, gx = 0, gy = 0, amp = 1, norm = 0, f = 1;
+  let px = x, py = y;
+  for (let o = 0; o < 3; o++) {
+    vnoise(px, py, NOISE_PERIOD * f, VN_OUT);
+    v += amp * VN_OUT[0];
+    gx += amp * f * VN_OUT[1];
+    gy += amp * f * VN_OUT[2];
+    norm += amp;
+    amp *= 0.5; f *= 2;
+    px = x * f + 7.1 * (o + 1); py = y * f + 3.7 * (o + 1);
+  }
+  out[0] = v / norm; out[1] = gx / norm; out[2] = gy / norm;
+}
+const smoothstep01 = (t) => (t <= 0 ? 0 : t >= 1 ? 1 : t * t * (3 - 2 * t));
+const dsmoothstep01 = (t) => (t <= 0 || t >= 1 ? 0 : 6 * t * (1 - t));
 
 // Distance filter: short waves narrower than what the sample grid (and the
 // eye) can resolve at range gy fade out smoothly instead of aliasing into
@@ -394,6 +526,278 @@ function newWake(id, halfW, yFar, strength) {
     angle: Math.round(WAKE_ANGLE_DEG * 10) / 10 };
 }
 
+// ---- the sea emitter -------------------------------------------------
+// The spectrum emitter above is a ladder of sines: N wavelengths stepping down
+// from λ₀, headings jittered inside a fixed cone, amplitudes falling off
+// linearly in λ. It is a good approximation of a lot of small waves, and it is
+// not a sea. Three things are missing, and all three are visible in the
+// picture rather than in the numbers:
+//
+//  * CRESTS ARE TOO LONG. Real wind waves spread their energy over a cone of
+//    headings that is narrow at the dominant wavelength and wide for the short
+//    waves riding on it, so a crest runs a few wavelengths and hands off to the
+//    next one. Fifteen components at nearly one heading is a corrugated sheet.
+//  * THE ENERGY LAW IS INVENTED. Amplitude ∝ λ/λ₀ ÷ N is not the shape of any
+//    sea, and it makes the controls fight: "roughness" changes the total
+//    steepness as a side effect of changing the texture.
+//  * THE WATER IS THE SAME EVERYWHERE. Nothing in the old field varies its
+//    envelope across the plane, and that is the single biggest lake tell — a
+//    lake is mostly glass with gust patches written onto it, not a uniform
+//    stipple to the horizon.
+//
+// So: amplitudes from a Pierson–Moskowitz / JONSWAP spectrum in wavenumber
+// (S(k) ∝ k⁻³·e^(−1.25(kp/k)²)·γ^r — the k-space form of the usual ω⁻⁵ one,
+// since ω = √(gk)), stratified in log k so even 24 components read as a
+// continuum; a directional spread that widens as √(k/kp); Gerstner
+// displacement, which slides the surface toward the crests and is what makes
+// crests peak and troughs go wide and flat, asymmetrically, the way the 2nd
+// harmonic in `sharp` cannot; and two envelopes across the water —
+// gust patches on the short waves, and slow groups along the wind on the long
+// ones, both travelling with the clock.
+//
+// STRENGTH IS CALIBRATED ON SLOPE, not on height. The picture is cut out of
+// the reflected angle, which is set by the slope, so a sea whose rms slope
+// matches a swell of the same strength reads as the same weight of water —
+// whereas matching heights would make every increase in fine texture also
+// blow up the contrast. It is also what makes the texture control safe to
+// drag: it changes what the water is made of, not how rough it is.
+const SEA_N_DEFAULT = 48;
+const SEA_CHOP_DEFAULT = 0.45;
+const SEA_PATCH_DEFAULT = 0.35;
+const SEA_GROUP_DEFAULT = 0.35;
+// Both envelopes scale the whole of one emitter's spectrum, and that is a
+// choice worth stating. A first cut modulated only the short waves, on the
+// reasoning that a swell rolls on through a lull while the chop on top of it
+// does not — and on a lake it produced almost nothing, because a lake has no
+// swell: the whole visible ripple field is wind, and the whole of it comes and
+// goes with the gusts. The persistent part of an ocean belongs in its own
+// swell emitter, where no gust reaches it, which is how the Ocean swell preset
+// is built. One emitter is one sea, and one sea rises and falls together.
+//
+// How big a gust patch is. A cat's paw on real water is set by the wind, not by
+// the ripples inside it, and is tens of wavelengths across — so this is a
+// fraction of the stretch of water in the scene rather than a multiple of the
+// wavelength, which is what keeps a handful of patches in frame whether the
+// waves are scaled large or small. The rings emitter already scatters its
+// sources across the plane the same way. Floored at a few wavelengths so the
+// envelope can never get finer than the waves it is modulating.
+const SEA_PATCH_FRAC = 0.22;
+const SEA_PATCH_MIN_LAM = 3;
+// Groups are a property of the wave train itself, so these stay in wavelengths.
+const SEA_GROUP_L1 = 6.5, SEA_GROUP_L2 = 10.7;
+
+function prepSea(em, S, A, t, phase, rate) {
+  const lamP = (2 * Math.PI / S.k) * em.size;      // the dominant wavelength
+  const kp = 2 * Math.PI / lamP;
+  const N = Math.max(12, Math.min(96, (em.detail | 0) || SEA_N_DEFAULT));
+  const wind = (em.dir * Math.PI) / 180;
+  // one slider, three spectrum parameters: how far down the ladder there is
+  // energy at all, how fast the tail past the peak gives out, and how much the
+  // peak stands above it. Low = the dominant wave nearly alone, high = a fully
+  // developed wind sea with fine texture all over it.
+  const rough = em.roughness == null ? 0.5 : em.roughness;
+  const oct = 1.6 + 3.4 * rough;
+  const tail = 2.2 - 1.9 * rough;
+  const gamma = 1 + 2.3 * (1 - rough);
+  const kMin = kp / 2.5, kMax = kp * Math.pow(2, oct);
+  const sigP = ((em.spread * Math.PI) / 180) * 0.6;   // angular half-width at the peak
+  const K = [], DX = [], DY = [], AMP = [], PH = [], AA = [];
+  let slopeVar = 0;
+  for (let i = 0; i < N; i++) {
+    // stratified in log k — one component per bin, jittered inside it, so the
+    // ladder never lines up into a comb the way an even spacing does
+    const u = (i + rand1(i * 7 + 3)) / N;
+    const k = kMin * Math.pow(kMax / kMin, u);
+    const rk = k / kp;
+    const sg = k <= kp ? 0.07 : 0.09;
+    const pk = Math.exp(-Math.pow(Math.sqrt(rk) - 1, 2) / (2 * sg * sg));
+    const Sk = Math.pow(rk, -3) * Math.exp(-1.25 / (rk * rk)) * Math.pow(gamma, pk)
+      * (rk > 1 ? Math.pow(rk, -tail) : 1);
+    // energy in a log-k bin is S(k)·k; amplitude is its root
+    const a = Math.sqrt(Math.max(0, Sk) * rk);
+    // short waves spread wider than the peak — the reason crests are short
+    const sig = Math.min(1.35, sigP * Math.sqrt(rk));
+    // a bounded bell (two uniforms summed) rather than a top hat, scaled to
+    // unit variance, so the heading distribution has shoulders like a real one
+    const tri = (rand1(i * 3 + 11) + rand1(i * 3 + 12) - 1) * 2.449;
+    const th = wind + sig * Math.max(-2.6, Math.min(2.6, tri));
+    // one rule for every train in the scene: this component's own wavenumber
+    // through omegaAt, so a sea's ladder keeps step with a swell of the same
+    // wavelength instead of measuring itself against an arbitrary k = 1
+    const om = omegaAt(k, S);
+    K.push(k); DX.push(Math.cos(th)); DY.push(Math.sin(th)); AMP.push(a);
+    PH.push(rand1(i * 2 + 2) * Math.PI * 2 - phase(om));
+    AA.push(aaCoef(k, S));
+    slopeVar += (a * k) * (a * k);
+  }
+  // match the rms slope of one sine of amplitude A at the peak wavelength
+  const sc = slopeVar > 0 ? (A * kp) / Math.sqrt(slopeVar) : 0;
+  for (let i = 0; i < N; i++) AMP[i] *= sc;
+
+  const patch = Math.max(0, Math.min(1, em.patch == null ? SEA_PATCH_DEFAULT : em.patch));
+  const group = Math.max(0, Math.min(1, em.group == null ? SEA_GROUP_DEFAULT : em.group));
+  const chop = Math.max(0, Math.min(1, em.chop == null ? SEA_CHOP_DEFAULT : em.chop));
+  // Peak phase speed, c = omega/k, taken through the scene's own dispersion
+  // rule so the envelopes travel with the waves they are riding on rather than
+  // at a speed of their own. Groups go at half of it (deep water), and the gust
+  // field is carried downwind at about the same rate.
+  const cp = omegaAt(kp, S) / kp;
+  const wx = Math.cos(wind), wy = Math.sin(wind);
+  const ns = 1 / Math.max(SEA_PATCH_MIN_LAM * lamP,
+    SEA_PATCH_FRAC * Math.max(S.xMax - S.xMin, S.yMax - S.yMin));
+  // How far the gust field has blown downwind by now, in lattice cells. The
+  // noise is sampled in the wind's own frame (u downwind, v across), so this
+  // translation is the whole of what time does to it, and the field is periodic
+  // in u — which is what lets a loop close at all, since a translated noise
+  // cannot otherwise return to where it started however the speed is picked.
+  //
+  // Counted as an angle, one turn to one spatial period, so closing the loop is
+  // the same rounding every train gets. One difference, and it is deliberate: a
+  // whole turn is not forced. loopOmega holds a train to at least one cycle
+  // because a train stopped dead among moving water reads as a broken renderer
+  // — but a gust field crosses only a fraction of a period in a normal clip, so
+  // rounding that up would send the patches racing across the frame. Rounded to
+  // none they stand still for the loop, which reads as still air over water
+  // that is still moving.
+  const omGust = (Math.PI * cp * ns) / NOISE_PERIOD;   // 2pi * (0.5 * cp * ns) / period
+  let gustAng = omGust * t;
+  if (S.loopPhase) {
+    const o = omGust * rate;
+    const n = Math.round(Math.abs(o * S.loopPhase) / (2 * Math.PI));
+    gustAng = ((Math.sign(o) * n * 2 * Math.PI) / S.loopPhase) * S.t;
+  }
+  const nou = -(gustAng / (2 * Math.PI)) * NOISE_PERIOD;
+  // Groups: two beats along the wind, each carried at the group speed. They get
+  // a phase term apiece rather than one shared translation of the position,
+  // because a loop has to round each frequency on its own and one translation
+  // cannot serve two. With no loop this is the same arithmetic as translating
+  // was, and the two are different wavelengths, so travelling at slightly
+  // different speeds is if anything the more honest reading of them.
+  const gl1 = (2 * Math.PI) / (SEA_GROUP_L1 * lamP);
+  const gl2 = (2 * Math.PI) / (SEA_GROUP_L2 * lamP);
+  // The remap window that turns the noise into patches: raising patchiness
+  // slides it up (more of the water falls in the glassy tail) and narrows it
+  // (the edge of a gust patch gets more definite).
+  const lo = 0.30 + 0.30 * patch, hi = lo + 0.34 - 0.16 * patch;
+  // The patch envelope runs 1−patch .. 1: the gust patches keep exactly the
+  // roughness the water had before the slider was touched, and everything else
+  // goes calmer. An earlier version normalised it to a mean of 1 instead, on
+  // the theory that patchiness should redistribute roughness rather than remove
+  // it — but roughness reads as a square, so holding the mean drove the patches
+  // to three times the steepness they started at, and dragging the slider
+  // steepened the water instead of opening glass in it. This way the control
+  // means what it says: how much of the water the wind has left alone.
+  return { type: "sea", K, DX, DY, AMP, PH, AA, N, chop,
+    patch, group, ns, nou, lo, hi, wx, wy, gl1, gl2,
+    gp1: phase(gl1 * 0.5 * cp), gp2: phase(gl2 * 0.5 * cp) };
+}
+
+// Evaluate one prepped sea at a ground point into SEA_OUT — the height, and
+// when `slope` is set its two ground-space derivatives. One function for both,
+// so the two cannot drift apart (the wake above is arranged the same way).
+//
+// The Gerstner part needs care on exactly that point. A true trochoidal surface
+// is given the other way round — a material point p lands at p + D(p) — so
+// drawing it at a ground point means inverting that map, and an inverted map
+// has no closed-form derivative. Rather than iterate the inverse and then
+// differentiate something we did not quite compute, the surface *is* defined as
+// the one-step warp
+//
+//     z(g) = H(g − D(g))
+//
+// which sharpens crests and flattens troughs exactly as the trochoid does (D
+// points toward the crest from either side, so the water bunches there), and
+// which can be differentiated exactly: ∂p/∂g = I − ∂D/∂g, no inverse, no
+// determinant to go singular under a steep setting. What slopeAt returns is
+// then the true gradient of what heightAt returns, at every chop setting.
+//
+// The two envelopes are read at the ground point, and their own gradients are
+// carried through both D and the sum, so they contribute to the slope as well
+// as the height — a gust patch has an edge, and the edge is visible.
+const SEA_OUT = [0, 0, 0];
+function seaAt(e, gx, gy, slope) {
+  // gust patches: 1 where the wind is on this water, 1−patch where it is not
+  let M = 1, Mx = 0, My = 0;
+  if (e.patch > 0) {
+    // sampled in the wind's frame: u downwind (the axis the field drifts along
+    // and repeats in), v across it
+    const u = (gx * e.wx + gy * e.wy) * e.ns + e.nou;
+    const v = (gy * e.wx - gx * e.wy) * e.ns;
+    fbm(u, v, FBM_OUT);
+    const w = 1 / (e.hi - e.lo), tt = (FBM_OUT[0] - e.lo) * w;
+    M = 1 - e.patch + e.patch * smoothstep01(tt);
+    // back out of that frame for the gradient
+    const c = e.patch * dsmoothstep01(tt) * w * e.ns;
+    Mx = c * (FBM_OUT[1] * e.wx - FBM_OUT[2] * e.wy);
+    My = c * (FBM_OUT[1] * e.wy + FBM_OUT[2] * e.wx);
+  }
+  // groups on the long ones: two incommensurate beats along the wind, riding
+  // downwind at the group speed, so sets roll through instead of standing still
+  let G = 1, Gx = 0, Gy = 0;
+  if (e.group > 0) {
+    const p = gx * e.wx + gy * e.wy;
+    const a1 = e.gl1 * p - e.gp1 + 0.7, a2 = e.gl2 * p - e.gp2 + 2.1;
+    const s1 = Math.sin(a1), s2 = Math.sin(a2);
+    const beat = 0.5 + 0.5 * s1 * s2;
+    const dbeat = 0.5 * (e.gl1 * Math.cos(a1) * s2 + e.gl2 * Math.cos(a2) * s1);
+    G = 1 - e.group + e.group * (0.35 + 1.3 * beat);
+    const c = e.group * 1.3 * dbeat;
+    Gx = c * e.wx; Gy = c * e.wy;
+  }
+
+  // one envelope over the whole emitter, so the two multiply
+  const E = G * M, Ex = Gx * M + G * Mx, Ey = Gy * M + G * My;
+
+  // The warp, and with it ∂p/∂g — identity when there is no chop.
+  let px = gx, py = gy;
+  let a00 = 1, a01 = 0, a10 = 0, a11 = 1;
+  if (e.chop > 0) {
+    let dx = 0, dy = 0, j00 = 0, j01 = 0, j11 = 0;
+    for (let i = 0; i < e.N; i++) {
+      const x = e.AA[i] * gy;
+      const w = (e.chop * e.AMP[i]) / (1 + x * x);
+      const th = e.K[i] * (e.DX[i] * gx + e.DY[i] * gy) + e.PH[i];
+      dx += w * Math.cos(th) * e.DX[i]; dy += w * Math.cos(th) * e.DY[i];
+      if (slope) {
+        const g = -w * e.K[i] * Math.sin(th);
+        j00 += g * e.DX[i] * e.DX[i];
+        j01 += g * e.DX[i] * e.DY[i];
+        j11 += g * e.DY[i] * e.DY[i];
+      }
+    }
+    px = gx - E * dx; py = gy - E * dy;
+    if (slope) {
+      // ∂D/∂g, where D = E(g)·d(g): the wave part through the envelope, plus
+      // the envelope's own gradient times the displacement it scales. The
+      // second term is an outer product, so this is not symmetric.
+      a00 = 1 - (E * j00 + dx * Ex);
+      a01 = -(E * j01 + dx * Ey);
+      a10 = -(E * j01 + dy * Ex);
+      a11 = 1 - (E * j11 + dy * Ey);
+    }
+  }
+
+  let SUM = 0, Cx = 0, Cy = 0;
+  for (let i = 0; i < e.N; i++) {
+    const x = e.AA[i] * gy;
+    const w = e.AMP[i] / (1 + x * x);
+    const th = e.K[i] * (e.DX[i] * px + e.DY[i] * py) + e.PH[i];
+    SUM += w * Math.sin(th);
+    if (slope) {
+      const ck = w * Math.cos(th) * e.K[i];
+      Cx += ck * e.DX[i]; Cy += ck * e.DY[i];
+    }
+  }
+  SEA_OUT[0] = E * SUM;
+  if (slope) {
+    // gradient with respect to p, carried back through ∂p/∂g, then the
+    // envelope's own ground-space gradient on top
+    const hx = E * Cx, hy = E * Cy;
+    SEA_OUT[1] = hx * a00 + hy * a10 + Ex * SUM;
+    SEA_OUT[2] = hx * a01 + hy * a11 + Ey * SUM;
+  }
+}
+
 // Pre-bake an emitter into per-frame constants so the per-sample loop is cheap.
 function prepEmitter(em, S) {
   const baseLambda = (2 * Math.PI / S.k) * em.size; // global λ × size
@@ -425,8 +829,10 @@ function prepEmitter(em, S) {
     const k0 = 2 * Math.PI / baseLambda;
     // the ring expands at this train's own phase speed omega/k, not the
     // clock's — a wide ripple spreads faster than a tight one
-    return { type: "point", x: em.x, y: em.y, k0, A, decay, wt: phase(omegaAt(k0, S)) };
+    return { type: "point", x: em.x, y: em.y, k0, A, decay, wt: phase(omegaAt(k0, S)),
+      e2: Math.pow(RIPPLE_EPS * baseLambda, 2) };
   }
+  if (em.type === "sea") return prepSea(em, S, A, t, phase, rate);
   if (em.type === "swell") {
     const a = (em.dir * Math.PI) / 180;
     const k0 = 2 * Math.PI / baseLambda;
@@ -466,19 +872,20 @@ function prepEmitter(em, S) {
     const M = Math.max(1, Math.min(20, em.detail | 0));
     const rough = em.roughness;
     const dec = S.decay * 0.7;
-    const CX = [], CY = [], K = [], AMP = [], PH = [];
+    const CX = [], CY = [], K = [], AMP = [], PH = [], E2 = [];
     for (let i = 0; i < M; i++) {
       CX.push(S.xMin + (S.xMax - S.xMin) * rand1(i * 3 + 1));
       CY.push(S.yMin + (S.yMax - S.yMin) * rand1(i * 3 + 2));
-      const lam = baseLambda * (1 + (rand1(i * 3 + 5) - 0.5) * 1.2 * rough);
-      const ki = 2 * Math.PI / Math.max(0.2, lam);
+      const lam = Math.max(0.2, baseLambda * (1 + (rand1(i * 3 + 5) - 0.5) * 1.2 * rough));
+      const ki = 2 * Math.PI / lam;
       K.push(ki);
       AMP.push(A * (0.6 + 0.7 * rand1(i * 7 + 3)));
       // each source spreads at the rate its own wavelength earns it, so a
       // varied field stops pulsing in unison the moment the rule is on
       PH.push(rand1(i * 11 + 4) * Math.PI * 2 - phase(omegaAt(ki, S)));
+      E2.push(Math.pow(RIPPLE_EPS * lam, 2));    // rounds off the cone tip
     }
-    return { type: "rings", M, CX, CY, K, AMP, PH, dec };
+    return { type: "rings", M, CX, CY, K, AMP, PH, E2, dec };
   }
   // spectrum: a ladder of components from baseLambda down through several
   // octaves — 1.5 octaves when glassy up to ~6 when rough — with jittered
@@ -506,7 +913,9 @@ function prepEmitter(em, S) {
     K.push(ki);
     DX.push(Math.cos(th));
     DY.push(Math.sin(th));
-    AMP.push(A * (lam / baseLambda) / N * 1.5);       // longer waves carry more energy
+    // longer waves carry more energy; 1/√N so the count resolves the field
+    // rather than fading it (see SPECTRUM_N_REF)
+    AMP.push(A * (lam / baseLambda) * 1.5 / Math.sqrt(SPECTRUM_N_REF * N));
     PH.push(rand1(i * 2 + 2) * Math.PI * 2 - phase(om));
     AA.push(aaCoef(ki, S));
   }
@@ -528,8 +937,10 @@ function heightAt(gx, gy, S) {
   for (const e of S._ems) {
     if (e.type === "point") {
       const dx = gx - e.x, dy = gy - e.y;
-      const r = Math.hypot(dx, dy) + 1e-6;
+      const r = Math.sqrt(dx * dx + dy * dy + e.e2);
       z += e.A * Math.exp(-e.decay * r) * Math.sin(e.k0 * r - e.wt);
+    } else if (e.type === "sea") {
+      seaAt(e, gx, gy, false); z += SEA_OUT[0];
     } else if (e.type === "swell") {
       const s1 = Math.sin(e.k0 * (e.Dx * gx + e.Dy * gy) + e.ph0);
       // Stokes-ish profile: 2nd harmonic peaks the crests, flattens troughs
@@ -539,7 +950,7 @@ function heightAt(gx, gy, S) {
     } else if (e.type === "rings") {
       for (let i = 0; i < e.M; i++) {
         const dx = gx - e.CX[i], dy = gy - e.CY[i];
-        const r = Math.hypot(dx, dy) + 1e-6;
+        const r = Math.sqrt(dx * dx + dy * dy + e.E2[i]);
         z += e.AMP[i] * Math.exp(-e.dec * r) * Math.sin(e.K[i] * r + e.PH[i]);
       }
     } else if (e.type === "wake") {
@@ -574,10 +985,14 @@ function slopeAt(gx, gy, S) {
   for (const e of S._ems) {
     if (e.type === "point") {
       const dx = gx - e.x, dy = gy - e.y;
-      const r = Math.hypot(dx, dy) + 1e-6;
+      // rounded radius: the gradient is f'(r)·(dx/r, dy/r) with the same r, so
+      // it falls to zero at the centre instead of flipping across it
+      const r = Math.sqrt(dx * dx + dy * dy + e.e2);
       const env = Math.exp(-e.decay * r);
       const f = e.A * env * (e.k0 * Math.cos(e.k0 * r - e.wt) - e.decay * Math.sin(e.k0 * r - e.wt));
       hx += f * dx / r; hy += f * dy / r;
+    } else if (e.type === "sea") {
+      seaAt(e, gx, gy, true); hx += SEA_OUT[1]; hy += SEA_OUT[2];
     } else if (e.type === "swell") {
       const th = e.k0 * (e.Dx * gx + e.Dy * gy) + e.ph0;
       // d/dθ of the sharpened profile: cosθ·(1 + 2q·sinθ)
@@ -589,7 +1004,7 @@ function slopeAt(gx, gy, S) {
     } else if (e.type === "rings") {
       for (let i = 0; i < e.M; i++) {
         const dx = gx - e.CX[i], dy = gy - e.CY[i];
-        const r = Math.hypot(dx, dy) + 1e-6;
+        const r = Math.sqrt(dx * dx + dy * dy + e.E2[i]);
         const env = Math.exp(-e.dec * r);
         const arg = e.K[i] * r + e.PH[i];
         const f = e.AMP[i] * env * (e.K[i] * Math.cos(arg) - e.dec * Math.sin(arg));
@@ -3066,6 +3481,7 @@ export {
   DERIVED_ENV_H, ENV2D_W, DEFAULT_EMITTERS,
   computeFit, cell2ground, heightAt, clampLift, penProject, reflectAt,
   withWakes, newWake, WAKE_ANGLE_DEG, prepField, slopeAt,
+  WATER_MOODS, SEA_N_DEFAULT, SPECTRUM_N_REF, NOISE_PERIOD,
   buildSurface3D, buildSurface3DPanorama, buildSolid3D, fieldSpecFor, crestField,
   buildPenLines, buildPenConcentric, buildPenHatch, HATCH_AIMS,
   RASTER_LEVELS, RASTER_DEFAULT, ANTIALIAS, ANTIALIAS_DEFAULT, antialiasAt,
@@ -4052,10 +4468,13 @@ const miniBtnBase = {
 };
 
 function EmitterCard({ em, idx, halfW, yFar, dispersion, onChange, onRemove }) {
-  const types = [["point", "Point"], ["rings", "Rings"], ["swell", "Swell"], ["spectrum", "Spectrum"]];
+  // Sea leads: it is the one that makes open water read, and the one a new
+  // emitter starts as. Spectrum stays for the scenes that were built on it.
+  const types = [["sea", "Sea"], ["swell", "Swell"], ["spectrum", "Spectrum"],
+    ["rings", "Rings"], ["point", "Point"]];
   // What the wavelength slider just bought this train, in the terms the Speed
-  // panel states the rule in. For a spectrum this is its dominant component;
-  // the shorter rungs of its ladder run faster still.
+  // panel states the rule in. For a sea or a spectrum this is its dominant
+  // component; the shorter rungs of the ladder run faster still.
   const disp = dispersionFor(em.size, dispersion);
   return (
     <div style={{ border: "1px solid #26313c", borderRadius: 9, padding: 11,
@@ -4074,10 +4493,10 @@ function EmitterCard({ em, idx, halfW, yFar, dispersion, onChange, onRemove }) {
           style={{ fontSize: 12, width: 26, height: 26, borderRadius: 6, cursor: "pointer",
             background: "#1a232c", color: "#9a6a6a", border: "1px solid #3a2a2a" }}>✕</button>
       </div>
-      <div style={{ display: "flex", gap: 5, marginBottom: 10 }}>
+      <div style={{ display: "flex", gap: 5, marginBottom: 10, flexWrap: "wrap" }}>
         {types.map(([tp, label]) => (
           <button key={tp} onClick={() => onChange({ type: tp })}
-            style={{ flex: 1, padding: "6px 4px", fontSize: 11, borderRadius: 6, cursor: "pointer",
+            style={{ flex: "1 0 28%", padding: "6px 4px", fontSize: 11, borderRadius: 6, cursor: "pointer",
               fontFamily: "ui-monospace, monospace",
               background: em.type === tp ? "#27424b" : "#1a232c",
               color: em.type === tp ? "#dff1f6" : "#9fb0c0",
@@ -4090,8 +4509,8 @@ function EmitterCard({ em, idx, halfW, yFar, dispersion, onChange, onRemove }) {
         <Slider label="y (distance)" value={em.y} min={3} max={yFar} step={0.5} onChange={(v) => onChange({ y: v })} />
       </>}
 
-      {(em.type === "swell" || em.type === "spectrum") &&
-        <Slider label={em.type === "spectrum" ? "wind heading" : "heading"} value={em.dir}
+      {(em.type === "swell" || em.type === "spectrum" || em.type === "sea") &&
+        <Slider label={em.type === "swell" ? "heading" : "wind heading"} value={em.dir}
           min={0} max={360} step={5} onChange={(v) => onChange({ dir: v })} fmt={(v) => v + "°"} />}
 
       {em.type === "spectrum" && <>
@@ -4104,6 +4523,25 @@ function EmitterCard({ em, idx, halfW, yFar, dispersion, onChange, onRemove }) {
           onChange={(v) => onChange({ detail: v })} />
       </>}
 
+      {em.type === "sea" && <>
+        <Slider label="direction spread" value={em.spread} min={0} max={80} step={1}
+          onChange={(v) => onChange({ spread: v })} fmt={(v) => v + "°"} />
+        <Slider label="fine texture" value={em.roughness == null ? 0.5 : em.roughness}
+          min={0} max={1} step={0.02} onChange={(v) => onChange({ roughness: v })}
+          fmt={(v) => (v < 0.25 ? "clean swell" : v < 0.55 ? "rippled" : v < 0.8 ? "textured" : "busy")} />
+        <Slider label="chop (crest shape)" value={em.chop == null ? SEA_CHOP_DEFAULT : em.chop}
+          min={0} max={1} step={0.02} onChange={(v) => onChange({ chop: v })}
+          fmt={(v) => (v < 0.15 ? "sine (soft)" : v < 0.5 ? "peaked" : v < 0.8 ? "steep" : "near breaking")} />
+        <Slider label="patchiness (gusts)" value={em.patch == null ? SEA_PATCH_DEFAULT : em.patch}
+          min={0} max={1} step={0.02} onChange={(v) => onChange({ patch: v })}
+          fmt={(v) => (v < 0.1 ? "even" : v < 0.45 ? "uneven" : v < 0.75 ? "cat's paws" : "mostly glass")} />
+        <Slider label="groupiness (sets)" value={em.group == null ? SEA_GROUP_DEFAULT : em.group}
+          min={0} max={1} step={0.02} onChange={(v) => onChange({ group: v })}
+          fmt={(v) => (v < 0.1 ? "steady" : v < 0.5 ? "gentle sets" : "marked sets")} />
+        <Slider label="components (cost)" value={em.detail == null ? SEA_N_DEFAULT : em.detail}
+          min={12} max={96} step={4} onChange={(v) => onChange({ detail: v })} />
+      </>}
+
       {em.type === "rings" && <>
         <Slider label="count (ripple sources)" value={em.detail} min={2} max={18} step={1}
           onChange={(v) => onChange({ detail: v })} />
@@ -4112,7 +4550,8 @@ function EmitterCard({ em, idx, halfW, yFar, dispersion, onChange, onRemove }) {
           fmt={(v) => (v < 0.2 ? "uniform" : v < 0.6 ? "varied" : "random")} />
       </>}
 
-      <Slider label={em.type === "spectrum" ? "dominant wavelength" : "wavelength"} value={em.size}
+      <Slider label={em.type === "swell" || em.type === "point" || em.type === "rings"
+        ? "wavelength" : "dominant wavelength"} value={em.size}
         min={0.3} max={5} step={0.1} onChange={(v) => onChange({ size: v })} fmt={(v) => v.toFixed(1) + "×"} />
       {dispersion && (
         <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5, marginTop: -6,
@@ -4325,9 +4764,10 @@ export default function App() {
     setEmitters((es) => es.map((e) => (e.id === id ? { ...e, ...patch } : e)));
   const addEmitter = () =>
     setEmitters((es) => es.length >= 5 ? es :
-      [...es, { id: es.reduce((m, e) => Math.max(m, e.id), 0) + 1, on: true, type: "rings",
-        x: 0, y: 20, dir: 90, size: 1.0, amp: 0.8, spread: 25, roughness: 0.45, detail: 10,
-        rate: EMITTER_RATE_DEFAULT }]);
+      [...es, { id: es.reduce((m, e) => Math.max(m, e.id), 0) + 1, on: true, type: "sea",
+        x: 0, y: 20, dir: 90, size: 1.0, amp: 0.8, spread: 50, roughness: 0.6,
+        detail: SEA_N_DEFAULT, chop: SEA_CHOP_DEFAULT, patch: SEA_PATCH_DEFAULT,
+        group: SEA_GROUP_DEFAULT, rate: EMITTER_RATE_DEFAULT }]);
   const removeEmitter = (id) => setEmitters((es) => es.filter((e) => e.id !== id));
   const [halfW, setHalfW] = useState(22); // 44 units across
   const [yNear, setYNear] = useState(3);
@@ -5750,6 +6190,21 @@ export default function App() {
 
             <div style={panel}>
               <div style={heading}>Water surface</div>
+              <div style={{ display: "flex", gap: 6, marginBottom: 8, flexWrap: "wrap" }}>
+                {WATER_MOODS.map((m) => (
+                  <button key={m.name} style={{ ...miniBtn, flex: "1 0 44%" }} title={m.note}
+                    onClick={() => {
+                      setWavelength(m.wavelength); setStrength(m.strength);
+                      setSharp(m.sharp); setSpread(m.spread);
+                      setEmitters(m.emitters.map((e) => ({ ...e })));
+                    }}>{m.name}</button>
+                ))}
+              </div>
+              <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5, marginBottom: 10,
+                fontFamily: "ui-monospace, monospace" }}>
+                Whole emitter stacks, tuned together. They replace the ripple sources and the
+                four sliders below; the camera, palette and range you have are left alone.
+              </div>
               <Slider label="Ripple scale (λ)" value={wavelength} min={0.6} max={7} step={0.1}
                 onChange={setWavelength} fmt={(v) => v.toFixed(1)} />
               <Slider label="Ripple strength" value={strength} min={0.05} max={1} step={0.01}
@@ -6374,10 +6829,15 @@ export default function App() {
                 <div style={heading}>Ripple emitters</div>
                 <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 10, lineHeight: 1.5,
                   fontFamily: "ui-monospace, monospace" }}>
-                  Swell = one long straight-crested wave train. Spectrum = a wind field of many
-                  straight waves (raise roughness for chop). Rings = a scattered field of radial
-                  ripples — the source of the concentric color rings you see on a real lake.
-                  Point = a single spreading ripple.
+                  Sea = open water: a real wave spectrum around a dominant wavelength, crests
+                  kept short by spreading the headings, with chop shaping the crests, gust
+                  patches switching the fine ripples on and off across the water, and slow
+                  sets rolling through. It is the one to reach for first — the presets under
+                  Water surface are stacks built on it. Swell = one long straight-crested wave
+                  train. Spectrum = the older wind field, a plain ladder of straight waves,
+                  kept for scenes built on it. Rings = a scattered field of radial ripples —
+                  the concentric color rings you see on a real lake. Point = a single spreading
+                  ripple.
                   {dispersion
                     ? " Speed follows wavelength is on, so each card shows the share of the"
                       + " clock its wavelength earns it; the rate below that is a trim on"
