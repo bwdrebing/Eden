@@ -3544,6 +3544,56 @@ export {
 };
 
 // ---- UI bits -------------------------------------------------------
+
+// The control surface's information architecture: six task-shaped
+// workspaces, rendered as tabs. This registry is the single source of
+// truth for the tab strip AND the find-box index — a control is only
+// findable if its label is listed under its workspace's `find` entries.
+// Placing a new control (or deciding whether something deserves a new
+// workspace) is governed by .claude/skills/control-surface/SKILL.md —
+// read it before adding entries here.
+const WORKSPACES = [
+  { id: "camera", name: "Camera", icon: "◇", find: [
+    "height (view angle)", "pitch (perspective squash)", "roll", "zoom (focal length)",
+    "pan", "framing presets (full / mid / far / close-up)",
+    "grazing perspective", "rectangular output (fill frame)"] },
+  { id: "waves", name: "Waves", icon: "≈", find: [
+    "ripple scale (wavelength)", "ripple strength", "crest sharpness", "spread / reach",
+    "emitters (swell, spectrum, rings, point)", "roughness (chop)", "wind heading",
+    "emitter rate (trim on the clock's share)",
+    "speed follows wavelength (dispersion)",
+    "3d wave surface", "wave height (3d)", "crest gap & color",
+    "plane width", "plane near / far edge"] },
+  { id: "backdrop", name: "Backdrop", icon: "◐", find: [
+    "palette presets", "paint 1d (elevation strip)", "paint 2d (panorama)", "from photo",
+    "backdrop layers (paint, stripes, shapes)", "shapes editor", "bake a layer",
+    "undo / redo the backdrop", "brush size & shape", "color swatches",
+    "show the backdrop itself", "elevation window (auto-fit, low / high)",
+    "reflection width (azimuth span)", "reflection detail (angular zoom)",
+    "fresnel depth mix", "deep water color"] },
+  { id: "objects", name: "Objects", icon: "◉", find: [
+    "watermark text on the water", "watermark type, weight & italic",
+    "letter spacing", "watermark size, position & turn", "watermark ink & outline",
+    "reflected objects across the water", "boat & board wakes (kelvin v)"] },
+  { id: "style", name: "Style", icon: "✎", find: [
+    "pen-plot mode", "pen style (parallel, concentric, hatched)", "line width",
+    "ring spacing", "hatch slant & tone", "3d relief (pen)", "hide obscured lines",
+    "edge smoothing", "edge ripple", "show region edges",
+    "antialiasing (jagged edges, staircases)", "background color"] },
+  { id: "output", name: "Output", icon: "⇲", find: [
+    "export svg", "export detail / mesh / edge polish", "export png & size",
+    "export mp4 (video length, video size)", "perfect loop", "loop length (phase)",
+    "layered paper stack", "sample grid", "3d surface detail (raster)",
+    "low power mode"] },
+];
+
+// Tabs that have been renamed since scenes started carrying uiTab.
+const LEGACY_TABS = { color: "backdrop" };
+
+// One flat index for the find box: [label, workspaceId].
+const SEARCH_INDEX = WORKSPACES.flatMap((w) => w.find.map((f) => [f, w.id]))
+  .concat([["animate ripples / speed (scene clock rate) / time scrub", "transport"]]);
+
 function Slider({ label, value, min, max, step, onChange, fmt }) {
   return (
     <label style={{ display: "block", marginBottom: 12 }}>
@@ -3675,6 +3725,43 @@ function ElevationScale({ eLo, eHi, mag, reach, children }) {
         </div>
       )}
     </>
+  );
+}
+
+// Long-form help lives behind this one-line disclosure so a control costs
+// its own height, not its documentation's. Anything longer than ~2 lines
+// of prose goes in a <Help>, per the control-surface skill.
+function Help({ label, children }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div style={{ margin: "0 0 8px" }}>
+      <button onClick={() => setOpen((o) => !o)}
+        style={{ background: "none", border: "none", padding: "1px 0", cursor: "pointer",
+          fontSize: 10, color: open ? "#9fd0d9" : "#5f7384",
+          fontFamily: "ui-monospace, monospace" }}>
+        ⓘ {label || "how this works"} {open ? "▾" : "▸"}
+      </button>
+      {open && (
+        <div style={{ fontSize: 10.5, color: "#8a9bab", lineHeight: 1.55, marginTop: 3,
+          fontFamily: "ui-monospace, monospace", borderLeft: "2px solid #26313c",
+          paddingLeft: 9 }}>
+          {children}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Where a control used to be duplicated, its old spots carry this pointer
+// to its one home instead — one state, one control, one place to learn it.
+function JumpNote({ label, onJump }) {
+  return (
+    <button onClick={onJump}
+      style={{ background: "none", border: "1px dashed #2a3640", borderRadius: 6,
+        padding: "5px 9px", cursor: "pointer", fontSize: 10, color: "#7f93a4",
+        fontFamily: "ui-monospace, monospace", marginBottom: 8, display: "block" }}>
+      {label} →
+    </button>
   );
 }
 
@@ -4426,7 +4513,18 @@ export default function App() {
   const [vidProg, setVidProg] = useState(null);            // { done, total, startedAt }
   const [quality, setQuality] = useState(() =>
     (typeof window !== "undefined" && window.innerWidth < 820) ? 100 : 140);
-  const [advanced, setAdvanced] = useState(false);
+  // which workspace tab the control panel shows; carried in the URL like
+  // every other studio setting so a shared link lands on the same tab.
+  // A tab that has since been renamed (or one from a build this link has
+  // never met) must still resolve to a real workspace — every panel is
+  // gated on this id, so an unknown one would render an empty column.
+  // The normalized value is what gets serialized, so old links heal
+  // themselves the first time they are opened.
+  const [savedTab, setUiTab] = useState("camera");
+  const uiTab = WORKSPACES.some((w) => w.id === savedTab)
+    ? savedTab : (LEGACY_TABS[savedTab] || WORKSPACES[0].id);
+  const [findQ, setFindQ] = useState("");     // find-box query
+  const [flashTab, setFlashTab] = useState(0); // > 0 briefly highlights a landed-on tab body
 
   const [emitters, setEmitters] = useState(DEFAULT_EMITTERS);
   const updateEmitter = (id, patch) =>
@@ -4676,7 +4774,7 @@ export default function App() {
     exportPolishQ: [exportPolishQ, setExportPolishQ], pngQ: [pngQ, setPngQ],
     vidSec: [vidSec, setVidSec], vidQ: [vidQ, setVidQ],
     vidLoop: [vidLoop, setVidLoop], vidLoopPhase: [vidLoopPhase, setVidLoopPhase],
-    advanced: [advanced, setAdvanced], emitters: [emitters, setEmitters],
+    uiTab: [uiTab, setUiTab], emitters: [emitters, setEmitters],
     wakes: [wakes, setWakes],
     halfW: [halfW, setHalfW], yNear: [yNear, setYNear], yFar: [yFar, setYFar],
     reflMag: [reflMag, setReflMag], objects: [objects, setObjects],
@@ -4871,6 +4969,25 @@ export default function App() {
     return Math.max(-m, Math.min(m, v));
   };
   const resetCamera = () => { setZoom(1); setPanX(0); setPanY(0); };
+
+  // find-box jump: land on a workspace tab and flash its body so the eye
+  // knows where it was taken. "transport" flashes the bar under the preview.
+  const jumpTo = (wsId) => {
+    if (wsId !== "transport") setUiTab(wsId);
+    setFindQ("");
+    setFlashTab((f) => f + 1);
+  };
+  const [flashOn, setFlashOn] = useState(false);
+  useEffect(() => {
+    if (!flashTab) return;
+    setFlashOn(true);
+    const t = setTimeout(() => setFlashOn(false), 900);
+    return () => clearTimeout(t);
+  }, [flashTab]);
+  const findHits = findQ.trim()
+    ? SEARCH_INDEX.filter(([label]) =>
+        label.toLowerCase().includes(findQ.trim().toLowerCase())).slice(0, 8)
+    : [];
 
   useEffect(() => {
     const el = previewRef.current;
@@ -5119,7 +5236,7 @@ export default function App() {
     [flatNeeded, use2d, S, backdrop, azSpan]);
   // …and those two numbers from the sample pass alone, only while something
   // is looking at them
-  const rangeNeeded = !flatNeeded && (autoFit || advanced);
+  const rangeNeeded = !flatNeeded && (autoFit || uiTab === "backdrop");
   const range = useMemo(() => (rangeNeeded ? elevationRange(S) : null), [rangeNeeded, S]);
   const rng = flatNeeded ? (use2d ? seg : geom) : range;
   const rngLo = rng ? rng.lo : null, rngHi = rng ? rng.hi : null;
@@ -5744,6 +5861,7 @@ export default function App() {
             touchAction: camDrag ? "none" : undefined,
             cursor: camDrag ? "grab" : undefined,
             boxShadow: "0 8px 24px rgba(0,0,0,0.55)" }}>
+            <div style={{ position: "relative" }}>
             <svg viewBox={`0 0 ${VB_W} ${VB_H}`} style={{ width: "100%", display: "block" }}>
               <rect width={VB_W} height={VB_H} fill={bgFill} />
               <g transform={rollTf || undefined}>
@@ -5842,10 +5960,120 @@ export default function App() {
                 background: camDrag ? "#27424b" : "#141b23e0",
                 color: camDrag ? "#dff1f6" : "#7f93a4",
                 border: "1px solid " + (camDrag ? "#3f7e8f" : "#26313c") }}>✥</button>
+            </div>
+            {/* Transport: the scene's one clock, docked with the picture it
+                moves — always visible, never in a tab. Speed is the clock's
+                rate, so it stays reachable whether or not the preview is
+                running: with the animation paused it still sets how much
+                water a second of exported video covers. The scrub is the
+                clock's position, and only means anything while paused. */}
+            <div onPointerDown={(e) => e.stopPropagation()}
+              style={{ padding: "8px 12px", borderTop: "1px solid #1b2530",
+                background: flashOn ? "#12222a" : "#0a0f15", transition: "background .4s" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <button onClick={() => setAnimate(!animate)}
+                  title={animate ? "pause the ripples" : "animate the ripples"}
+                  style={{ width: 30, height: 30, borderRadius: 7, cursor: "pointer",
+                    flex: "none", fontSize: 13, lineHeight: 1,
+                    background: animate ? "#27424b" : "#1a232c",
+                    color: animate ? "#dff1f6" : "#9fb0c0",
+                    border: "1px solid " + (animate ? "#3f7e8f" : "#26313c") }}>
+                  {animate ? "\u275a\u275a" : "\u25b6"}</button>
+                <span style={{ fontSize: 9.5, color: "#6d808f", flex: "none",
+                  fontFamily: "ui-monospace, monospace" }}>speed</span>
+                <input type="range" min={SPEED_MIN} max={SPEED_MAX} step={0.05} value={speed}
+                  aria-label="Speed (the scene clock's rate)"
+                  onChange={(e) => setSpeed(parseFloat(e.target.value))}
+                  style={{ flex: 1, height: 24, cursor: "pointer", minWidth: 0 }} />
+                <span style={{ fontSize: 10.5, color: "#cdd9e3", flex: "none", minWidth: 78,
+                  textAlign: "right", fontFamily: "ui-monospace, monospace" }}>
+                  {speed.toFixed(2)} · {(speed * PHASE_PER_SEC).toFixed(1)}/s</span>
+              </div>
+              {!animate && (
+                <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 6 }}>
+                  <span style={{ width: 30, flex: "none" }} />
+                  <span style={{ fontSize: 9.5, color: "#6d808f", flex: "none",
+                    fontFamily: "ui-monospace, monospace" }}>time</span>
+                  <input type="range" min={0} max={20} step={0.05} value={manualTime}
+                    aria-label="Time (wave phase) — scrub to a frozen moment to view or export"
+                    onChange={(e) => setManualTime(parseFloat(e.target.value))}
+                    style={{ flex: 1, height: 24, cursor: "pointer", minWidth: 0 }} />
+                  <span style={{ fontSize: 10.5, color: "#cdd9e3", flex: "none", minWidth: 78,
+                    textAlign: "right", fontFamily: "ui-monospace, monospace" }}>
+                    {manualTime.toFixed(2)}</span>
+                </div>
+              )}
+              <Help label="the scene clock">
+                One clock drives every emitter, the buoy and its reflection, and speed is
+                its rate — for the animation and for the video export alike. Turning it down
+                and the video length up is how you get the same stretch of water to unfold
+                slowly: a {vidPlan.seconds.toFixed(1)} s export covers{" "}
+                {vidPlan.endPhase.toFixed(1)} of phase at this setting. Each emitter also
+                has its own rate against this one (in Waves), so a long swell can roll
+                while the chop on top of it races.
+              </Help>
+            </div>
           </div>
 
-          {/* CONTROLS */}
-          <div>
+          {/* CONTROLS — one workspace tab at a time; see WORKSPACES above
+              and .claude/skills/control-surface/SKILL.md for what goes where */}
+          <div style={{ boxShadow: flashOn ? "0 0 0 2px #3f8597" : "none",
+            borderRadius: 12, transition: "box-shadow .5s" }}>
+            <div style={{ position: "relative", marginBottom: 10 }}>
+              <input value={findQ} onChange={(e) => setFindQ(e.target.value)}
+                placeholder="Find a control…" aria-label="Find a control"
+                style={{ width: "100%", boxSizing: "border-box", background: "#151c24",
+                  color: "#e6eef5", border: "1px solid #232d38", borderRadius: 9,
+                  padding: "9px 12px", fontSize: 12, fontFamily: "ui-monospace, monospace" }} />
+              {findHits.length > 0 && (
+                <div style={{ position: "absolute", top: "100%", left: 0, right: 0, zIndex: 30,
+                  marginTop: 4, background: "#141b23", border: "1px solid #33414e",
+                  borderRadius: 9, overflow: "hidden", boxShadow: "0 12px 30px rgba(0,0,0,.6)" }}>
+                  {findHits.map(([label, ws]) => (
+                    <button key={label} onClick={() => jumpTo(ws)}
+                      style={{ display: "flex", width: "100%", alignItems: "center", gap: 8,
+                        background: "none", border: "none", borderBottom: "1px solid #232d38",
+                        color: "#9fb0c0", fontFamily: "ui-monospace, monospace", fontSize: 11,
+                        padding: "7px 10px", cursor: "pointer", textAlign: "left" }}>
+                      <span style={{ flex: 1 }}>{label}</span>
+                      <span style={{ fontSize: 9, color: "#5fb6c9", border: "1px solid #2f6b78",
+                        borderRadius: 3, padding: "0 5px", flex: "none" }}>
+                        {ws === "transport" ? "under preview"
+                          : WORKSPACES.find((w) => w.id === ws).name}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+              {findQ.trim() !== "" && findHits.length === 0 && (
+                <div style={{ position: "absolute", top: "100%", left: 0, right: 0, zIndex: 30,
+                  marginTop: 4, background: "#141b23", border: "1px solid #33414e",
+                  borderRadius: 9, padding: "7px 10px", fontSize: 11, color: "#6d808f",
+                  fontFamily: "ui-monospace, monospace" }}>no matching control</div>
+              )}
+            </div>
+
+            <div role="tablist" aria-label="Control workspaces"
+              style={{ display: "grid", gridTemplateColumns: "repeat(6, 1fr)",
+                gap: 4, marginBottom: 12 }}>
+              {WORKSPACES.map((w) => {
+                const on = uiTab === w.id;
+                return (
+                  <button key={w.id} role="tab" aria-selected={on}
+                    onClick={() => setUiTab(w.id)}
+                    style={{ padding: "7px 2px 5px", borderRadius: 8, cursor: "pointer",
+                      display: "flex", flexDirection: "column", alignItems: "center", gap: 1,
+                      background: on ? "#1d2a34" : "none",
+                      color: on ? "#dff1f6" : "#6f8294",
+                      border: "1px solid " + (on ? "#2f6b78" : "transparent") }}>
+                    <span style={{ fontSize: 14, lineHeight: 1.2 }}>{w.icon}</span>
+                    <span style={{ fontSize: 8.5, letterSpacing: 0.4, textTransform: "uppercase",
+                      fontFamily: "ui-monospace, monospace" }}>{w.name}</span>
+                  </button>
+                );
+              })}
+            </div>
+
+            {uiTab === "camera" && <>
             <div style={panel}>
               <div style={heading}>Camera</div>
               <Slider label="Height (view angle at near edge)" value={steep} min={0} max={1} step={0.01}
@@ -5882,10 +6110,18 @@ export default function App() {
                 double-click to reset. The ✥ button on the preview toggles this
                 (turn it off to scroll the page on touch screens).
               </div>
+              <div style={{ marginTop: 8 }}>
+                <Toggle label="Grazing perspective" value={perspective} onChange={setPerspective} />
+                {perspective && (
+                  <Toggle label="Rectangular output (fill frame)" value={rectOutput} onChange={setRectOutput} />
+                )}
+              </div>
             </div>
+            </>}
 
+            {uiTab === "waves" && <>
             <div style={panel}>
-              <div style={heading}>Water surface</div>
+              <div style={heading}>Open water</div>
               <Slider label="Ripple scale (λ)" value={wavelength} min={0.6} max={7} step={0.1}
                 onChange={setWavelength} fmt={(v) => v.toFixed(1)} />
               <Slider label="Ripple strength" value={strength} min={0.05} max={1} step={0.01}
@@ -5897,8 +6133,83 @@ export default function App() {
                 onChange={setSpread} fmt={(v) => (v < 0.4 ? "tight" : v < 0.75 ? "medium" : "wide")} />
               <Slider label="Plane width" value={halfW} min={2} max={40} step={1}
                 onChange={setHalfW} fmt={(v) => v * 2 + " units"} />
+              <Slider label="Plane near edge" value={yNear} min={1} max={15} step={0.5}
+                onChange={setYNear} fmt={(v) => v.toFixed(1)} />
+              <Slider label="Plane depth (far edge)" value={yFar} min={10} max={90} step={2}
+                onChange={setYFar} />
+              {/* How each train's motion follows from its size is a property of
+                  the water, not of the clock — the clock's rate lives on the
+                  transport, and this decides how that one tempo is shared out. */}
+              <Toggle label="Speed follows wavelength" value={dispersion}
+                onChange={setDispersion} />
+              <Help label="speed follows wavelength">
+                Real water disperses: a long wave rolls through slowly and overtakes
+                everything, a short one bobs fast and barely travels. With this on, Speed
+                (on the transport, under the preview) stays the scene's one tempo and each
+                train's share of it is worked out from its own wavelength — crests carry as
+                √λ, the bob as 1/√λ — so a swell at 4.0× runs its crests through twice as
+                fast as one at 1.0× and oscillates half as often. Off, every train bobs at
+                the clock's rate whatever its size, which sends long swell across the frame
+                far too fast. Each emitter still keeps a rate of its own, now a trim on the
+                share the rule gives it.
+              </Help>
             </div>
 
+            <div style={panel}>
+              <div style={heading}>3D relief</div>
+              {!penMode ? (
+                <Toggle
+                  label={perspective ? "3D wave surface" : "3D wave surface (needs perspective)"}
+                  value={surface3d && perspective}
+                  onChange={(v) => { if (!perspective) setPerspective(true); setSurface3d(v); }} />
+              ) : (
+                <JumpNote label="Pen-plot mode is on — relief is under Style"
+                  onJump={() => jumpTo("style")} />
+              )}
+              {!penMode && perspective && surface3d && (
+                <>
+                  <Slider label="Wave height (3D)" value={waveScale} min={0} max={10} step={0.05}
+                    onChange={setWaveScale} fmt={(v) => (v === 0 ? "flat" : v.toFixed(2))} />
+                  <Help label="wave height">
+                    Lifts the color regions onto the actual wave crests to preview the surface
+                    in relief. Tune the wave <em>scale</em> with Ripple scale (λ) &amp; strength
+                    above, and the vertical exaggeration here.
+                  </Help>
+                  <Slider label="Crest gap" value={crestGap} min={0} max={8} step={0.25}
+                    onChange={setCrestGap} fmt={(v) => (v === 0 ? "off" : v.toFixed(2))} />
+                  <Help label="crest gap">
+                    Lets the water occlude a little past its own silhouette, opening a strip of
+                    background along the far side of every crest. Where a wave crosses water its
+                    own color it otherwise blends straight into it — this is what says which one
+                    is in front. Measured on the frame, so the export draws the same gap, only
+                    traced finer — a coarse preview raster holds it a hair wider, since it
+                    cannot place either edge closer than a pixel.
+                  </Help>
+                  {crestGap > 0 && (
+                    <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
+                      <label style={{ width: 26, height: 26, borderRadius: 6, cursor: "pointer",
+                        border: "1px solid #44525e", position: "relative", overflow: "hidden",
+                        background: gapFill, display: "inline-block", flex: "none" }}>
+                        <input type="color"
+                          value={/^#[0-9a-fA-F]{6}$/.test(gapFill) ? gapFill : "#ffffff"}
+                          onChange={(e) => setCrestGapColor(e.target.value)}
+                          style={{ position: "absolute", inset: -4, opacity: 0, cursor: "pointer" }} />
+                      </label>
+                      <span style={{ fontSize: 11, color: "#9fb0c0", flex: 1,
+                        fontFamily: "ui-monospace, monospace" }}>
+                        {crestGapColor ? crestGapColor : "gap color: background"}
+                      </span>
+                      <button onClick={() => setCrestGapColor("")}
+                        style={{ ...miniBtn, flex: "none", padding: "6px 12px",
+                          opacity: crestGapColor ? 1 : 0.5 }}>Auto</button>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+            </>}
+
+            {uiTab === "backdrop" && <>
             <div style={panel}>
               <div style={heading}>Environment</div>
               {mode === "preset" && !stops &&
@@ -6196,8 +6507,7 @@ export default function App() {
               <div style={heading}>What the water sees</div>
               <Toggle label="Show the backdrop itself" value={showBackdrop}
                 onChange={setShowBackdrop} />
-              <div style={{ fontSize: 9.5, color: "#6d808f", margin: "2px 0 12px", lineHeight: 1.5,
-                fontFamily: "ui-monospace, monospace" }}>
+              <Help label="showing the backdrop">
                 {penMode
                   ? "Not in pen mode — the pen styles draw the water's own lines."
                   : showBackdrop
@@ -6208,7 +6518,7 @@ export default function App() {
                       + " paper stack cuts water only."
                     : "Draw the backdrop above the horizon, not only its reflection. The fastest"
                       + " way to see what the elevation window is doing."}
-              </div>
+              </Help>
               <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 10, lineHeight: 1.5,
                 fontFamily: "ui-monospace, monospace" }}>
                 The window of the sky the ripples can reach. Every backdrop row maps into
@@ -6241,21 +6551,20 @@ export default function App() {
               <Slider label="reflection detail (angular zoom)" value={reflMag} min={0.5} max={10}
                 step={0.1} onChange={setReflMag}
                 fmt={(v) => (v === 1 ? "1.0× (off)" : v.toFixed(1) + "×")} />
-              <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 10, lineHeight: 1.5,
-                fontFamily: "ui-monospace, monospace" }}>
+              <Help label="reflection detail">
                 Compresses the environment into a narrower reflected cone, so a small ripple
                 tilt sweeps more of the colors — the telephoto close-up look where every
                 wavelet carries the whole gradient. Pair with auto-fit for steep-down shots.
-              </div>
+              </Help>
               {use2d && (
                 <>
-                  <Slider label="edge ripple" value={coherence} min={0} max={8} step={1}
-                    onChange={setCoherence}
-                    fmt={(v) => (v === 0 ? "sharp" : v <= 2 ? "rippled" : v <= 5 ? "smooth" : "broad")} />
-                  <div style={{ fontSize: 9.5, color: "#6d808f", margin: "2px 0 10px", lineHeight: 1.5,
-                    fontFamily: "ui-monospace, monospace" }}>
-                    Lower = edges follow every wave; higher = calmer, broader regions.
-                  </div>
+                  {/* edge ripple reads as a backdrop setting here and an edge
+                      setting under Style, but it is one number — it lives with
+                      the other edge controls, and this points at it. */}
+                  <JumpNote label={`Edge ripple (how closely edges follow the waves) is under Style · `
+                    + (coherence === 0 ? "sharp" : coherence <= 2 ? "rippled"
+                      : coherence <= 5 ? "smooth" : "broad")}
+                    onJump={() => jumpTo("style")} />
                   <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 6,
                     fontFamily: "ui-monospace, monospace" }}>
                     reflected panorama (what the water actually samples):
@@ -6285,24 +6594,24 @@ export default function App() {
                     <span style={{ fontSize: 12, color: "#9fb0c0",
                       fontFamily: "ui-monospace, monospace" }}>deep water · {deepColor}</span>
                   </div>
-                  <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5,
-                    fontFamily: "ui-monospace, monospace" }}>
+                  <Help label="how depth mixing works">
                     Steep view angles see through the surface (Fresnel reflectance ~2%), grazing
                     angles mirror it — so the near water shifts toward the deep-water color, in
                     flat contoured bands. The far field stays pure reflection.
-                  </div>
+                  </Help>
                 </div>
               )}
             </div>
+            </>}
 
+            {uiTab === "objects" && <>
             <div style={panel}>
               <div style={heading}>Watermark on the water</div>
-              <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 10, lineHeight: 1.5,
-                fontFamily: "ui-monospace, monospace" }}>
+              <Help label="what the watermark is">
                 Type lying on the surface itself — not a reflection. It bends with the wave it
                 sits on and stops where a nearer crest hides the water behind it, but it never
                 shreds, so it stays readable where a reflected sign would not.
-              </div>
+              </Help>
               <Toggle label="Watermark" value={markOn} onChange={setMarkOn} />
               {markOn && (
                 <div style={{ marginTop: 8 }}>
@@ -6332,27 +6641,25 @@ export default function App() {
                       <ColorWell label="outline" value={markHaloColor} onChange={setMarkHaloColor} />
                     )}
                   </div>
-                  <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5,
-                    fontFamily: "ui-monospace, monospace" }}>
+                  <Help label="sizing & the outline">
                     Size is one em in the water's own units, so a watermark laid far out reads
                     smaller through the same camera as everything else. The outline is a second
                     cut of the same field a little outside the letters — it is what keeps pale
                     type legible over the pale water of a specular band.
                     {!markMask && markText.trim() ? " (This browser gave no canvas to set type on,"
                       + " so nothing is drawn.)" : ""}
-                  </div>
+                  </Help>
                 </div>
               )}
             </div>
 
             <div style={panel}>
               <div style={heading}>Objects across the water</div>
-              <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 10, lineHeight: 1.5,
-                fontFamily: "ui-monospace, monospace" }}>
+              <Help label="what these are">
                 Stamped into the reflected panorama, not drawn in the frame — like the boats
                 in the paintings, only each object's reflection appears in the water, torn up
                 by the ripples and rimmed with an ink line.
-              </div>
+              </Help>
               {objects.map((o, i) => (
                 <ObjectCard key={o.id} obj={o} idx={i} azSpan={azSpan} eLo={eLo} eHi={eHi}
                   onChange={(patch) => updateObject(o.id, patch)}
@@ -6377,18 +6684,17 @@ export default function App() {
 
             <div style={panel}>
               <div style={heading}>Boat &amp; board wakes</div>
-              <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 10, lineHeight: 1.5,
-                fontFamily: "ui-monospace, monospace" }}>
+              <Help label="how wakes work">
                 The water a hull leaves behind it — the V of a Kelvin wake, cut into the color
                 regions like any other wave. No vessel is drawn: place the boat or board over
                 the apex in post. Scale and strength are the wake&#39;s own, read in scene units
-                rather than off the sliders above, so it holds its size and its height when you
-                retune the open water — a new wake only starts at the strength the water has.
+                rather than off the open-water sliders, so it holds its size and its height when
+                you retune the open water — a new wake only starts at the strength the water has.
                 Arm detail sets how short a wave the feathering off the arms may carry: turn it
                 down for a big scene where those wavelets land a pixel wide and break up under
                 the 3D lift, up for a close one where they are the point. The pattern stands
                 still in the vessel&#39;s frame, so it does not drift when the waves animate.
-              </div>
+              </Help>
               {wakes.map((wk, i) => (
                 <WakeCard key={wk.id} wk={wk} idx={i} halfW={halfW} yFar={yFar}
                   onChange={(patch) => updateWake(wk.id, patch)}
@@ -6404,11 +6710,42 @@ export default function App() {
               )}
             </div>
 
+            </>}
+
+            {uiTab === "waves" && <>
             <div style={panel}>
-              <div style={heading}>Display</div>
+              <div style={heading}>Ripple emitters</div>
+              <Help label="emitter types">
+                Swell = one long straight-crested wave train. Spectrum = a wind field of many
+                straight waves (raise roughness for chop). Rings = a scattered field of radial
+                ripples — the source of the concentric color rings you see on a real lake.
+                Point = a single spreading ripple. Each carries a rate — its gearing off
+                the scene clock — so a long swell can roll under fast chop, or one train
+                can be frozen while the rest of the water moves.
+              </Help>
+              {emitters.map((em, i) => (
+                <EmitterCard key={em.id} em={em} idx={i} halfW={halfW} yFar={yFar}
+                  dispersion={dispersion}
+                  onChange={(patch) => updateEmitter(em.id, patch)}
+                  onRemove={() => removeEmitter(em.id)} />
+              ))}
+              {emitters.length < 4 && (
+                <button onClick={addEmitter}
+                  style={{ width: "100%", padding: "9px", borderRadius: 8, cursor: "pointer",
+                    background: "#1a232c", color: "#9fb0c0", border: "1px dashed #3a4a57",
+                    fontFamily: "ui-monospace, monospace", fontSize: 12 }}>
+                  + add emitter
+                </button>
+              )}
+            </div>
+            </>}
+
+            {uiTab === "style" && <>
+            <div style={panel}>
+              <div style={heading}>Region edges</div>
               <Slider label="Edge smoothing" value={smooth} min={0} max={4} step={1}
                 onChange={setSmooth} fmt={(v) => (v === 0 ? "off (crisp)" : v + "×")} />
-              <Slider label="edge ripple" value={coherence} min={0} max={8} step={1}
+              <Slider label="Edge ripple" value={coherence} min={0} max={8} step={1}
                 onChange={setCoherence}
                 fmt={(v) => (v === 0 ? "sharp" : v <= 2 ? "rippled" : v <= 5 ? "smooth" : "broad")} />
               {coherence > 0 && (
@@ -6417,206 +6754,38 @@ export default function App() {
                   Blurs the reflection everywhere — sharp (0) keeps every wavelet's ripple.
                 </div>
               )}
-              <Toggle label="Grazing perspective" value={perspective} onChange={setPerspective} />
-              {perspective && (
-                <Toggle label="Rectangular output (fill frame)" value={rectOutput} onChange={setRectOutput} />
-              )}
-              {!penMode && (
-                <Toggle
-                  label={perspective ? "3D wave surface" : "3D wave surface (needs perspective)"}
-                  value={surface3d && perspective}
-                  onChange={(v) => { if (!perspective) setPerspective(true); setSurface3d(v); }} />
-              )}
-              {!penMode && perspective && surface3d && (
-                <>
-                  <Slider label="Wave height (3D)" value={waveScale} min={0} max={10} step={0.05}
-                    onChange={setWaveScale} fmt={(v) => (v === 0 ? "flat" : v.toFixed(2))} />
-                  <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 8, lineHeight: 1.5,
-                    fontFamily: "ui-monospace, monospace" }}>
-                    Lifts the color regions onto the actual wave crests to preview the surface
-                    in relief. Tune the wave <em>scale</em> with Ripple scale (λ) &amp; strength above,
-                    and the vertical exaggeration here.
-                  </div>
-                  <Slider label="Crest gap" value={crestGap} min={0} max={8} step={0.25}
-                    onChange={setCrestGap} fmt={(v) => (v === 0 ? "off" : v.toFixed(2))} />
-                  <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 8, lineHeight: 1.5,
-                    fontFamily: "ui-monospace, monospace" }}>
-                    Lets the water occlude a little past its own silhouette, opening a strip of
-                    background along the far side of every crest. Where a wave crosses water its
-                    own color it otherwise blends straight into it — this is what says which one
-                    is in front. Measured on the frame, so the export draws the same gap, only
-                    traced finer — a coarse preview raster holds it a hair wider, since it
-                    cannot place either edge closer than a pixel.
-                  </div>
-                  {crestGap > 0 && (
-                    <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
-                      <label style={{ width: 26, height: 26, borderRadius: 6, cursor: "pointer",
-                        border: "1px solid #44525e", position: "relative", overflow: "hidden",
-                        background: gapFill, display: "inline-block", flex: "none" }}>
-                        <input type="color"
-                          value={/^#[0-9a-fA-F]{6}$/.test(gapFill) ? gapFill : "#ffffff"}
-                          onChange={(e) => setCrestGapColor(e.target.value)}
-                          style={{ position: "absolute", inset: -4, opacity: 0, cursor: "pointer" }} />
-                      </label>
-                      <span style={{ fontSize: 11, color: "#9fb0c0", flex: 1,
-                        fontFamily: "ui-monospace, monospace" }}>
-                        {crestGapColor ? crestGapColor : "gap color: background"}
-                      </span>
-                      <button onClick={() => setCrestGapColor("")}
-                        style={{ ...miniBtn, flex: "none", padding: "6px 12px",
-                          opacity: crestGapColor ? 1 : 0.5 }}>Auto</button>
-                    </div>
-                  )}
-                </>
-              )}
               <Toggle label="Show region edges" value={edges} onChange={setEdges} />
-              <Toggle label="Animate ripples" value={animate} onChange={setAnimate} />
-              {/* Speed is the rate of the one clock the whole scene reads, so it
-                  belongs here whether or not the preview is currently running it:
-                  with the animation off it still sets how much water a second of
-                  exported video covers. */}
-              <div style={{ marginTop: 8 }}>
-                <Slider label="Speed" value={speed} min={SPEED_MIN} max={SPEED_MAX} step={0.05}
-                  onChange={setSpeed}
-                  fmt={(v) => `${v.toFixed(2)} \u00b7 ${(v * PHASE_PER_SEC).toFixed(1)} phase/s`} />
-                <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5, marginTop: -4,
-                  fontFamily: "ui-monospace, monospace" }}>
-                  One clock drives every emitter and everything that rides the surface, and this is
-                  its rate — for the animation above and for the video export alike. Turning
-                  it down and the video length up is how you get the same stretch of water
-                  to unfold slowly: a {vidPlan.seconds.toFixed(1)} s export covers
-                  {" "}{vidPlan.endPhase.toFixed(1)} of phase at this setting.
-                </div>
-                <Toggle label="Speed follows wavelength" value={dispersion}
-                  onChange={setDispersion} />
-                <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5, marginTop: -4,
-                  fontFamily: "ui-monospace, monospace" }}>
-                  Real water disperses: a long wave rolls through slowly and overtakes
-                  everything, a short one bobs fast and barely travels. With this on, the
-                  clock above stays the scene's one tempo and each train's share of it is
-                  worked out from its own wavelength — crests carry as √λ, the bob as 1/√λ —
-                  so a swell at 4.0× runs its crests through twice as fast as one at 1.0×
-                  and oscillates half as often. Off, every train bobs at the clock's rate
-                  whatever its size, which sends long swell across the frame far too fast.
-                  Under advanced each emitter still keeps a rate, now a trim on the share
-                  the rule gives it.
-                </div>
-              </div>
-              {animate ? null : (
-                <div style={{ marginTop: 8 }}>
-                  <Slider label="Time (wave phase)" value={manualTime} min={0} max={20} step={0.05}
-                    onChange={setManualTime} fmt={(v) => v.toFixed(2)} />
-                  <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5, marginTop: -4,
-                    fontFamily: "ui-monospace, monospace" }}>
-                    Scrub to a specific frozen moment to view or export.
-                  </div>
-                </div>
-              )}
+              {/* Jagged edges are an edge problem, so the control for them sits
+                  with the other edge controls — not with the raster that sets how
+                  fine a stair is, which is a cost decision under Output. */}
+              <Slider label="Antialiasing" value={antialiasQ} min={0} max={ANTIALIAS.length - 1}
+                step={1} onChange={setAntialiasQ}
+                fmt={(v) => {
+                  const a = ANTIALIAS[v];
+                  return a.passes ? `${a.name} · ${a.passes} passes` : a.name;
+                }} />
+              <Help label="antialiasing">
+                3D surface detail (under Output) sets how fine a stair is; this is what
+                removes one. An edge is cut at one crossing per raster pixel, so out where
+                the reflection turns over faster than a pixel the boundary zigzags against
+                that grid — staircases along a far crest, slivers either side of a seam,
+                specks a pixel across. This blurs the field first, before the shapes are
+                decided, which is the only place a jagged contour can be reached: the bands
+                stay parallel and a pinched-off speck leaves cleanly instead of as a stray
+                ring.
+                {" It is a smoothing pass, so it is not free — the thinnest bright ribbons"
+                  + " fatten and can break into dots, and the finer the raster the less of"
+                  + " that you pay. Light at " + RASTER_LEVELS[RASTER_LEVELS.length - 1].name
+                  + " costs almost nothing visible; at draft it will soften the picture"
+                  + " itself."}
+                {solid3d
+                  ? " Everything built from what is on screen carries it: the preview, the"
+                    + " PNG, the video frames, the paper stack — and the SVG, whose own edge"
+                    + " polish adds to it."
+                  : " The 3D wave surface is off, so this only reaches the layered-paper"
+                    + " export, which is cut from the same kind of raster."}
+              </Help>
             </div>
-
-            <button onClick={() => setAdvanced((a) => !a)}
-              style={{ width: "100%", background: "none", border: "1px dashed #2a3640",
-                color: "#7f93a4", padding: "8px", borderRadius: 9, cursor: "pointer",
-                fontSize: 11.5, fontFamily: "ui-monospace, monospace", marginBottom: 14 }}>
-              {advanced ? "− hide advanced" : "+ advanced (sources, range, quality)"}
-            </button>
-
-            {advanced && (
-              <div style={panel}>
-                <div style={heading}>Ripple emitters</div>
-                <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 10, lineHeight: 1.5,
-                  fontFamily: "ui-monospace, monospace" }}>
-                  Swell = one long straight-crested wave train. Spectrum = a wind field of many
-                  straight waves (raise roughness for chop). Rings = a scattered field of radial
-                  ripples — the source of the concentric color rings you see on a real lake.
-                  Point = a single spreading ripple.
-                  {dispersion
-                    ? " Speed follows wavelength is on, so each card shows the share of the"
-                      + " clock its wavelength earns it; the rate below that is a trim on"
-                      + " top, and 0 still freezes one train while the rest of the water moves."
-                    : " Each carries a rate — its gearing off the scene clock — so a long"
-                      + " swell can roll under fast chop, or one train can be frozen while"
-                      + " the rest of the water moves."}
-                </div>
-                {emitters.map((em, i) => (
-                  <EmitterCard key={em.id} em={em} idx={i} halfW={halfW} yFar={yFar}
-                    dispersion={dispersion}
-                    onChange={(patch) => updateEmitter(em.id, patch)}
-                    onRemove={() => removeEmitter(em.id)} />
-                ))}
-                {emitters.length < 4 && (
-                  <button onClick={addEmitter}
-                    style={{ width: "100%", padding: "9px", borderRadius: 8, cursor: "pointer",
-                      background: "#1a232c", color: "#9fb0c0", border: "1px dashed #3a4a57",
-                      fontFamily: "ui-monospace, monospace", fontSize: 12, marginBottom: 12 }}>
-                    + add emitter
-                  </button>
-                )}
-                <div style={{ ...heading, marginTop: 10 }}>Range & quality</div>
-                <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 10, lineHeight: 1.5,
-                  fontFamily: "ui-monospace, monospace" }}>
-                  The elevation window moved up to <b>What the water sees</b>, beside the
-                  backdrop it frames.
-                </div>
-                <Slider label="plane near edge" value={yNear} min={1} max={15} step={0.5}
-                  onChange={setYNear} fmt={(v) => v.toFixed(1)} />
-                <Slider label="plane depth (far edge)" value={yFar} min={10} max={90} step={2} onChange={setYFar} />
-                <Slider label="sample grid" value={quality} min={60} max={220} step={10} onChange={setQuality} />
-                <Slider label="3D surface detail" value={rasterQ} min={0} max={RASTER_LEVELS.length - 1}
-                  step={1} onChange={setRasterQ}
-                  fmt={(v) => {
-                    const L = RASTER_LEVELS[v];
-                    return `${L.name} · ${L.BW}px` + (lowPower && v > 0 ? " (capped)" : "");
-                  }} />
-                <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 10, lineHeight: 1.5,
-                  fontFamily: "ui-monospace, monospace" }}>
-                  {solid3d
-                    ? "Resolution of the 3D pass: the regions are contoured on a raster this many"
-                      + " pixels wide, so it sets how fine a wave edge can get — mostly visible"
-                      + " along the crest lines, where a near wave cuts across the water behind"
-                      + " it. Cost grows with the square, and every color layer pays it: print and"
-                      + " max are meant for a still you export, not for panning around — and for"
-                      + " an export you can leave this where you like to work and let export"
-                      + " detail (next to the button) do the fine trace instead."
-                    : penMode && penStyle === "hatch"
-                      ? "The hatched pen style is cut from the same kind of raster: it sets how"
-                        + " finely a region boundary is placed, and so where a stroke stops."
-                        + " The other pen styles don't use it."
-                      : "The 3D wave surface is off, so this only sets the resolution of the"
-                        + " layered-paper export, which is cut from the same kind of raster."}
-                  {` The paper stack caps it at ${PAPER_MAX_BW}px — past that the`
-                    + " cut lines get finer than paper and scissors care about."}
-                  {lowPower && rasterQ > 0 && " Low power mode is holding this at draft."}
-                </div>
-                <Slider label="antialiasing" value={antialiasQ} min={0} max={ANTIALIAS.length - 1}
-                  step={1} onChange={setAntialiasQ}
-                  fmt={(v) => {
-                    const a = ANTIALIAS[v];
-                    return a.passes ? `${a.name} · ${a.passes} passes` : a.name;
-                  }} />
-                <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 10, lineHeight: 1.5,
-                  fontFamily: "ui-monospace, monospace" }}>
-                  Detail above sets how fine a stair is; this is what removes one. An edge is
-                  cut at one crossing per raster pixel, so out where the reflection turns over
-                  faster than a pixel the boundary zigzags against that grid — staircases along
-                  a far crest, slivers either side of a seam, specks a pixel across. This blurs
-                  the field first, before the shapes are decided, which is the only place a
-                  jagged contour can be reached: the bands stay parallel and a pinched-off
-                  speck leaves cleanly instead of as a stray ring.
-                  {" It is a smoothing pass, so it is not free — the thinnest bright ribbons"
-                    + " fatten and can break into dots, and the finer the raster the less of"
-                    + " that you pay. Light at " + RASTER_LEVELS[RASTER_LEVELS.length - 1].name
-                    + " costs almost nothing visible; at draft it will soften the picture"
-                    + " itself."}
-                  {solid3d
-                    ? " Everything built from what is on screen carries it: the preview, the"
-                      + " PNG, the video frames, the paper stack — and the SVG, whose own edge"
-                      + " polish adds to it."
-                    : " The 3D wave surface is off, so this only reaches the layered-paper"
-                      + " export, which is cut from the same kind of raster."}
-                </div>
-              </div>
-            )}
 
             <div style={panel}>
               <div style={heading}>Background</div>
@@ -6643,7 +6812,6 @@ export default function App() {
                 ))}
               </div>
             </div>
-
             <div style={panel}>
               <div style={heading}>Pen plotter</div>
               <Toggle label="Pen-plot mode" value={penMode} onChange={setPenMode} />
@@ -6719,7 +6887,9 @@ export default function App() {
                 </div>
               )}
             </div>
+            </>}
 
+            {uiTab === "output" && <>
             {solid3d && (
               <div style={{ marginBottom: 10 }}>
                 <Slider label="export detail" value={exportQ} min={0} max={EXPORT_MULTS.length - 1}
@@ -6729,15 +6899,14 @@ export default function App() {
                     return (m === 1 ? "as previewed" : `${m}\u00d7 preview`) + ` \u00b7 ${bw}px`
                       + (bw === EXPORT_MAX_BW && rasterLevel.BW * m > EXPORT_MAX_BW ? " (capped)" : "");
                   }} />
-                <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5,
-                  fontFamily: "ui-monospace, monospace" }}>
+                <Help label="export detail">
                   The file is a curve fitted to one crossing per raster pixel, so the preview's
                   raster is also the smallest wobble an edge can have — invisible at panel size,
                   a visible stair once the SVG is opened full-screen or printed. This retraces
                   the regions wider on the way out (the same picture, resolved finer), which is
                   what smooths the distant crests. It runs once per export and the page holds
                   still while it does — seconds at {RASTER_LEVELS[RASTER_LEVELS.length - 1].name}.
-                </div>
+                </Help>
                 <Slider label="export mesh" value={exportMeshQ} min={0} max={EXPORT_MESHES.length - 1}
                   step={1} onChange={setExportMeshQ}
                   fmt={(v) => {
@@ -6745,8 +6914,7 @@ export default function App() {
                     return `${m.name} · ${gn}`
                       + (m.f < 1 && gn === EXPORT_MESH_FLOOR ? " (floor)" : "");
                   }} />
-                <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5,
-                  fontFamily: "ui-monospace, monospace" }}>
+                <Help label="export mesh">
                   The other half of the same trade. The raster sets how finely an edge is drawn;
                   this sets how much surface there is to draw, and the detail steps raise it
                   faster than any raster can resolve — so standing it down for the export is a
@@ -6755,16 +6923,15 @@ export default function App() {
                   crests round off a little and the smallest far-field wavelets stop showing
                   at all. Leave it as previewed for a faithful file; reach for it when a
                   distant edge still crawls at {EXPORT_MAX_BW}px.
-                </div>
+                </Help>
                 <Slider label="edge polish" value={exportPolishQ} min={0} max={EXPORT_POLISH.length - 1}
                   step={1} onChange={setExportPolishQ}
                   fmt={(v) => {
                     const q = EXPORT_POLISH[v];
                     return q.passes ? `${q.name} · ${q.passes} passes` : q.name;
                   }} />
-                <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5,
-                  fontFamily: "ui-monospace, monospace" }}>
-                  The same step as <b>antialiasing</b> under Range &amp; quality, and this is the
+                <Help label="edge polish">
+                  The same step as <b>antialiasing</b> under Style, and this is the
                   extra the file gets on top of it: smoothing the field the regions are cut
                   from, just before they are cut. What is left on a far edge once the raster is
                   as wide as it goes is the reflection varying faster than one pixel, and this
@@ -6776,7 +6943,7 @@ export default function App() {
                   {polish.preview > 0
                     && ` This scene already antialiases at ${polish.preview}, so the file is`
                        + ` traced at ${polish.svg}.`}
-                </div>
+                                </Help>
               </div>
             )}
 
@@ -6804,26 +6971,27 @@ export default function App() {
                 fontSize: 13.5, fontWeight: 600, letterSpacing: 0.3 }}>
               {pngBusy ? `Rendering ${pngAt.w}\u00d7${pngAt.h}\u2026` : "Export PNG"}
             </button>
-            <div style={{ fontSize: 10, color: "#6d808f", marginTop: 5, lineHeight: 1.5,
-              fontFamily: "ui-monospace, monospace" }}>
-              {solid3d ? (
-                <>
-                  Pixels instead of paths, and the closest thing to the preview this page
-                  can hand you. The steps above smooth the vector outline so it survives
-                  being magnified — edge polish especially, which blurs the field before
-                  the regions are cut and takes the smallest glints and highlights with
-                  it. A raster has no outline to smooth, so the PNG runs neither that
-                  polish nor the mesh stand-down: it draws the preview's own geometry —
-                  antialiasing included, since that is part of what is on screen{pngRetrace
-                    ? `, retraced at ${exportRaster(rasterLevel, exportMult).BW}px so the edges are resolved for a file this wide.`
-                    : "."} Reach for it when the SVG loses something you can see on screen.
-                </>
-              ) : (
-                <>
-                  Pixels instead of paths: the same picture the SVG carries, drawn at print
-                  size, for anywhere a vector file is not what you want.
-                </>
-              )}
+            <div style={{ marginTop: 5 }}>
+              <Help label="when to use PNG">
+                {solid3d ? (
+                  <>
+                    Pixels instead of paths, and the closest thing to the preview this page
+                    can hand you. The steps above smooth the vector outline so it survives
+                    being magnified — edge polish especially, which blurs the field before
+                    the regions are cut and takes the smallest glints and highlights with
+                    it. A raster has no outline to smooth, so the PNG runs neither that
+                    polish nor the mesh stand-down: it draws the preview's own geometry —
+                    antialiasing included, since that is part of what is on screen{pngRetrace
+                      ? `, retraced at ${exportRaster(rasterLevel, exportMult).BW}px so the edges are resolved for a file this wide.`
+                      : "."} Reach for it when the SVG loses something you can see on screen.
+                  </>
+                ) : (
+                  <>
+                    Pixels instead of paths: the same picture the SVG carries, drawn at print
+                    size, for anywhere a vector file is not what you want.
+                  </>
+                )}
+              </Help>
             </div>
 
             {pngErr && (
@@ -6941,17 +7109,18 @@ export default function App() {
               </div>
             )}
 
-            <div style={{ fontSize: 10, color: "#6d808f", marginTop: 5, lineHeight: 1.5,
-              fontFamily: "ui-monospace, monospace" }}>
-              The animation, written out at a steady {VIDEO_FPS}fps whatever this scene renders
-              at live. Each frame is built at the wave phase it is due at — starting from
-              t&nbsp;=&nbsp;0, ending at {vidPlan.endPhase.toFixed(1)} — so the file plays at the
-              speed the scene was set up for, however long it takes to make. Detail costs the
-              render, not the playback: a frame that takes two seconds on screen takes two
-              seconds here too, and there are {vidPlan.count} of them. The picture is the
-              preview's own geometry, like the PNG — no polish pass, no export retrace. How
-              much water it covers is Speed, under Display: turn that down and this up, and
-              the same swell unfolds slowly instead of racing past.
+            <div style={{ marginTop: 5 }}>
+              <Help label="how the video is made">
+                The animation, written out at a steady {VIDEO_FPS}fps whatever this scene renders
+                at live. Each frame is built at the wave phase it is due at — starting from
+                t&nbsp;=&nbsp;0, ending at {vidPlan.endPhase.toFixed(1)} — so the file plays at the
+                speed the scene was set up for, however long it takes to make. Detail costs the
+                render, not the playback: a frame that takes two seconds on screen takes two
+                seconds here too, and there are {vidPlan.count} of them. The picture is the
+                preview's own geometry, like the PNG — no polish pass, no export retrace. How
+                much water it covers is Speed, on the transport under the preview: turn that
+                down and this up, and the same swell unfolds slowly instead of racing past.
+              </Help>
             </div>
 
             {vidErr && (
@@ -7006,12 +7175,13 @@ export default function App() {
                 fontSize: 13.5, fontWeight: 600, letterSpacing: 0.3 }}>
               Export layered paper ↓
             </button>
-            <div style={{ fontSize: 10, color: "#6d808f", marginTop: 5, lineHeight: 1.5,
-              fontFamily: "ui-monospace, monospace" }}>
-              A stack of same-size sheets, each one contiguous piece with holes cut, that
-              rebuilds the scene when stacked in order. Cut from the picture on screen —
-              the 3D surface, what the crests hide, and the current framing included —
-              posterized to at most {PAPER_MAX_COLORS} colors, since paper is not a gradient.
+            <div style={{ marginTop: 5 }}>
+              <Help label="what the paper stack is">
+                A stack of same-size sheets, each one contiguous piece with holes cut, that
+                rebuilds the scene when stacked in order. Cut from the picture on screen —
+                the 3D surface, what the crests hide, and the current framing included —
+                posterized to at most {PAPER_MAX_COLORS} colors, since paper is not a gradient.
+              </Help>
             </div>
 
             {svgOut && (
@@ -7070,25 +7240,45 @@ export default function App() {
               Exports as {regionCount} vector regions. Edges stay straight under
               the perspective map, so the vector stays clean at any zoom.
             </p>
-          </div>
-        </div>
 
-        {/* Low power mode — battery saver, pinned at the foot of the page */}
-        <div style={{ marginTop: 20, paddingTop: 14, borderTop: "1px solid #1b2530",
-          display: "flex", alignItems: "center", justifyContent: "space-between",
-          gap: 12, flexWrap: "wrap" }}>
-          <div style={{ maxWidth: 480 }}>
-            <div style={{ fontSize: 12.5, color: "#cdd9e3", letterSpacing: 0.3,
-              fontFamily: "ui-monospace, monospace" }}>Low power mode</div>
-            <div style={{ fontSize: 10.5, color: "#6d808f", lineHeight: 1.5, marginTop: 3,
-              fontFamily: "ui-monospace, monospace" }}>
-              Caps the render grid to a coarser resolution and throttles the ripple
-              animation to ~15fps. Trades some fidelity for much lower battery use
-              on phones{lowPower ? " — currently on." : "."}
+            <div style={{ ...panel, marginTop: 14 }}>
+              <div style={heading}>Render quality</div>
+              <Slider label="sample grid" value={quality} min={60} max={220} step={10}
+                onChange={setQuality} />
+              <Slider label="3D surface detail" value={rasterQ} min={0} max={RASTER_LEVELS.length - 1}
+                step={1} onChange={setRasterQ}
+                fmt={(v) => {
+                  const L = RASTER_LEVELS[v];
+                  return `${L.name} · ${L.BW}px` + (lowPower && v > 0 ? " (capped)" : "");
+                }} />
+              <Help label="what the raster costs and buys">
+                {solid3d
+                  ? "Resolution of the 3D pass: the regions are contoured on a raster this many"
+                    + " pixels wide, so it sets how fine a wave edge can get — mostly visible"
+                    + " along the crest lines, where a near wave cuts across the water behind"
+                    + " it. Cost grows with the square, and every color layer pays it: print and"
+                    + " max are meant for a still you export, not for panning around — and for"
+                    + " an export you can leave this where you like to work and let export"
+                    + " detail (above) do the fine trace instead."
+                  : penMode && penStyle === "hatch"
+                    ? "The hatched pen style is cut from the same kind of raster: it sets how"
+                      + " finely a region boundary is placed, and so where a stroke stops."
+                      + " The other pen styles don't use it."
+                    : "The 3D wave surface is off, so this only sets the resolution of the"
+                      + " layered-paper export, which is cut from the same kind of raster."}
+                {` The paper stack caps it at ${PAPER_MAX_BW}px — past that the`
+                  + " cut lines get finer than paper and scissors care about."}
+                {lowPower && rasterQ > 0 && " Low power mode is holding this at draft."}
+              </Help>
+              <Toggle label={"Low power mode" + (lowPower ? " (on)" : "")}
+                value={lowPower} onChange={setLowPower} />
+              <Help label="low power mode">
+                Caps the render grid to a coarser resolution and throttles the ripple
+                animation to ~15fps. Trades some fidelity for much lower battery use
+                on phones.
+              </Help>
             </div>
-          </div>
-          <div style={{ flexShrink: 0, minWidth: 132 }}>
-            <Toggle label={lowPower ? "On" : "Off"} value={lowPower} onChange={setLowPower} />
+            </>}
           </div>
         </div>
       </div>
