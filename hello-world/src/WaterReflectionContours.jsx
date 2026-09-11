@@ -2080,6 +2080,91 @@ function relLum(c) {
   return (0.2126 * s.r + 0.7152 * s.g + 0.0722 * s.b) / 255;
 }
 
+// The wave height's gradient in SCREEN pixels, over a surface raster: which way
+// the water runs uphill at each pixel of the picture, and how steeply.
+//
+// Sampled off the mesh through the raster's own grid coordinates, so it is the
+// height of the point actually visible at that pixel — across a crest
+// silhouette the two sheets keep their own slopes instead of averaging into a
+// direction neither of them has. `S` is passed separately from the raster
+// because a caller may have rasterized a different relief than the scene's
+// (the pen styles do), and the slope wanted is always the scene's own.
+//
+// Two callers read it: the hatch's "wave" aim, which takes the axis of the
+// gradient over a whole region, and the drift grid, which takes the direction
+// at one point. Both need the same answer, which is why it is one function.
+function surfaceSlopeField(R, S, gN) {
+  const { BW, BH, NP, GI, GJ, cov } = R;
+  const stride = gN + 1;
+  const HG = new Float64Array(stride * stride);
+  for (let j = 0; j <= gN; j++) for (let i = 0; i <= gN; i++) {
+    const [gx, gy] = cell2ground((i / gN) * S.nx, (j / gN) * S.ny, S);
+    HG[j * stride + i] = heightAt(gx, gy, S);
+  }
+  const HR = new Float64Array(NP);
+  for (let p = 0; p < NP; p++) {
+    if (!cov[p]) continue;
+    const fi = Math.max(0, Math.min(gN - 1e-6, GI[p])), fj = Math.max(0, Math.min(gN - 1e-6, GJ[p]));
+    const i0 = Math.floor(fi), j0 = Math.floor(fj), tx = fi - i0, ty = fj - j0, q = j0 * stride + i0;
+    HR[p] = (HG[q] * (1 - tx) + HG[q + 1] * tx) * (1 - ty)
+          + (HG[q + stride] * (1 - tx) + HG[q + stride + 1] * tx) * ty;
+  }
+  const HGX = new Float64Array(NP), HGY = new Float64Array(NP);
+  for (let y = 0; y < BH; y++) for (let x = 0; x < BW; x++) {
+    const p = y * BW + x;
+    if (!cov[p]) continue;
+    // one-sided at the water's edge: an uncovered neighbour holds no height
+    const xm = x > 0 && cov[p - 1] ? p - 1 : p, xp = x < BW - 1 && cov[p + 1] ? p + 1 : p;
+    const ym = y > 0 && cov[p - BW] ? p - BW : p, yp = y < BH - 1 && cov[p + BW] ? p + BW : p;
+    const hx = xp - xm, hy = (yp - ym) / BW;      // 0, 1 or 2 pixels apart
+    HGX[p] = hx ? (HR[xp] - HR[xm]) / hx : 0;
+    HGY[p] = hy ? (HR[yp] - HR[ym]) / hy : 0;
+  }
+  return { HGX, HGY };
+}
+
+// The color the filled render would paint at a ground point.
+//
+// The contouring path answers this by cutting regions; the pen styles and the
+// drift grid need it the other way round — the color at one arbitrary point,
+// thousands of times — and they must get the same answer the regions do, or a
+// stroke lands in a band the picture does not have there. One sampler, built
+// from the same slice of studio state `fieldSpecFor` takes, so the two readings
+// of the palette cannot drift apart.
+//
+// `deepMix` folds in the Fresnel depth band, which is a property of the ray
+// rather than of the palette, so it stays the caller's to supply.
+function colorSampler(S, opts) {
+  const { use2d, env, azSpan, cols, deepMix } = opts;
+  const mag = S.reflMag || 1;
+  if (use2d) {
+    const { w: EW, h: EH, cells } = env;
+    const az = azSpan;
+    return (gx, gy) => {
+      const R = reflectAt(gx, gy, S);
+      const phi = Math.asin(Math.max(-1, Math.min(1, R[2]))) * 180 / Math.PI;
+      let psi = Math.atan2(R[0], R[1]) * 180 / Math.PI; psi = psi < -az ? -az : psi > az ? az : psi;
+      let v = magFrac((phi - S.eLo) / ((S.eHi - S.eLo) || 1), mag); v = v < 0 ? 0 : v > 1 ? 1 : v;
+      let u = magFrac((psi + az) / (2 * az), mag); u = u < 0 ? 0 : u > 1 ? 1 : u;
+      const c = cells[Math.min(EH - 1, Math.floor(v * EH)) * EW + Math.min(EW - 1, Math.floor(u * EW))];
+      return deepMix(c, R[3]);
+    };
+  }
+  const NB = cols.length, fr = S.bandFractions;
+  return (gx, gy) => {
+    const R = reflectAt(gx, gy, S);
+    const phi = Math.asin(Math.max(-1, Math.min(1, R[2]))) * 180 / Math.PI;
+    let v = magFrac((phi - S.eLo) / ((S.eHi - S.eLo) || 1), mag); v = v < 0 ? 0 : v >= 1 ? 0.999999 : v;
+    let c;
+    if (fr) {
+      let idx = 0;
+      for (const f of fr) { if (v >= f) idx++; else break; }
+      c = cols[idx] || cols[0];
+    } else c = cols[Math.floor(v * NB)] || cols[0];
+    return deepMix(c, R[3]);
+  };
+}
+
 // Where each region's deviation from the base angle comes from. Ordered as the
 // UI shows them: the two that read the picture first, the one that doesn't last.
 const HATCH_AIMS = [
@@ -2108,38 +2193,9 @@ function buildPenHatch(S, fit, colorAt, opts) {
     idxField[p] = id;
   }
 
-  // ---- screen-space gradient of the wave height, for the "wave" aim.
-  // Sampled off the mesh through the raster's own grid coordinates, so it is
-  // the height of the point actually visible at that pixel — across a crest
-  // silhouette the two sheets keep their own slopes instead of averaging.
-  let HGX = null, HGY = null;
-  if (aim === "wave") {
-    const stride = gN + 1;
-    const HG = new Float64Array(stride * stride);
-    for (let j = 0; j <= gN; j++) for (let i = 0; i <= gN; i++) {
-      const [gx, gy] = cell2ground((i / gN) * S.nx, (j / gN) * S.ny, S);
-      HG[j * stride + i] = heightAt(gx, gy, S);
-    }
-    const HR = new Float64Array(NP);
-    for (let p = 0; p < NP; p++) {
-      if (!cov[p]) continue;
-      const fi = Math.max(0, Math.min(gN - 1e-6, GI[p])), fj = Math.max(0, Math.min(gN - 1e-6, GJ[p]));
-      const i0 = Math.floor(fi), j0 = Math.floor(fj), tx = fi - i0, ty = fj - j0, q = j0 * stride + i0;
-      HR[p] = (HG[q] * (1 - tx) + HG[q + 1] * tx) * (1 - ty)
-            + (HG[q + stride] * (1 - tx) + HG[q + stride + 1] * tx) * ty;
-    }
-    HGX = new Float64Array(NP); HGY = new Float64Array(NP);
-    for (let y = 0; y < BH; y++) for (let x = 0; x < BW; x++) {
-      const p = y * BW + x;
-      if (!cov[p]) continue;
-      // one-sided at the water's edge: an uncovered neighbour holds no height
-      const xm = x > 0 && cov[p - 1] ? p - 1 : p, xp = x < BW - 1 && cov[p + 1] ? p + 1 : p;
-      const ym = y > 0 && cov[p - BW] ? p - BW : p, yp = y < BH - 1 && cov[p + BW] ? p + BW : p;
-      const hx = xp - xm, hy = (yp - ym) / BW;      // 0, 1 or 2 pixels apart
-      HGX[p] = hx ? (HR[xp] - HR[xm]) / hx : 0;
-      HGY[p] = hy ? (HR[yp] - HR[ym]) / hy : 0;
-    }
-  }
+  // ---- screen-space gradient of the wave height, for the "wave" aim
+  const slope = aim === "wave" ? surfaceSlopeField(R, S, gN) : null;
+  const HGX = slope ? slope.HGX : null, HGY = slope ? slope.HGY : null;
 
   // ---- connected regions of one color, with the moments each aim needs
   const label = new Int32Array(NP).fill(-1);
@@ -2300,6 +2356,158 @@ function buildPenHatch(S, fit, colorAt, opts) {
     if (parts.length) add(palette[c.id], parts.join(""));
   }
   return [...byColor.entries()].map(([color, subs]) => ({ color, d: subs.join("") }));
+}
+
+// ---- the drift grid ------------------------------------------------
+// A peripheral-drift figure cut from the scene: the picture rendered not as
+// filled regions but as a screen grid of small shapes, each turned to lie along
+// the wave that passes under it, each carrying an asymmetric pair of rims. Held
+// in peripheral vision the whole frame appears to roll, though nothing moves.
+//
+// The illusion (Fraser–Wilcox, and Kitaoka's optimized versions of it) is a
+// luminance trick, not a geometric one. A repeating sequence of four tones —
+// mid, black, mid, white — with the SAME handedness everywhere is read by the
+// motion system as movement, because the visual system's latency for a dark
+// edge differs from its latency for a light one, and a consistently ordered
+// pair of them fakes the temporal offset real motion would produce. So the
+// three things that matter here are:
+//
+//   * the repeating unit must be asymmetric. A shape with rims of equal weight
+//     on both sides is mirror-symmetric and the two readings cancel exactly;
+//     one dark rim and one light rim do not.
+//   * the handedness must be CONSISTENT across the frame. This is the part
+//     that a wave scene gets wrong if you are not careful: the obvious move is
+//     to hang the dark rim on each shape's uphill side, and that reverses on
+//     every other flank of every wave, so the drift cancels wave by wave and
+//     the picture just looks embossed. The rims here are hung off the crest
+//     normal signed against ONE reference direction for the whole frame — the
+//     dominant crest normal of the picture, which is the direction the swell is
+//     travelling — so every shape carries its dark rim on the same side of the
+//     water's own grain and the readings add up. A scene whose crests genuinely
+//     run every which way has no consistent handedness to find, and will drift
+//     only where they agree; that is the illusion's limit, not a bug in it.
+//   * the rims must be near-black and near-white against a mid ground. Anything
+//     softer and the effect fades; these two are constants for that reason,
+//     and the tones between them are the scene's own colors.
+//
+// What the wave supplies is the ORIENTATION: each shape's long axis runs along
+// the crest through it, taken from the screen-space slope field (the same one
+// the hatch's "wave" aim reads), so the grid traces out the swell the way iron
+// filings trace a field. The drift then runs across the crests, which is the
+// direction the wave itself travels.
+//
+// Everything is on one uniform screen grid, deliberately: the illusion is a
+// property of the retinal image, so the repeating unit has to keep its size
+// across the frame rather than shrink into the distance with the water.
+const DRIFT_SHAPES = [
+  // id, label, thickness across the shape as a fraction of its half-length
+  ["almond", "Almond", 0.42],
+  ["ellipse", "Ellipse", 0.58],
+  ["disc", "Disc", 1],
+];
+const DRIFT_DARK = "#000000";
+const DRIFT_LIGHT = "#ffffff";
+// Below this the slope has no direction worth reading.
+const DRIFT_FLAT = 1e-9;
+
+// One shape, half-length 1 along its own +x and `k` half-thickness across +y.
+// The almond is a true vesica: two circular arcs meeting at points, which is
+// what gives it the tapered ends a plain ellipse does not have.
+function driftShapePath(kind, k) {
+  if (kind === "disc") return "M-1 0A1 1 0 1 0 1 0A1 1 0 1 0-1 0Z";
+  if (kind === "ellipse") return `M-1 0A1 ${fix2(k)} 0 1 0 1 0A1 ${fix2(k)} 0 1 0-1 0Z`;
+  const R = fix2((1 + k * k) / (2 * k));
+  return `M-1 0A${R} ${R} 0 0 1 1 0A${R} ${R} 0 0 1-1 0Z`;
+}
+
+// `opts`: { shape, density, size, spacing, tint, ink, BW, gN, threeD }.
+// Returns { d, half, aim, cells: [{ x, y, a, c }] } — the unit outline, the
+// scale each copy is drawn at, the frame's own drift heading in degrees, and
+// one record per shape in viewBox coordinates. The rim offset is not baked in:
+// it is applied at draw time, in the shape's own rotated frame, so the same
+// grid can be re-rimmed without rebuilding.
+function buildDriftGrid(S, fit, colorAt, opts) {
+  const { shape, density, size, spacing, tint, ink, BW, gN, threeD } = opts;
+  const kind = DRIFT_SHAPES.find(([id]) => id === shape) || DRIFT_SHAPES[0];
+  // the raster carries the front-most surface point's grid coordinate, so a
+  // crest in front hides the water — and the shapes — behind it, and the color
+  // under each shape is the one the filled render would have put there
+  const R = rasterizeSurface(S, fit, gN, BW, threeD);
+  const { BH, cov, GI, GJ } = R;
+  const { HGX, HGY } = surfaceSlopeField(R, S, gN);
+
+  const nCols = Math.max(2, Math.round(density));
+  const pitch = VB_W / nCols;
+  // Rows are spaced in units of the shape's own thickness, not of the column
+  // pitch: an almond is two and a half times longer than it is thick, and a
+  // disc is not, so the one number that makes "1 = rows just touching" true for
+  // both is the thickness. Keeping it off `size` as well means the shape can be
+  // grown or shrunk in its cell without the grid walking around underneath it.
+  const rowPitch = Math.max(1e-3, pitch * kind[2] * spacing);
+  const nRows = Math.max(1, Math.round(VB_H / rowPitch));
+  // centre the rows in the frame, so changing the spacing breathes about the
+  // middle of the picture instead of walking the whole grid off the bottom
+  const y0 = (VB_H - nRows * rowPitch) / 2;
+
+  // Pass one: where the shapes go and which way the water runs under each. The
+  // normal is kept as a raw direction here; which of its two ends counts as
+  // "forward" cannot be decided one cell at a time.
+  const raw = [];
+  for (let j = 0; j < nRows; j++) for (let i = 0; i < nCols; i++) {
+    const x = (i + 0.5) * pitch, y = y0 + (j + 0.5) * rowPitch;
+    const px = Math.floor((x / VB_W) * BW), py = Math.floor((y / VB_H) * BH);
+    if (px < 0 || px >= BW || py < 0 || py >= BH) continue;
+    const p = py * BW + px;
+    if (!cov[p]) continue;                       // no water in this cell
+    let nx = HGX[p], ny = HGY[p];
+    const m = Math.hypot(nx, ny);
+    // dead flat, or a pixel sitting exactly on a crest: lie along the horizon
+    // rather than take a heading out of rounding noise
+    if (m < DRIFT_FLAT) { nx = 0; ny = 1; } else { nx /= m; ny /= m; }
+    raw.push({ x, y, nx, ny, p });
+  }
+
+  // The frame's grain, as ONE direction: sum the normals at doubled angles, so
+  // a normal and its opposite reinforce instead of cancelling, and halve the
+  // angle of the sum. That is the axis the crests mostly run across. Its own
+  // two ends are still a toss-up, so the tie goes down the screen — toward the
+  // viewer, the way water in this studio usually runs.
+  let sx = 0, sy = 0;
+  for (const r of raw) { sx += r.nx * r.nx - r.ny * r.ny; sy += 2 * r.nx * r.ny; }
+  const th = 0.5 * Math.atan2(sy, sx);
+  let rx = Math.cos(th), ry = Math.sin(th);
+  if (ry < 0 || (ry === 0 && rx < 0)) { rx = -rx; ry = -ry; }
+
+  // Pass two: swing every normal onto that reference, so the whole frame hangs
+  // its dark rim on the same side of the swell.
+  const cells = raw.map((r) => {
+    const flip = r.nx * rx + r.ny * ry < 0;
+    const nx = flip ? -r.nx : r.nx, ny = flip ? -r.ny : r.ny;
+    // rotate(a) takes the shape's local +y onto that normal, so its long axis
+    // lands along the crest and the rims straddle the wave
+    const a = (Math.atan2(-nx, ny) * 180) / Math.PI;
+    const [gx, gy] = cell2ground((GI[r.p] / gN) * S.nx, (GJ[r.p] / gN) * S.ny, S);
+    return { x: r.x, y: r.y, a, c: tint ? colorAt(gx, gy) : ink };
+  });
+  return { d: driftShapePath(kind[0], kind[2]), half: (pitch * size) / 2,
+           aim: (Math.atan2(ry, rx) * 180) / Math.PI, cells };
+}
+
+// One shape's three copies: the dark rim, the light rim, then the shape over
+// both, leaving a crescent of each showing on opposite sides. The rim offset is
+// applied inside the rotation and outside the scale, so it is a fixed number of
+// viewBox units measured across the crest however big the shape is — and a
+// negative width swaps the two rims, which reverses the drift.
+function driftUses(grid, rim, emit) {
+  const h = fix2(grid.half);
+  for (const c of grid.cells) {
+    const turn = `translate(${fix1(c.x)} ${fix1(c.y)}) rotate(${fix1(c.a)})`;
+    if (rim) {
+      emit(`${turn} translate(0 ${fix2(-rim)}) scale(${h})`, DRIFT_DARK);
+      emit(`${turn} translate(0 ${fix2(rim)}) scale(${h})`, DRIFT_LIGHT);
+    }
+    emit(`${turn} scale(${h})`, c.c);
+  }
 }
 
 // Resolution of the 3D surface pass, as named steps. `BW` is the width of the
@@ -3098,6 +3306,8 @@ export {
   withWakes, newWake, WAKE_ANGLE_DEG, prepField, slopeAt,
   buildSurface3D, buildSurface3DPanorama, buildSolid3D, fieldSpecFor, crestField,
   buildPenLines, buildPenConcentric, buildPenHatch, HATCH_AIMS,
+  buildDriftGrid, driftUses, driftShapePath, colorSampler, surfaceSlopeField,
+  DRIFT_SHAPES, DRIFT_DARK, DRIFT_LIGHT,
   RASTER_LEVELS, RASTER_DEFAULT, ANTIALIAS, ANTIALIAS_DEFAULT, antialiasAt,
   EXPORT_MULTS, EXPORT_DEFAULT, EXPORT_MAX_BW,
   EXPORT_MESHES, EXPORT_MESH_DEFAULT, EXPORT_MESH_FLOOR, exportRaster, polishPlan,
@@ -3576,7 +3786,11 @@ const WORKSPACES = [
     "letter spacing", "watermark size, position & turn", "watermark ink & outline",
     "reflected objects across the water", "boat & board wakes (kelvin v)"] },
   { id: "style", name: "Style", icon: "✎", find: [
-    "pen-plot mode", "pen style (parallel, concentric, hatched)", "line width",
+    "draw mode (filled regions, pen plot, drift grid)",
+    "drift grid (peripheral drift illusion, fake wave motion)",
+    "drift shape (almond, ellipse, disc)", "shape density, size & row spacing",
+    "drift rim width & direction", "shape color from the scene",
+    "pen style (parallel, concentric, hatched)", "line width",
     "ring spacing", "hatch slant & tone", "3d relief (pen)", "hide obscured lines",
     "edge smoothing", "edge ripple", "show region edges",
     "antialiasing (jagged edges, staircases)", "background color"] },
@@ -4595,6 +4809,15 @@ export default function App() {
   const [penHatchSpread, setPenHatchSpread] = useState(60); // per-region deviation
   const [penHatchAim, setPenHatchAim] = useState("shape"); // what sets the deviation
   const [penHatchTone, setPenHatchTone] = useState(0);      // density from color/paper contrast
+  // Drift grid: the peripheral-drift reading of the scene (see buildDriftGrid).
+  const [driftOn, setDriftOn] = useState(false);
+  const [driftShape, setDriftShape] = useState("almond");
+  const [driftDensity, setDriftDensity] = useState(38);   // shapes across the frame
+  const [driftSize, setDriftSize] = useState(0.85);       // shape length, × the cell
+  const [driftSpacing, setDriftSpacing] = useState(1.15); // row pitch, × the shape's thickness
+  const [driftRim, setDriftRim] = useState(1.1);   // rim width, viewBox units; sign = direction
+  const [driftTint, setDriftTint] = useState(true); // take each shape's color from the scene
+  const [driftInk, setDriftInk] = useState("#2233c4"); // …or this one, everywhere
   const [bgColor, setBgColor] = useState("");       // "" = auto
 
   const [zoom, setZoom] = useState(5);
@@ -4785,6 +5008,10 @@ export default function App() {
     markAngle: [markAngle, setMarkAngle], markColor: [markColor, setMarkColor],
     markHalo: [markHalo, setMarkHalo], markHaloColor: [markHaloColor, setMarkHaloColor],
     eLo: [eLo, setELo], eHi: [eHi, setEHi], autoFit: [autoFit, setAutoFit],
+    driftOn: [driftOn, setDriftOn], driftShape: [driftShape, setDriftShape],
+    driftDensity: [driftDensity, setDriftDensity], driftSize: [driftSize, setDriftSize],
+    driftSpacing: [driftSpacing, setDriftSpacing], driftRim: [driftRim, setDriftRim],
+    driftTint: [driftTint, setDriftTint], driftInk: [driftInk, setDriftInk],
     penMode: [penMode, setPenMode], penCount: [penCount, setPenCount],
     penRelief: [penRelief, setPenRelief], penWidth: [penWidth, setPenWidth],
     penHidden: [penHidden, setPenHidden], penStyle: [penStyle, setPenStyle],
@@ -5207,7 +5434,7 @@ export default function App() {
   // mode we instead z-buffer the surface into a raster and re-contour it (see
   // surf3d) — smooth regions like the flat modes, but occlusion-correct. Pen
   // mode has its own hidden-line path, so this only covers filled regions.
-  const solid3d = !penMode && surface3d && perspective;
+  const solid3d = !penMode && !driftOn && surface3d && perspective;
 
   // The backdrop as the camera sees it, above the horizon. Keyed on camS, so it
   // survives every animation frame and rebuilds only when the camera, the
@@ -5228,7 +5455,12 @@ export default function App() {
   // frame, for the two numbers auto-fit reads. On a detailed scene that was
   // most of the frame (the flat trace lifts every smoothed vertex through the
   // wave height), spent on geometry nothing displayed.
-  const flatNeeded = !solid3d && !penMode;
+  const flatNeeded = !solid3d && !penMode && !driftOn;
+  // the two modes that draw no filled color regions at all, and so have
+  // nothing for the paper stack to cut sheets out of
+  const noFills = penMode || driftOn;
+  // which of the three the Style tab's one selector is showing
+  const drawMode = penMode ? "pen" : driftOn ? "drift" : "fill";
   const geom = useMemo(() => (flatNeeded && !use2d ? buildGeometry(S) : null),
     [flatNeeded, use2d, S]);
   const seg = useMemo(
@@ -5271,46 +5503,27 @@ export default function App() {
   // pen-plot lines: equally spaced scan lines colored by the reflection beneath.
   // Takes the scene rather than closing over it, so the video export can build
   // the same lines at a wave phase this render is not showing.
-  const makePenLines = useCallback((S) => {
-    if (!penMode) return null;
-    const fit = computeFit(S);
-    const mag = S.reflMag || 1;
-    prepField(S);
+  // The color the filled render would paint at a ground point — what the pen
+  // styles ink a stroke with and what the drift grid tints a shape with. Takes
+  // the scene rather than closing over it, for the same reason the builders
+  // below do: the video export asks at a phase this render is not showing.
+  const makeColorAt = useCallback((S) => {
     const deepMix = (c, cosI) => {
       if (!fresOn) return c;
       const b = Math.min(fresBands - 1, Math.floor(fresnelDeepW(cosI) * fresBands));
       return mixDeep(c, b);
     };
-    let colorAt;
-    if (use2d) {
-      const { w: EW, h: EH, cells } = envEffective;
-      const az = azSpan;
-      colorAt = (gx, gy) => {
-        const R = reflectAt(gx, gy, S);
-        const phi = Math.asin(Math.max(-1, Math.min(1, R[2]))) * 180 / Math.PI;
-        let psi = Math.atan2(R[0], R[1]) * 180 / Math.PI; psi = psi < -az ? -az : psi > az ? az : psi;
-        let v = magFrac((phi - S.eLo) / ((S.eHi - S.eLo) || 1), mag); v = v < 0 ? 0 : v > 1 ? 1 : v;
-        let u = magFrac((psi + az) / (2 * az), mag); u = u < 0 ? 0 : u > 1 ? 1 : u;
-        const c = cells[Math.min(EH - 1, Math.floor(v * EH)) * EW + Math.min(EW - 1, Math.floor(u * EW))];
-        return deepMix(c, R[3]);
-      };
-    } else {
-      const cols = mode === "paint1d" ? colors1d : presetColors;
-      const NB = cols.length;
-      const fr = S.bandFractions;
-      colorAt = (gx, gy) => {
-        const R = reflectAt(gx, gy, S);
-        const phi = Math.asin(Math.max(-1, Math.min(1, R[2]))) * 180 / Math.PI;
-        let v = magFrac((phi - S.eLo) / ((S.eHi - S.eLo) || 1), mag); v = v < 0 ? 0 : v >= 1 ? 0.999999 : v;
-        let c;
-        if (fr) {
-          let idx = 0;
-          for (const f of fr) { if (v >= f) idx++; else break; }
-          c = cols[idx] || cols[0];
-        } else c = cols[Math.floor(v * NB)] || cols[0];
-        return deepMix(c, R[3]);
-      };
-    }
+    return colorSampler(S, {
+      use2d, env: envEffective, azSpan, deepMix,
+      cols: mode === "paint1d" ? colors1d : presetColors,
+    });
+  }, [use2d, envEffective, azSpan, mode, colors1d, presetColors, fresOn, fresBands, mixDeep]);
+
+  const makePenLines = useCallback((S) => {
+    if (!penMode) return null;
+    const fit = computeFit(S);
+    prepField(S);
+    const colorAt = makeColorAt(S);
     const threeD = S.perspective && penRelief > 0;
     if (penStyle === "hatch") {
       // Hatching is cut from the screen raster, so it wants the same two
@@ -5333,10 +5546,40 @@ export default function App() {
       nLines: penCount, samples: penHidden ? 360 : 260, relief: penRelief,
       threeD, hidden: penHidden, evenScreen: penEven,
     });
-  }, [penMode, penStyle, penCount, penSpacing, penRelief, penHidden, penEven, use2d, mode,
-      penHatchGap, penHatchAngle, penHatchSpread, penHatchAim, penHatchTone, bgFill, rasterLevel,
-      envEffective, azSpan, colors1d, presetColors, fresOn, fresBands, mixDeep]);
+  }, [penMode, penStyle, penCount, penSpacing, penRelief, penHidden, penEven, makeColorAt,
+      penHatchGap, penHatchAngle, penHatchSpread, penHatchAim, penHatchTone, bgFill, rasterLevel]);
   const penLines = useMemo(() => makePenLines(S), [makePenLines, S]);
+
+  // The drift grid, on the same terms: built from the scene handed in, so the
+  // video export gets the shapes turned to the wave at that frame's phase
+  // rather than this one's. It carries no path data of its own beyond one unit
+  // outline — the picture is that outline placed a few thousand times — so it
+  // is cheap enough to rebuild per frame on this thread, like the pen styles.
+  const makeDriftGrid = useCallback((S) => {
+    if (!driftOn) return null;
+    const fit = computeFit(S);
+    prepField(S);
+    return buildDriftGrid(S, fit, makeColorAt(S), {
+      shape: driftShape, density: driftDensity, size: driftSize,
+      spacing: driftSpacing, tint: driftTint, ink: driftInk,
+      // the shapes sit on the visible surface, so they want the same raster the
+      // filled 3D pass contours: the mesh decides how much wave there is to
+      // read a heading off, the raster how finely a crest hides what is behind
+      BW: rasterLevel.BW, gN: rasterLevel.gN,
+      threeD: S.perspective && S.surface3d,
+    });
+  }, [driftOn, driftShape, driftDensity, driftSize, driftSpacing, driftTint, driftInk,
+      rasterLevel, makeColorAt]);
+  const driftGrid = useMemo(() => makeDriftGrid(S), [makeDriftGrid, S]);
+  // the placement the SVG export writes, as React nodes — one source of truth
+  // for where the copies go, so the preview and the file cannot disagree
+  const driftCopies = useMemo(() => {
+    if (!driftGrid) return null;
+    const out = [];
+    driftUses(driftGrid, driftRim, (tf, fill) =>
+      out.push(<use key={out.length} href="#drift" transform={tf} fill={fill} />));
+    return out;
+  }, [driftGrid, driftRim]);
 
   // The fields the surface-raster passes contour (fieldSpecFor), from the
   // slice of studio state they depend on — kept as plain data so the same spec
@@ -5440,6 +5683,7 @@ export default function App() {
   // what the SVG export will hold: pen mode writes its pens, 3D solid the
   // occluded layers, the flat modes their own
   const regionCount = penMode ? penLines.length
+    : driftOn ? driftGrid.cells.length * (driftRim ? 3 : 1)
     : (solid3d ? drawLayers.length + 1 : use2d ? seg.count : layers.length + 1) * fresIdx.length;
 
   // auto-fit the elevation range to the actual reflected φ, so steep/near water
@@ -5459,7 +5703,7 @@ export default function App() {
   // the video export walks through. Color, camera roll, Fresnel banding and
   // the rest do not move with the phase, so they stay closed over.
   const liveFrame = {
-    seg, fresPaths, penLines,
+    seg, fresPaths, penLines, driftGrid,
     drawLayers, drawFres, drawBg, drawGap, drawMark, bgFill, gapFill,
   };
   // The 3D solid pass at any phase, through the worker when there is one —
@@ -5480,6 +5724,11 @@ export default function App() {
     if (penMode) {
       // pen mode has no filled regions at all: lines, the watermark, and paper
       return { ...liveFrame, penLines: makePenLines(St), drawMark: makeMark(St) };
+    }
+    // …and the drift grid none either: its shapes turn with the wave under
+    // them, so the whole grid is rebuilt at this frame's phase
+    if (driftOn) {
+      return { ...liveFrame, driftGrid: makeDriftGrid(St), drawMark: makeMark(St) };
     }
     // the flat build only where it is what gets drawn (see flatNeeded)
     const geomT = !solid3d && !use2d ? buildGeometry(St) : null;
@@ -5514,7 +5763,7 @@ export default function App() {
   // is on screen; only the outlines are resolved finer.
   const buildSvg = (over, frame) => {
     const F = frame || liveFrame;
-    const { seg, fresPaths, penLines, bgFill, gapFill } = F;
+    const { seg, fresPaths, penLines, driftGrid, bgFill, gapFill } = F;
     // the drawn backdrop does not move with the waves, so every frame of a
     // video export shares the one the preview built
     const svgSky = penMode ? null : skyLayers;
@@ -5535,6 +5784,21 @@ export default function App() {
       });
       body += markStr + `</g>`;
       return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${VB_W} ${VB_H}">${body}</svg>`;
+    }
+    if (driftGrid) {
+      // one outline in the defs, placed once per shape and twice more per rim —
+      // the whole picture is <use> of a single path
+      const defs = `<path id="drift" d="${driftGrid.d}"/>`;
+      let body = `<rect width="${VB_W}" height="${VB_H}" fill="${bgFill}"/>` + rollOpen;
+      if (svgSky) svgSky.forEach((l) => {
+        body += `<path d="${l.d}" fill="${l.color}" fill-rule="evenodd"/>`;
+      });
+      driftUses(driftGrid, driftRim, (tf, fill) => {
+        body += `<use href="#drift" transform="${tf}" fill="${fill}"/>`;
+      });
+      body += markStr + `</g>`;
+      return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${VB_W} ${VB_H}">`
+        + `<defs>${defs}</defs>${body}</svg>`;
     }
     let body = `<rect width="${VB_W}" height="${VB_H}" fill="${bgFill}"/>` + rollOpen;
     const stroke = edges ? ` stroke="#000" stroke-opacity="0.25" stroke-width="0.6"` : "";
@@ -5878,6 +6142,11 @@ export default function App() {
                   <path key={i} d={l.d} fill="none" stroke={l.color}
                     strokeWidth={penWidth} strokeLinecap="round" strokeLinejoin="round" />
                 ))
+              ) : driftGrid ? (
+                <>
+                  <defs><path id="drift" d={driftGrid.d} /></defs>
+                  {driftCopies}
+                </>
               ) : !solid3d && use2d && !layers ? (
                 <>
                   <defs>
@@ -5948,6 +6217,7 @@ export default function App() {
             <div style={{ position: "absolute", left: 12, bottom: 10, fontSize: 10.5,
               color: "#6d808f", fontFamily: "ui-monospace, monospace", letterSpacing: 0.5 }}>
               {penMode ? `${penStyle === "rings" ? "rings" : penStyle === "hatch" ? `hatch ${penHatchAngle}\u00b0\u00b1${penHatchSpread}\u00b0` : penCount + " lines"} · ${penLines.length} pens${S.perspective && penRelief > 0 ? " · 3D" : ""}${penHidden || penStyle === "hatch" ? " · hidden-line" : ""}`
+                : driftOn ? `${driftGrid.cells.length} ${driftShape}s \u00b7 ${driftDensity} across \u00b7 ${driftRim ? `rim ${driftRim.toFixed(1)}` : "no rim"}${S.perspective && surface3d ? " \u00b7 3D" : ""}`
                 : solid3d ? `${drawLayers.length + 1} regions · ${S.nx}×${S.ny} sample grid · 3D ${rasterLevel.name} ${rasterLevel.BW}px${antialias.passes ? ` · aa ${antialias.name}` : ""}${rendering ? " · rendering…" : ""}`
                 : `${regionCount} regions · ${S.nx}×${S.ny} sample grid${surface3d && perspective ? " · 3D" : ""}`}
             </div>
@@ -6812,9 +7082,84 @@ export default function App() {
                 ))}
               </div>
             </div>
+            {/* The three draw modes are one decision — "how is this picture
+                made of marks?" — so they are one control. As three separate
+                toggles they were three ways to ask the same question, and two
+                of them could be on at once. */}
             <div style={panel}>
-              <div style={heading}>Pen plotter</div>
-              <Toggle label="Pen-plot mode" value={penMode} onChange={setPenMode} />
+              <div style={heading}>How it's drawn</div>
+              <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
+                {[["fill", "Filled"], ["pen", "Pen plot"], ["drift", "Drift grid"]].map(([v, lbl]) => (
+                  <button key={v} onClick={() => { setPenMode(v === "pen"); setDriftOn(v === "drift"); }}
+                    style={{ flex: 1, padding: "7px 4px", fontSize: 11.5, borderRadius: 6, cursor: "pointer",
+                      fontFamily: "ui-monospace, monospace",
+                      background: drawMode === v ? "#27424b" : "#1a232c",
+                      color: drawMode === v ? "#dff1f6" : "#9fb0c0",
+                      border: "1px solid " + (drawMode === v ? "#3f7e8f" : "#26313c") }}>{lbl}</button>
+                ))}
+              </div>
+              <Help label="the three draw modes">
+                <b>Filled</b> cuts the reflection into flat color regions — the studio's own
+                picture, and the only mode the layered-paper stack can be cut from.
+                {" "}<b>Pen plot</b> redraws it as strokes a plotter could pull.
+                {" "}<b>Drift grid</b> redraws it as a field of small shapes on a screen grid,
+                each lying along the wave crest passing under it and carrying a black rim on
+                one side and a white rim on the other — the repeating light-dark-light-dark
+                sequence of a peripheral-drift illusion. Look at the middle of that frame and
+                the edges appear to roll; look straight at any one shape and it stops. Nothing
+                is animating: the picture is a still, and the motion is your own visual system
+                reading the asymmetric rims as movement.
+                {" The rims all lean the same way off the swell, because that consistency is"
+                  + " the whole effect — hang them off each shape's own uphill side instead"
+                  + " and the drift reverses on every other flank and cancels out. Which way"
+                  + " it rolls is the sign of the rim width, and which sign reads as which"
+                  + " direction depends on the viewer, so try both."}
+              </Help>
+              {driftOn && (
+                <div style={{ marginTop: 10 }}>
+                  <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
+                    {DRIFT_SHAPES.map(([v, lbl]) => (
+                      <button key={v} onClick={() => setDriftShape(v)}
+                        style={{ flex: 1, padding: "7px 4px", fontSize: 11.5, borderRadius: 6, cursor: "pointer",
+                          fontFamily: "ui-monospace, monospace",
+                          background: driftShape === v ? "#27424b" : "#1a232c",
+                          color: driftShape === v ? "#dff1f6" : "#9fb0c0",
+                          border: "1px solid " + (driftShape === v ? "#3f7e8f" : "#26313c") }}>{lbl}</button>
+                    ))}
+                  </div>
+                  <Slider label="density" value={driftDensity} min={10} max={90} step={1}
+                    onChange={setDriftDensity} fmt={(v) => v + " across"} />
+                  <Slider label="size" value={driftSize} min={0.3} max={1.8} step={0.05}
+                    onChange={setDriftSize}
+                    fmt={(v) => v.toFixed(2) + "× cell" + (v > 1 ? " (overlapping)" : "")} />
+                  <Slider label="row spacing" value={driftSpacing} min={0.6} max={3} step={0.05}
+                    onChange={setDriftSpacing}
+                    fmt={(v) => (v < 1 ? v.toFixed(2) + "× (rows overlap)"
+                      : v.toFixed(2) + "× shape")} />
+                  <Slider label="drift rim" value={driftRim} min={-3} max={3} step={0.1}
+                    onChange={setDriftRim}
+                    fmt={(v) => (Math.abs(v) < 0.05 ? "off (no illusion)"
+                      : Math.abs(v).toFixed(1) + (v < 0 ? " reversed" : ""))} />
+                  <Toggle label="Color from the scene" value={driftTint} onChange={setDriftTint} />
+                  {!driftTint && (
+                    <div style={{ marginTop: 8 }}>
+                      <ColorWell label="shape color" value={driftInk} onChange={setDriftInk} />
+                    </div>
+                  )}
+                  <div style={{ fontSize: 10, color: "#6d808f", marginTop: 8, lineHeight: 1.5,
+                    fontFamily: "ui-monospace, monospace" }}>
+                    {driftTint
+                      ? "Each shape takes the color the filled render would have painted under it, so the grid still reads as the picture."
+                      : "One color for every shape — the plainest reading, and the strongest illusion, since only the rims carry contrast."}
+                    {surface3d && perspective
+                      ? " Placed on the depth-sorted surface, so a near crest hides the shapes behind it."
+                      : " Turn on the 3D wave surface for crests to hide the shapes behind them."}
+                    {" The grid is uniform on screen rather than in the water: the illusion is a"
+                      + " property of the image on your retina, so the repeating unit has to keep"
+                      + " its size instead of shrinking into the distance."}
+                  </div>
+                </div>
+              )}
               {penMode && (
                 <div style={{ marginTop: 10 }}>
                   <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
@@ -7165,13 +7510,14 @@ export default function App() {
               </div>
             )}
 
-            <button onClick={exportPaperStack} disabled={penMode || vidBusy}
-              title={penMode ? "Turn off pen-plot mode — the paper stack needs filled color regions"
+            <button onClick={exportPaperStack} disabled={noFills || vidBusy}
+              title={noFills ? `Turn off ${penMode ? "pen-plot" : "drift-grid"} mode \u2014 the paper`
+                  + " stack needs filled color regions"
                 : "Decompose the scene into cuttable paper sheets"}
-              style={{ width: "100%", marginTop: 8, background: penMode ? "#1a232c" : "#274b3f",
-                border: "1px solid " + (penMode ? "#26313c" : "#3f7e63"),
-                color: penMode ? "#5f7384" : "#e6fbf1",
-                padding: "12px", borderRadius: 10, cursor: penMode ? "not-allowed" : "pointer",
+              style={{ width: "100%", marginTop: 8, background: noFills ? "#1a232c" : "#274b3f",
+                border: "1px solid " + (noFills ? "#26313c" : "#3f7e63"),
+                color: noFills ? "#5f7384" : "#e6fbf1",
+                padding: "12px", borderRadius: 10, cursor: noFills ? "not-allowed" : "pointer",
                 fontSize: 13.5, fontWeight: 600, letterSpacing: 0.3 }}>
               Export layered paper ↓
             </button>
