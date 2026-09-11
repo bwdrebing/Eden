@@ -2,7 +2,7 @@ import React from "react";
 import { render, screen, fireEvent } from "@testing-library/react";
 import WaterReflectionContours, {
   buildDriftGrid, driftUses, driftShapePath, colorSampler, computeFit, prepField,
-  DRIFT_SHAPES, DRIFT_DARK, DRIFT_LIGHT, VB_W, VB_H,
+  waveHeadingAt, flowTangent, slopeAt, DRIFT_SHAPES, DRIFT_DARK, DRIFT_LIGHT, VB_W, VB_H,
 } from "./WaterReflectionContours";
 import { GRAZING_RIPPLES, buildScene } from "./sceneFixtures";
 
@@ -27,7 +27,7 @@ const grid = (over = {}, opts = {}) => {
     use2d: false, cols: fieldSpec.cols, deepMix: (c) => c,
   });
   return buildDriftGrid(S, fit, colorAt, {
-    shape: "almond", density: 30, size: 1, spacing: 1.15,
+    shape: "almond", density: 30, size: 1, spacing: 1,
     tint: true, ink: INK, BW: 320, gN: 110, threeD: true, ...opts,
   });
 };
@@ -67,21 +67,81 @@ test("density and row spacing move the count the way they read", () => {
   expect(big.half).toBeCloseTo(grid().half * 1.6, 6);
 }, 240000);
 
-test("the shapes turn with the wave, not with the frame", () => {
-  // A swell running along +y has its crests across the plane, so on screen the
-  // shapes lie flat; turn the train 90° and they stand up. The angle is the
-  // shape's own +y against the crest normal, so "flat shape" is angle ~0.
-  const across = grid(swell(90));
-  const along = grid(swell(0));
+test("the shapes point along the flow the generators set", () => {
+  // With the relief at zero there is no rocking left, so the angle is the flow
+  // direction and nothing else: a train running across the plane lays the
+  // shapes flat, one running away from the camera stands them up.
   const med = (g) => {
     const v = g.cells.map((c) => Math.abs(c.a)).sort((a, b) => a - b);
     return v[v.length >> 1];
   };
-  expect(med(across)).toBeLessThan(20);
-  expect(med(along)).toBeGreaterThan(60);
-  // the frame's own heading follows the train it was taken from
-  expect(Math.abs(across.aim - 90)).toBeLessThan(20);
+  expect(med(grid({ ...swell(0), waveScale: 0 }))).toBeLessThan(25);
+  expect(med(grid({ ...swell(90), waveScale: 0 }))).toBeGreaterThan(65);
 }, 240000);
+
+test("a crest and a trough lie the same way; the flank between them tips over", () => {
+  // The rule stated as the user states it: level over the crest, level through
+  // the trough, tilted on the flank, and tilted the OTHER way on the far flank.
+  const { S } = buildScene({ ...GRAZING_RIPPLES, ...swell(90), waveScale: 9 });
+  const fit = computeFit(S);
+  prepField(S);
+  const gx = 0, relief = S.waveScale, eps = (S.yMax - S.yMin) * 1e-3;
+  const at = (gy) => {
+    const [dx, dy] = waveHeadingAt(gx, gy, S);
+    const [hx, hy] = slopeAt(gx, gy, S);
+    const [tx, ty] = flowTangent(gx, gy, dx, dy, S, fit, relief, eps);
+    return { gy, slope: hx * dx + hy * dy, a: (Math.atan2(ty, tx) * 180) / Math.PI };
+  };
+  // a wavelength's worth of the train, well inside the plane
+  const line = [];
+  for (let gy = 30; gy < 42; gy += 0.05) line.push(at(gy));
+  const bySlope = [...line].sort((p, q) => Math.abs(p.slope) - Math.abs(q.slope));
+  const level = bySlope.slice(0, 6);                 // the crest and the trough
+  const up = line.reduce((b, p) => (p.slope > b.slope ? p : b));
+  const down = line.reduce((b, p) => (p.slope < b.slope ? p : b));
+
+  // the level points are a crest AND a trough — genuinely different places
+  const heights = level.map((p) => p.gy).sort((a, b) => a - b);
+  expect(heights[heights.length - 1] - heights[0]).toBeGreaterThan(1);
+  // …and they lie at the same angle, to well under a degree
+  const angles = level.map((p) => p.a);
+  expect(Math.max(...angles) - Math.min(...angles)).toBeLessThan(1);
+
+  // the two flanks tip off that angle, by a real amount and in opposite ways
+  const base = angles[0];
+  expect(up.a - base).toBeLessThan(-8);              // screen y runs down
+  expect(down.a - base).toBeGreaterThan(8);
+  // and by about as much either side, because a sine is symmetric about both
+  expect(Math.abs(Math.abs(up.a - base) - Math.abs(down.a - base))).toBeLessThan(6);
+}, 120000);
+
+test("the shape leans the way the water climbs", () => {
+  // A train running across the frame, where the tilt is unambiguous on screen:
+  // where the water climbs along the flow, the downwind end of the shape has to
+  // sit HIGHER in the picture than the upwind end.
+  const { S } = buildScene({ ...GRAZING_RIPPLES, ...swell(0), waveScale: 9 });
+  const fit = computeFit(S);
+  prepField(S);
+  const eps = (S.yMax - S.yMin) * 1e-3, gy = 12;
+  const pts = [];
+  for (let gx = -20; gx <= 20; gx += 0.2) {
+    const [dx, dy] = waveHeadingAt(gx, gy, S);
+    const [hx, hy] = slopeAt(gx, gy, S);
+    pts.push({ gx, dx, dy, s: hx * dx + hy * dy });
+  }
+  const peak = Math.max(...pts.map((p) => Math.abs(p.s)));
+  expect(peak).toBeGreaterThan(1e-3);              // the train is actually there
+  let checked = 0;
+  for (const p of pts) {
+    if (Math.abs(p.s) < 0.3 * peak) continue;      // too level to judge
+    const [tx, ty] = flowTangent(p.gx, gy, p.dx, p.dy, S, fit, S.waveScale, eps);
+    // the flow runs +x on screen here, so the shape's own +x end is downwind
+    const rising = tx > 0 ? ty < 0 : ty > 0;       // downwind end higher = lower y
+    expect(rising).toBe(p.s > 0);
+    checked++;
+  }
+  expect(checked).toBeGreaterThan(40);
+}, 120000);
 
 test("every rim in the frame leans the same way off the swell", () => {
   // The rims are offset along each shape's local +y, which rotate(a) puts on

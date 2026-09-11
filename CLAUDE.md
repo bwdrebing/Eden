@@ -97,22 +97,32 @@ scaled inside a fixed-size `<div>` gives a zoomed crop to screenshot.
   which the file adds on top. Both are counted in raster pixels and neither
   scales with `BW` — a pass is sigma = sqrt(2N/3) pixels of the very grid whose
   aliasing it removes, so one step means one thing at every raster.
-- **The drift grid's rims all lean the same way, and that is the whole
-  feature.** `buildDriftGrid` redraws the scene as shapes on a screen grid,
-  each turned along the crest under it (from `surfaceSlopeField`, the same
-  screen-space slope the hatch's "wave" aim reads) and each carrying a black
-  rim on one side and a white rim on the other. A peripheral-drift illusion is
-  a *luminance* trick: it needs the repeating dark/light sequence to keep one
-  handedness over the whole frame. Signing each shape's rim off its own local
-  gradient looks reasonable and destroys it — the sign reverses on every other
-  flank of every wave and the readings cancel, leaving a merely embossed
-  picture. So the normals are signed against ONE heading for the frame, the
-  dominant crest normal found by summing them at doubled angles. Anything that
-  touches the orientation has to preserve that, and `driftGrid.test.js` pins
-  it: every shape's rim must have a non-negative component along `grid.aim`.
-  The rim offset itself is applied at draw time in the shape's rotated frame
-  (`driftUses`), which is what the preview and the SVG both call, so the two
-  cannot disagree and a negative width simply reverses the drift.
+- **The drift grid asks the emitters which way the water is going, not the
+  surface.** `buildDriftGrid` redraws the scene as shapes on a screen grid,
+  each lying flat on the water pointing downwind: level over a crest, level
+  through the trough behind it, tipped over on the flank between. That rule
+  needs a *heading*, and the height gradient cannot give one — it vanishes at
+  exactly the crests and troughs where the answer has to be steadiest, and it
+  flips sign flank to flank while a train keeps going one way. So
+  `waveHeadingAt` reads it off the prepared emitters, weighted by what each is
+  worth at that point. `flowTangent` then turns the projected heading by the
+  tangent's own inclination (`slopeAt` through the lift's own clamp) — a
+  deliberate stylization: this camera usually looks straight down the swell,
+  where a truly projected 3D tangent hardly rotates on screen at all and the
+  whole frame comes out as parallel vertical dashes carrying none of the wave.
+- **The drift grid's rims all lean the same way, and that is the other half of
+  the feature.** A peripheral-drift illusion is a *luminance* trick: it needs
+  the repeating dark/light sequence to keep one handedness over the whole
+  frame. Signing each shape's rim off its own local slope looks reasonable and
+  destroys it — the sign reverses on every other flank and the readings cancel,
+  leaving a merely embossed picture. So every shape's cross axis is signed
+  against ONE reference for the frame, found by summing those axes at doubled
+  angles. Anything touching the orientation has to preserve that, and
+  `driftGrid.test.js` pins it: every shape's rim must have a non-negative
+  component along `grid.aim`. The rim offset itself is applied at draw time in
+  the shape's rotated frame (`driftUses`), which is what the preview and the
+  SVG both call, so the two cannot disagree and a negative width simply
+  reverses the drift.
 
 - **The three pen styles are not the same kind of thing.** `buildPenLines` and
   `buildPenConcentric` work in ground space and do their own hidden-line pass;

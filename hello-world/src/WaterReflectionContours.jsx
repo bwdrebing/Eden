@@ -613,6 +613,98 @@ function slopeAt(gx, gy, S) {
   return [hx, hy];
 }
 
+// Which way the water is GOING at a ground point: the propagation direction of
+// every live train, summed and weighted by what each one is worth here.
+//
+// The drift grid needs this and the height gradient cannot supply it. On a
+// plane wave the gradient does lie along the direction of travel — but it
+// vanishes at every crest and every trough, which is precisely where the answer
+// has to be steadiest: a shape sitting on a crest and one sitting in the trough
+// behind it should lie the same way, and reading a heading off a gradient of
+// zero gives them rounding noise instead. Nor is a gradient a direction at all;
+// it flips sign flank to flank, while a wave train keeps going one way.
+//
+// So it is read off the emitters, where travel is a property of the train and
+// not of the instantaneous surface: a swell and each component of a spectrum
+// carry their own heading, a ring or point source sends its ripples radially
+// out from where it sits, and a Kelvin wake — which stands still in the hull's
+// frame — runs along the hull's own course. Each is weighted by the amplitude
+// it actually has at this point, through the same falloffs `heightAt` uses, so
+// the train that shapes the water here is the one that says which way it runs.
+// Trains that oppose cancel to nothing, and the caller falls back to the
+// frame's mean heading where they do.
+function waveHeadingAt(gx, gy, S) {
+  let dx = 0, dy = 0;
+  for (const e of S._ems) {
+    if (e.type === "point") {
+      const ux = gx - e.x, uy = gy - e.y;
+      const r = Math.hypot(ux, uy) + 1e-6;
+      const w = Math.abs(e.A) * Math.exp(-e.decay * r);
+      dx += (w * ux) / r; dy += (w * uy) / r;
+    } else if (e.type === "swell") {
+      const x = e.aa * gy, w = Math.abs(e.A) / (1 + x * x);
+      dx += w * e.Dx; dy += w * e.Dy;
+    } else if (e.type === "rings") {
+      for (let i = 0; i < e.M; i++) {
+        const ux = gx - e.CX[i], uy = gy - e.CY[i];
+        const r = Math.hypot(ux, uy) + 1e-6;
+        const w = Math.abs(e.AMP[i]) * Math.exp(-e.dec * r);
+        dx += (w * ux) / r; dy += (w * uy) / r;
+      }
+    } else if (e.type === "wake") {
+      const w = Math.abs(e.A);
+      dx += w * e.ex; dy += w * e.ey;
+    } else {
+      for (let i = 0; i < e.N; i++) {
+        const x = e.AA[i] * gy, w = Math.abs(e.AMP[i]) / (1 + x * x);
+        dx += w * e.DX[i]; dy += w * e.DY[i];
+      }
+    }
+  }
+  const m = Math.hypot(dx, dy);
+  return m > 1e-12 ? [dx / m, dy / m] : [0, 0];
+}
+
+// Which way a drift shape lies: the flow's own direction in the picture, tipped
+// by however steeply the water is climbing along it.
+//
+// That is the classic profile-tangent picture — dashes laid on a wave, level
+// over the crest, level through the trough, tilted on the flank between them —
+// read in the plane of the PICTURE rather than projected out of three
+// dimensions. The difference matters, and it is a deliberate stylization:
+//
+// The true 3D tangent is (D, dz/ds), and projecting it is geometrically the
+// honest thing. But this camera usually looks straight down the swell, and a
+// tangent that tips in the vertical plane containing the view ray hardly
+// rotates on screen at all — it lengthens and shortens instead. Project it and
+// a rolling swell comes out as a field of parallel vertical dashes carrying
+// none of the wave. Rotating the flow direction by the tangent's own
+// inclination keeps what the diagram is for: the shape rocks back and forth
+// about the flow as each wave passes under it, by the angle the water actually
+// makes with the horizontal, whichever way the camera happens to be pointing.
+//
+// The base direction is genuinely projected, so the field converges toward the
+// horizon with the water. The slope is analytic (`slopeAt` is exactly
+// `heightAt`'s gradient) and carried through the derivative of the same soft
+// clamp the lift goes through, so the tilt belongs to the surface being drawn:
+// `relief` is the scene's own wave height, and at zero the shapes lie flat
+// along the flow with no rocking at all.
+function flowTangent(gx, gy, dx, dy, S, fit, relief, eps) {
+  const z = clampLift(heightAt(gx, gy, S) * relief, S, fit);
+  const p0 = penProject(gx, gy, z, S, fit);
+  const p1 = penProject(gx + eps * dx, gy + eps * dy, z, S, fit);
+  const ux = p1[0] - p0[0], uy = p1[1] - p0[1];
+  if (Math.hypot(ux, uy) < 1e-12) return [1, 0];   // sitting on the vanishing point
+  const [hx, hy] = slopeAt(gx, gy, S);
+  const aniso = fit && fit.scaleY ? Math.min(1, fit.scale / fit.scaleY) : 1;
+  const m = 0.75 * S.H, th = z / m;
+  const dzds = (hx * dx + hy * dy) * relief * aniso * (1 - th * th);
+  // screen y runs down, so water climbing along the flow tips the downwind end
+  // of the shape UP the frame, which is a negative turn
+  const a = Math.atan2(uy, ux) - Math.atan(dzds);
+  return [Math.cos(a), Math.sin(a)];
+}
+
 // full reflected direction (unit) — gives both elevation and azimuth.
 // 4th component = cos of the incidence angle (view ray vs surface normal),
 // which sets the Fresnel reflectance at this point.
@@ -2080,49 +2172,6 @@ function relLum(c) {
   return (0.2126 * s.r + 0.7152 * s.g + 0.0722 * s.b) / 255;
 }
 
-// The wave height's gradient in SCREEN pixels, over a surface raster: which way
-// the water runs uphill at each pixel of the picture, and how steeply.
-//
-// Sampled off the mesh through the raster's own grid coordinates, so it is the
-// height of the point actually visible at that pixel — across a crest
-// silhouette the two sheets keep their own slopes instead of averaging into a
-// direction neither of them has. `S` is passed separately from the raster
-// because a caller may have rasterized a different relief than the scene's
-// (the pen styles do), and the slope wanted is always the scene's own.
-//
-// Two callers read it: the hatch's "wave" aim, which takes the axis of the
-// gradient over a whole region, and the drift grid, which takes the direction
-// at one point. Both need the same answer, which is why it is one function.
-function surfaceSlopeField(R, S, gN) {
-  const { BW, BH, NP, GI, GJ, cov } = R;
-  const stride = gN + 1;
-  const HG = new Float64Array(stride * stride);
-  for (let j = 0; j <= gN; j++) for (let i = 0; i <= gN; i++) {
-    const [gx, gy] = cell2ground((i / gN) * S.nx, (j / gN) * S.ny, S);
-    HG[j * stride + i] = heightAt(gx, gy, S);
-  }
-  const HR = new Float64Array(NP);
-  for (let p = 0; p < NP; p++) {
-    if (!cov[p]) continue;
-    const fi = Math.max(0, Math.min(gN - 1e-6, GI[p])), fj = Math.max(0, Math.min(gN - 1e-6, GJ[p]));
-    const i0 = Math.floor(fi), j0 = Math.floor(fj), tx = fi - i0, ty = fj - j0, q = j0 * stride + i0;
-    HR[p] = (HG[q] * (1 - tx) + HG[q + 1] * tx) * (1 - ty)
-          + (HG[q + stride] * (1 - tx) + HG[q + stride + 1] * tx) * ty;
-  }
-  const HGX = new Float64Array(NP), HGY = new Float64Array(NP);
-  for (let y = 0; y < BH; y++) for (let x = 0; x < BW; x++) {
-    const p = y * BW + x;
-    if (!cov[p]) continue;
-    // one-sided at the water's edge: an uncovered neighbour holds no height
-    const xm = x > 0 && cov[p - 1] ? p - 1 : p, xp = x < BW - 1 && cov[p + 1] ? p + 1 : p;
-    const ym = y > 0 && cov[p - BW] ? p - BW : p, yp = y < BH - 1 && cov[p + BW] ? p + BW : p;
-    const hx = xp - xm, hy = (yp - ym) / BW;      // 0, 1 or 2 pixels apart
-    HGX[p] = hx ? (HR[xp] - HR[xm]) / hx : 0;
-    HGY[p] = hy ? (HR[yp] - HR[ym]) / hy : 0;
-  }
-  return { HGX, HGY };
-}
-
 // The color the filled render would paint at a ground point.
 //
 // The contouring path answers this by cutting regions; the pen styles and the
@@ -2193,9 +2242,38 @@ function buildPenHatch(S, fit, colorAt, opts) {
     idxField[p] = id;
   }
 
-  // ---- screen-space gradient of the wave height, for the "wave" aim
-  const slope = aim === "wave" ? surfaceSlopeField(R, S, gN) : null;
-  const HGX = slope ? slope.HGX : null, HGY = slope ? slope.HGY : null;
+  // ---- screen-space gradient of the wave height, for the "wave" aim.
+  // Sampled off the mesh through the raster's own grid coordinates, so it is
+  // the height of the point actually visible at that pixel — across a crest
+  // silhouette the two sheets keep their own slopes instead of averaging.
+  let HGX = null, HGY = null;
+  if (aim === "wave") {
+    const stride = gN + 1;
+    const HG = new Float64Array(stride * stride);
+    for (let j = 0; j <= gN; j++) for (let i = 0; i <= gN; i++) {
+      const [gx, gy] = cell2ground((i / gN) * S.nx, (j / gN) * S.ny, S);
+      HG[j * stride + i] = heightAt(gx, gy, S);
+    }
+    const HR = new Float64Array(NP);
+    for (let p = 0; p < NP; p++) {
+      if (!cov[p]) continue;
+      const fi = Math.max(0, Math.min(gN - 1e-6, GI[p])), fj = Math.max(0, Math.min(gN - 1e-6, GJ[p]));
+      const i0 = Math.floor(fi), j0 = Math.floor(fj), tx = fi - i0, ty = fj - j0, q = j0 * stride + i0;
+      HR[p] = (HG[q] * (1 - tx) + HG[q + 1] * tx) * (1 - ty)
+            + (HG[q + stride] * (1 - tx) + HG[q + stride + 1] * tx) * ty;
+    }
+    HGX = new Float64Array(NP); HGY = new Float64Array(NP);
+    for (let y = 0; y < BH; y++) for (let x = 0; x < BW; x++) {
+      const p = y * BW + x;
+      if (!cov[p]) continue;
+      // one-sided at the water's edge: an uncovered neighbour holds no height
+      const xm = x > 0 && cov[p - 1] ? p - 1 : p, xp = x < BW - 1 && cov[p + 1] ? p + 1 : p;
+      const ym = y > 0 && cov[p - BW] ? p - BW : p, yp = y < BH - 1 && cov[p + BW] ? p + BW : p;
+      const hx = xp - xm, hy = (yp - ym) / BW;      // 0, 1 or 2 pixels apart
+      HGX[p] = hx ? (HR[xp] - HR[xm]) / hx : 0;
+      HGY[p] = hy ? (HR[yp] - HR[ym]) / hy : 0;
+    }
+  }
 
   // ---- connected regions of one color, with the moments each aim needs
   const label = new Int32Array(NP).fill(-1);
@@ -2377,24 +2455,31 @@ function buildPenHatch(S, fit, colorAt, opts) {
 //     one dark rim and one light rim do not.
 //   * the handedness must be CONSISTENT across the frame. This is the part
 //     that a wave scene gets wrong if you are not careful: the obvious move is
-//     to hang the dark rim on each shape's uphill side, and that reverses on
-//     every other flank of every wave, so the drift cancels wave by wave and
-//     the picture just looks embossed. The rims here are hung off the crest
-//     normal signed against ONE reference direction for the whole frame — the
-//     dominant crest normal of the picture, which is the direction the swell is
-//     travelling — so every shape carries its dark rim on the same side of the
-//     water's own grain and the readings add up. A scene whose crests genuinely
-//     run every which way has no consistent handedness to find, and will drift
-//     only where they agree; that is the illusion's limit, not a bug in it.
+//     to hang the dark rim on each shape's own uphill side, and that reverses
+//     on every other flank of every wave, so the drift cancels wave by wave and
+//     the picture just looks embossed. The rims are hung off each shape's own
+//     cross axis instead, signed against ONE reference for the whole frame, so
+//     every shape carries its dark rim on the same side of the water's grain
+//     and the readings add up. A scene whose trains genuinely run every which
+//     way has no consistent handedness to find and will drift only where they
+//     agree; that is the illusion's limit, not a bug in it.
 //   * the rims must be near-black and near-white against a mid ground. Anything
 //     softer and the effect fades; these two are constants for that reason,
 //     and the tones between them are the scene's own colors.
 //
-// What the wave supplies is the ORIENTATION: each shape's long axis runs along
-// the crest through it, taken from the screen-space slope field (the same one
-// the hatch's "wave" aim reads), so the grid traces out the swell the way iron
-// filings trace a field. The drift then runs across the crests, which is the
-// direction the wave itself travels.
+// What the wave supplies is the ORIENTATION. Each shape lies flat ON the water
+// pointing downwind — its long axis is the surface tangent along the flow
+// (`flowTangent`), projected into the picture. So a shape on a crest and a
+// shape in the trough behind it come out at the same angle, both level, and the
+// shapes on the flank between them tip over by however steeply the water climbs
+// there. A swell laid across the frame turns the grid into a field of dashes
+// whose slant rises and falls with the swell itself, which is exactly the
+// angle field these illusions are built out of. The flow is read off the
+// emitters (`waveHeadingAt`) rather than off the surface, because the surface
+// has no heading to give at the crests and troughs where it matters most.
+//
+// The drift then runs ACROSS the shapes' long axes — across the flow — since
+// that is the direction the rims repeat along.
 //
 // Everything is on one uniform screen grid, deliberately: the illusion is a
 // property of the retinal image, so the repeating unit has to keep its size
@@ -2434,60 +2519,73 @@ function buildDriftGrid(S, fit, colorAt, opts) {
   // under each shape is the one the filled render would have put there
   const R = rasterizeSurface(S, fit, gN, BW, threeD);
   const { BH, cov, GI, GJ } = R;
-  const { HGX, HGY } = surfaceSlopeField(R, S, gN);
 
   const nCols = Math.max(2, Math.round(density));
   const pitch = VB_W / nCols;
-  // Rows are spaced in units of the shape's own thickness, not of the column
-  // pitch: an almond is two and a half times longer than it is thick, and a
-  // disc is not, so the one number that makes "1 = rows just touching" true for
-  // both is the thickness. Keeping it off `size` as well means the shape can be
-  // grown or shrunk in its cell without the grid walking around underneath it.
-  const rowPitch = Math.max(1e-3, pitch * kind[2] * spacing);
+  // Square by default. The shapes turn with the water rather than lying along
+  // one screen axis, so there is no orientation for a row pitch to be tuned
+  // against — anything but a square cell packs them tightly in whichever
+  // direction the wave happens to be running and leaves gaps across it. The
+  // slider is there for the scenes where a stretched grid is the look.
+  const rowPitch = Math.max(1e-3, pitch * spacing);
   const nRows = Math.max(1, Math.round(VB_H / rowPitch));
   // centre the rows in the frame, so changing the spacing breathes about the
   // middle of the picture instead of walking the whole grid off the bottom
   const y0 = (VB_H - nRows * rowPitch) / 2;
 
-  // Pass one: where the shapes go and which way the water runs under each. The
-  // normal is kept as a raw direction here; which of its two ends counts as
-  // "forward" cannot be decided one cell at a time.
+  // Pass one: where the shapes go, and which way the water is running under
+  // each. The heading is a true direction, so these sum as vectors — the mean
+  // is what stands in for the few cells where opposing trains cancel.
   const raw = [];
+  let mx = 0, my = 0;
   for (let j = 0; j < nRows; j++) for (let i = 0; i < nCols; i++) {
     const x = (i + 0.5) * pitch, y = y0 + (j + 0.5) * rowPitch;
     const px = Math.floor((x / VB_W) * BW), py = Math.floor((y / VB_H) * BH);
     if (px < 0 || px >= BW || py < 0 || py >= BH) continue;
     const p = py * BW + px;
     if (!cov[p]) continue;                       // no water in this cell
-    let nx = HGX[p], ny = HGY[p];
-    const m = Math.hypot(nx, ny);
-    // dead flat, or a pixel sitting exactly on a crest: lie along the horizon
-    // rather than take a heading out of rounding noise
-    if (m < DRIFT_FLAT) { nx = 0; ny = 1; } else { nx /= m; ny /= m; }
-    raw.push({ x, y, nx, ny, p });
+    // the raster hands back the front-most surface point, so a shape is placed
+    // — and colored, and turned — by the water the camera can actually see
+    const [gx, gy] = cell2ground((GI[p] / gN) * S.nx, (GJ[p] / gN) * S.ny, S);
+    const [dx, dy] = waveHeadingAt(gx, gy, S);
+    mx += dx; my += dy;
+    raw.push({ x, y, gx, gy, dx, dy });
   }
+  const mm = Math.hypot(mx, my);
+  const fx = mm > DRIFT_FLAT ? mx / mm : 1, fy = mm > DRIFT_FLAT ? my / mm : 0;
 
-  // The frame's grain, as ONE direction: sum the normals at doubled angles, so
-  // a normal and its opposite reinforce instead of cancelling, and halve the
-  // angle of the sum. That is the axis the crests mostly run across. Its own
-  // two ends are still a toss-up, so the tie goes down the screen — toward the
-  // viewer, the way water in this studio usually runs.
+  // Pass two: which way each shape lies. A step one part in a thousand of the
+  // plane is far inside the perspective divide's linear range and far outside
+  // floating point's noise.
+  const relief = S.waveScale || 0;
+  const eps = Math.max(1e-6, (S.yMax - S.yMin) * 1e-3);
   let sx = 0, sy = 0;
-  for (const r of raw) { sx += r.nx * r.nx - r.ny * r.ny; sy += 2 * r.nx * r.ny; }
+  const turned = raw.map((r) => {
+    const dx = Math.hypot(r.dx, r.dy) > DRIFT_FLAT ? r.dx : fx;
+    const dy = Math.hypot(r.dx, r.dy) > DRIFT_FLAT ? r.dy : fy;
+    const [tx, ty] = flowTangent(r.gx, r.gy, dx, dy, S, fit, relief, eps);
+    // …and the cross axis, which is the one the rims repeat along
+    return { ...r, tx, ty, nx: -ty, ny: tx };
+  });
+  // The frame's grain, as ONE direction: sum those cross axes at doubled
+  // angles, so an axis and its opposite reinforce instead of cancelling, and
+  // halve the angle of the sum. Its own two ends are still a toss-up, so the
+  // tie goes down the screen — toward the viewer, the way water in this studio
+  // usually runs.
+  for (const r of turned) { sx += r.nx * r.nx - r.ny * r.ny; sy += 2 * r.nx * r.ny; }
   const th = 0.5 * Math.atan2(sy, sx);
   let rx = Math.cos(th), ry = Math.sin(th);
   if (ry < 0 || (ry === 0 && rx < 0)) { rx = -rx; ry = -ry; }
 
-  // Pass two: swing every normal onto that reference, so the whole frame hangs
-  // its dark rim on the same side of the swell.
-  const cells = raw.map((r) => {
+  // Pass three: turn every shape through 180° where its cross axis disagrees
+  // with that reference. The shapes are symmetric, so that is no change to the
+  // picture except the one it is for — which side each rim lands on.
+  const cells = turned.map((r) => {
     const flip = r.nx * rx + r.ny * ry < 0;
-    const nx = flip ? -r.nx : r.nx, ny = flip ? -r.ny : r.ny;
-    // rotate(a) takes the shape's local +y onto that normal, so its long axis
-    // lands along the crest and the rims straddle the wave
-    const a = (Math.atan2(-nx, ny) * 180) / Math.PI;
-    const [gx, gy] = cell2ground((GI[r.p] / gN) * S.nx, (GJ[r.p] / gN) * S.ny, S);
-    return { x: r.x, y: r.y, a, c: tint ? colorAt(gx, gy) : ink };
+    // rotate(a) takes the shape's local +x onto the tangent (so it lies along
+    // the flow) and its local +y onto the cross axis (so the rims straddle it)
+    const a = (Math.atan2(flip ? -r.ty : r.ty, flip ? -r.tx : r.tx) * 180) / Math.PI;
+    return { x: r.x, y: r.y, a, c: tint ? colorAt(r.gx, r.gy) : ink };
   });
   return { d: driftShapePath(kind[0], kind[2]), half: (pitch * size) / 2,
            aim: (Math.atan2(ry, rx) * 180) / Math.PI, cells };
@@ -3306,7 +3404,8 @@ export {
   withWakes, newWake, WAKE_ANGLE_DEG, prepField, slopeAt,
   buildSurface3D, buildSurface3DPanorama, buildSolid3D, fieldSpecFor, crestField,
   buildPenLines, buildPenConcentric, buildPenHatch, HATCH_AIMS,
-  buildDriftGrid, driftUses, driftShapePath, colorSampler, surfaceSlopeField,
+  buildDriftGrid, driftUses, driftShapePath, colorSampler,
+  waveHeadingAt, flowTangent,
   DRIFT_SHAPES, DRIFT_DARK, DRIFT_LIGHT,
   RASTER_LEVELS, RASTER_DEFAULT, ANTIALIAS, ANTIALIAS_DEFAULT, antialiasAt,
   EXPORT_MULTS, EXPORT_DEFAULT, EXPORT_MAX_BW,
@@ -4814,7 +4913,7 @@ export default function App() {
   const [driftShape, setDriftShape] = useState("almond");
   const [driftDensity, setDriftDensity] = useState(38);   // shapes across the frame
   const [driftSize, setDriftSize] = useState(0.85);       // shape length, × the cell
-  const [driftSpacing, setDriftSpacing] = useState(1.15); // row pitch, × the shape's thickness
+  const [driftSpacing, setDriftSpacing] = useState(1);     // row pitch, × the column pitch
   const [driftRim, setDriftRim] = useState(1.1);   // rim width, viewBox units; sign = direction
   const [driftTint, setDriftTint] = useState(true); // take each shape's color from the scene
   const [driftInk, setDriftInk] = useState("#2233c4"); // …or this one, everywhere
@@ -7102,18 +7201,27 @@ export default function App() {
                 <b>Filled</b> cuts the reflection into flat color regions — the studio's own
                 picture, and the only mode the layered-paper stack can be cut from.
                 {" "}<b>Pen plot</b> redraws it as strokes a plotter could pull.
-                {" "}<b>Drift grid</b> redraws it as a field of small shapes on a screen grid,
-                each lying along the wave crest passing under it and carrying a black rim on
-                one side and a white rim on the other — the repeating light-dark-light-dark
-                sequence of a peripheral-drift illusion. Look at the middle of that frame and
-                the edges appear to roll; look straight at any one shape and it stops. Nothing
-                is animating: the picture is a still, and the motion is your own visual system
-                reading the asymmetric rims as movement.
-                {" The rims all lean the same way off the swell, because that consistency is"
-                  + " the whole effect — hang them off each shape's own uphill side instead"
-                  + " and the drift reverses on every other flank and cancels out. Which way"
-                  + " it rolls is the sign of the rim width, and which sign reads as which"
-                  + " direction depends on the viewer, so try both."}
+                {" "}<b>Drift grid</b> redraws it as a field of small shapes on a screen grid.
+                Each one lies flat on the water pointing the way the water is going, so it
+                runs level over a crest and level through the trough behind it and tips over
+                on the flank between them — the grid draws the swell the way iron filings
+                draw a field. Which way the water is going comes from the emitters
+                themselves, not from the surface: a swell and each part of a spectrum carry
+                their own heading, and a ring or point source sends its ripples out from
+                where it sits.
+                {" Each shape also carries a black rim on one side and a white rim on the"
+                  + " other — the repeating light-dark-light-dark sequence of a"
+                  + " peripheral-drift illusion. Look at the middle of the frame and the"
+                  + " edges appear to roll; look straight at any one shape and it stops."
+                  + " Nothing is animating: the picture is a still, and the motion is your"
+                  + " own visual system reading the asymmetric rims as movement."}
+                {" The rims lean the same way over the whole frame, because that consistency"
+                  + " is the whole effect — hang them off each shape's own uphill side"
+                  + " instead and the drift reverses on every other flank and cancels out."
+                  + " They sit on the shapes' long sides, so the roll runs across the flow"
+                  + " rather than along it. Which way it rolls is the sign of the rim width,"
+                  + " and which sign reads as which direction depends on the viewer, so try"
+                  + " both."}
               </Help>
               {driftOn && (
                 <div style={{ marginTop: 10 }}>
@@ -7132,10 +7240,9 @@ export default function App() {
                   <Slider label="size" value={driftSize} min={0.3} max={1.8} step={0.05}
                     onChange={setDriftSize}
                     fmt={(v) => v.toFixed(2) + "× cell" + (v > 1 ? " (overlapping)" : "")} />
-                  <Slider label="row spacing" value={driftSpacing} min={0.6} max={3} step={0.05}
+                  <Slider label="row spacing" value={driftSpacing} min={0.5} max={2.5} step={0.05}
                     onChange={setDriftSpacing}
-                    fmt={(v) => (v < 1 ? v.toFixed(2) + "× (rows overlap)"
-                      : v.toFixed(2) + "× shape")} />
+                    fmt={(v) => (v === 1 ? "square grid" : v.toFixed(2) + "× columns")} />
                   <Slider label="drift rim" value={driftRim} min={-3} max={3} step={0.1}
                     onChange={setDriftRim}
                     fmt={(v) => (Math.abs(v) < 0.05 ? "off (no illusion)"
@@ -7154,6 +7261,8 @@ export default function App() {
                     {surface3d && perspective
                       ? " Placed on the depth-sorted surface, so a near crest hides the shapes behind it."
                       : " Turn on the 3D wave surface for crests to hide the shapes behind them."}
+                    {" How far a shape tips is the wave height under Waves \u2014 at zero the"
+                      + " shapes lie flat along the flow and stop reading the swell at all."}
                     {" The grid is uniform on screen rather than in the water: the illusion is a"
                       + " property of the image on your retina, so the repeating unit has to keep"
                       + " its size instead of shrinking into the distance."}
