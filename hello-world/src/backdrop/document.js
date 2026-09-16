@@ -27,14 +27,18 @@
 //             and this tall — so it can be moved afterwards, and rendered at
 //             whatever resolution the compiler asks for rather than the
 //             brush's (see shapes.js)
+//    svg      an imported drawing: filled outlines somebody made elsewhere,
+//             flattened to polygons on the way in and placed in a box you can
+//             drag, the same way a shape is (see svg.js)
 //
 //  See docs/backdrop-system.md.
 // ------------------------------------------------------------------ //
 import * as d3 from "d3";
 import { paletteColorAt } from "./palettes";
 import { rasterizeShapes, shapesContent } from "./shapes";
+import { rasterizeSvg, svgContent } from "./svg";
 
-export { shapesContent };
+export { shapesContent, svgContent };
 
 export const DOC_VERSION = 2;
 // The document's cell grid: width is azimuth, height is elevation, row 0 is
@@ -147,6 +151,9 @@ export function renderContent(content, w = DOC_W, h = DOC_H, rowScale = 1) {
   if (content.kind === "shapes") {
     return rasterizeShapes(content.items, w, h, () => 0).cells;
   }
+  if (content.kind === "svg") {
+    return rasterizeSvg(content, w, h, () => 0).cells;
+  }
   return new Array(w * h).fill(null);
 }
 
@@ -175,10 +182,16 @@ export const kindLabel = (content) =>
     : content.kind === "stripes" ? (content.repeat ? "repeat" : "bands")
       : content.kind === "shapes" ? `${content.items.length} shape`
         + (content.items.length === 1 ? "" : "s")
-        : "painted";
+        : content.kind === "svg" ? `svg · ${content.paths.length} path`
+          + (content.paths.length === 1 ? "" : "s")
+          : "painted";
 
-export const docHasShapes = (doc) =>
-  doc.flats.some((f) => f.visible && f.content.kind === "shapes");
+// Stated content — shapes and imported drawings — is what the compiler renders
+// onto a finer grid than the brush paints on. A document with none of it is
+// authored at its own resolution and gains nothing from the scale-up.
+export const docHasVector = (doc) =>
+  doc.flats.some((f) => f.visible
+    && (f.content.kind === "shapes" || f.content.kind === "svg"));
 
 // ---- editing (all pure: hand back a new document) ------------------
 

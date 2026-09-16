@@ -12,12 +12,21 @@
 //  "-"-separated, so "aabbcc--ddeeff" is three entries with the middle one
 //  transparent. (A "-" marker would have been a second separator.)
 //
+//  An imported drawing is the one thing here whose cost is its geometry rather
+//  than its colours, so its points are packed rather than printed: each
+//  coordinate is twelve bits of the flat's own 0..1 box, written as two
+//  characters, so a point costs four. Twelve bits is 1/4096 of the layer —
+//  a twelfth of one cell of the finest grid the compiler contours on, so the
+//  packing is below anything the water can show.
+//
 //  Anything unparseable decodes to null and the caller keeps what it had. A
-//  document that will not fit (a smoothed layer with thousands of colours)
-//  encodes to null rather than writing a megabyte into someone's URL.
+//  document that will not fit (a smoothed layer with thousands of colours, or
+//  a drawing with more outline in it than a URL holds) encodes to null rather
+//  than writing a megabyte into someone's URL.
 // ------------------------------------------------------------------ //
 import { DOC_VERSION, backdropDoc, flat, rampContent, stripesContent } from "./document";
 import { shapesContent, shape, SHAPE_KINDS } from "./shapes";
+import { svgContent, MAX_SVG_PATHS, MAX_SVG_POINTS } from "./svg";
 
 const MAX_PALETTE = 64;
 // a watermark is a name or a title, not an essay — and the whole document has
@@ -80,6 +89,34 @@ export function decodeCells(code) {
   return { w, h, cells };
 }
 
+// ---- drawings, packed ----------------------------------------------
+// Two characters per coordinate, 4096 steps across the flat. The alphabet is
+// URL-safe, and the whole document rides inside a base64url parameter, so
+// nothing here needs escaping on the way out.
+
+const A64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+const V64 = new Map([...A64].map((c, i) => [c, i]));
+
+export function encodeRing(pts) {
+  let out = "";
+  for (let k = 0; k < pts.length; k++) {
+    const v = Math.max(0, Math.min(4095, Math.round(pts[k] * 4095)));
+    out += A64[(v >> 6) & 63] + A64[v & 63];
+  }
+  return out;
+}
+
+export function decodeRing(code) {
+  if (typeof code !== "string" || code.length % 4 !== 0 || !code.length) return null;
+  const pts = new Array(code.length / 2);
+  for (let k = 0; k < code.length; k += 2) {
+    const hi = V64.get(code[k]), lo = V64.get(code[k + 1]);
+    if (hi === undefined || lo === undefined) return null;
+    pts[k / 2] = ((hi << 6) | lo) / 4095;
+  }
+  return pts;
+}
+
 // ---- whole documents -----------------------------------------------
 
 export function encodeDoc(doc) {
@@ -93,6 +130,15 @@ export function encodeDoc(doc) {
       head.q = [f.place.distance, f.place.width, f.place.height];
     }
     if (c.kind === "ramp") flats.push({ ...head, k: "r", p: c.palette });
+    else if (c.kind === "svg") {
+      flats.push({ ...head, k: "v",
+        z: [c.x, c.y, c.w, c.h, c.aspect].map((v) => Math.round(v * 1e4) / 1e4),
+        i: c.paths.map((pth) => ({
+          c: pth.color.replace(/^#/, ""),
+          e: pth.even ? 1 : 0,
+          s: pth.subs.map(encodeRing),
+        })) });
+    }
     else if (c.kind === "shapes") {
       // a shape is its statement: type, box, colours. Four numbers and two
       // hexes, whatever resolution it ends up rendered at
@@ -163,6 +209,27 @@ export function decodeDoc(s) {
             : {}),
         }));
       content = shapesContent(items);
+    } else if (f.k === "v" && Array.isArray(f.i) && Array.isArray(f.z) && f.z.length === 5
+      && f.z.every((v) => typeof v === "number" && Number.isFinite(v))) {
+      const paths = [];
+      let points = 0;
+      for (const pth of f.i) {
+        if (paths.length >= MAX_SVG_PATHS || !pth || !Array.isArray(pth.s)) break;
+        const subs = [];
+        for (const code of pth.s) {
+          const ring = decodeRing(code);
+          if (!ring || ring.length < 6) continue;
+          points += ring.length / 2;
+          if (points > MAX_SVG_POINTS * 4) return null;   // not a link anyone wrote
+          subs.push(ring);
+        }
+        if (!subs.length) continue;
+        paths.push({ color: /^[0-9a-f]{6}$/i.test(String(pth.c)) ? "#" + pth.c : "#141d33",
+          even: !!pth.e, subs });
+      }
+      if (!paths.length) return null;
+      content = svgContent(paths, f.z[4] > 0 ? f.z[4] : 1,
+        { x: f.z[0], y: f.z[1], w: f.z[2], h: f.z[3] });
     } else if (f.k === "p") {
       const env = decodeCells(f.c);
       if (!env) return null;

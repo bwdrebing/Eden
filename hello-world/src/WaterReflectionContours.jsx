@@ -20,6 +20,9 @@ import {
   STAMPS, SHAPE_KINDS, shape, shapesContent, shapeAt, shapeBox, shapeLabel,
   withTextMasks, textMaskFor, textAspect, DOC_ASPECT,
 } from "./backdrop/shapes";
+import {
+  parseSvg, fitSvgBox, tintSvg, simplifySvg, svgBoxItem, svgPointCount,
+} from "./backdrop/svg";
 import { compileBackdrop, COMPILE_SCALE } from "./backdrop/compile";
 import { PALETTES, BANDED_PALETTES, paletteStops, paletteColorAt, paletteNames }
   from "./backdrop/palettes";
@@ -3567,6 +3570,7 @@ const WORKSPACES = [
   { id: "backdrop", name: "Backdrop", icon: "◐", find: [
     "palette presets", "paint 1d (elevation strip)", "paint 2d (panorama)", "from photo",
     "backdrop layers (paint, stripes, shapes)", "shapes editor", "bake a layer",
+    "import an svg drawing (vector layer)", "tint / fit / simplify a drawing",
     "undo / redo the backdrop", "brush size & shape", "color swatches",
     "show the backdrop itself", "elevation window (auto-fit, low / high)",
     "reflection width (azimuth span)", "reflection detail (angular zoom)",
@@ -4132,6 +4136,42 @@ function ColorWell({ label, value, onChange }) {
   );
 }
 
+// An imported drawing has no catalogue to pick from and no bands to set: it
+// arrived whole. What is left to decide is where it sits — which is the canvas
+// above, not a slider here — and the two things a file cannot know: whether it
+// belongs to this scene's palette, and whether it is finer than a link can
+// carry.
+function SvgEditor({ content, points, onChange, activeColor }) {
+  return (
+    <div style={{ marginTop: 10 }}>
+      <div style={{ fontSize: 9.5, color: "#6d808f", marginBottom: 6, lineHeight: 1.5,
+        fontFamily: "ui-monospace, monospace" }}>
+        {content.paths.length} path{content.paths.length === 1 ? "" : "s"} · {points} points.
+        Drag it on the canvas; the corner handle resizes.
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+        <ColorWell label="tint all" value={content.paths[0] ? content.paths[0].color : activeColor}
+          onChange={(c) => onChange(tintSvg(content, c))} />
+        <button style={{ ...miniBtnBase, flex: "none", padding: "6px 10px" }}
+          title="put back the proportions the file had"
+          onClick={() => onChange(fitSvgBox(content))}>fit</button>
+        <button style={{ ...miniBtnBase, flex: "none", padding: "6px 10px" }}
+          title="drop the detail a backdrop cell cannot show, to fit the link"
+          onClick={() => onChange(simplifySvg(content))}>simplify</button>
+      </div>
+      <Help label="what comes across from a drawing">
+        Filled outlines, in the order the file draws them, each one its own region — so
+        two paths the same colour stay two shapes in the water. Strokes come across as
+        outlines of themselves. A gradient becomes the one colour its stops average to,
+        because a region is flat by construction, and anything nearly transparent is
+        dropped rather than drawn solid. Type has to be converted to outlines in the
+        program that drew it: the letters are not in the file otherwise. Rendered at{" "}
+        {COMPILE_SCALE}× the paint grid, like shapes.
+      </Help>
+    </div>
+  );
+}
+
 // The layer stack, far at the bottom of the list to near at the top — the way
 // it is drawn, and the way it reads on the canvas.
 function LayerList({ doc, activeId, onSelect, onToggle, onMove }) {
@@ -4617,6 +4657,8 @@ export default function App() {
   const docRef = useRef(doc); docRef.current = doc;
   const [activeFlat, setActiveFlat] = useState(() => doc.flats[0].id);
   const [selectedShape, setSelectedShape] = useState(null);
+  const svgFileRef = useRef(null);
+  const [svgInfo, setSvgInfo] = useState(null);   // { error } | { note }
   const envColorsRef = useRef(envColors); envColorsRef.current = envColors;
   const active = doc.flats[flatIndex(doc, activeFlat)] || doc.flats[doc.flats.length - 1];
   // what the canvas shows: every visible layer composited, live (the water
@@ -4838,6 +4880,26 @@ export default function App() {
     setActiveFlat(id);
     return next;
   });
+  // An SVG arrives as a layer of its own. The file is read and flattened here,
+  // on the main thread, for the same reason a watermark's letters are: parsing
+  // needs the DOM, and what goes into the document has to be plain data the
+  // render worker can be handed. See backdrop/svg.js.
+  const loadSvgFile = (file) => {
+    if (!file) return;
+    setSvgInfo(null);
+    const reader = new FileReader();
+    reader.onerror = () => setSvgInfo({ error: "Couldn't read that file." });
+    reader.onload = () => {
+      const res = parseSvg(String(reader.result || ""));
+      if (res.error) { setSvgInfo({ error: res.error }); return; }
+      setSelectedShape(null);
+      addLayer(res.content, file.name.replace(/\.svg$/i, "").slice(0, 24) || "Drawing");
+      setSvgInfo(res.dropped
+        ? { note: `${res.dropped} of the smallest paths were left out.` }
+        : null);
+    };
+    reader.readAsText(file);
+  };
   const duplicateLayer = () => editDoc((d) => {
     const { doc: next, id } = duplicateFlat(d, activeFlat);
     setActiveFlat(id);
@@ -4880,6 +4942,10 @@ export default function App() {
         items: [...d.flats[flatIndex(d, activeFlat)].content.items, item] },
     }));
   };
+  // Dragging a drawing moves its box, mid-drag: the canvas follows the pointer
+  // and the water waits for it to come up, exactly as a shape drag does.
+  const placeSvg = (patch) => setDoc((d) => updateFlat(d, activeFlat,
+    { content: { ...d.flats[flatIndex(d, activeFlat)].content, ...patch } }));
   const patchShape = (id, patch, live) => {
     const refit = RESETS_TEXT_FIT.some((k) => k in patch);
     const apply = (d) => updateFlat(d, activeFlat, {
@@ -6330,6 +6396,15 @@ export default function App() {
                         onChange={(id, patch) => patchShape(id, patch, true)}
                         onCommit={() => setSegDoc(docRef.current)} />
                     )}
+                    {active.content.kind === "svg" && (
+                      // a drawing is placed by its box, so it is dragged by the
+                      // same overlay a rectangle is — one item, always selected
+                      <ShapeOverlay items={[svgBoxItem(active.content)]} selectedId="svg"
+                        onSelect={() => {}}
+                        onEditStart={() => { beginEdit("2d"); setDirty2d(true); }}
+                        onChange={(id, patch) => placeSvg(patch)}
+                        onCommit={() => setSegDoc(docRef.current)} />
+                    )}
                   </ElevationScale>
                   <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9.5,
                     color: "#6d808f", marginTop: 2, paddingLeft: 40,
@@ -6352,10 +6427,27 @@ export default function App() {
                     <button style={miniBtn} title="A new layer of shapes you can drag"
                       onClick={() => { setSelectedShape(null);
                         addLayer(shapesContent([]), "Shapes"); }}>+ shapes</button>
+                    <input ref={svgFileRef} type="file" accept=".svg,image/svg+xml"
+                      style={{ display: "none" }}
+                      onChange={(e) => { loadSvgFile(e.target.files && e.target.files[0]);
+                        e.target.value = ""; }} />
+                    <button style={miniBtn} title="Import an SVG drawing as its own layer"
+                      onClick={() => svgFileRef.current && svgFileRef.current.click()}>
+                      + svg</button>
+                  </div>
+                  <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
                     <button style={miniBtn} onClick={duplicateLayer}>copy</button>
                     <button style={{ ...miniBtn, color: doc.flats.length > 1 ? "#c98a7f" : "#4a5560" }}
                       onClick={removeLayer} disabled={doc.flats.length <= 1}>delete</button>
                   </div>
+
+                  {svgInfo && (
+                    <div style={{ fontSize: 9.5, marginTop: 6, lineHeight: 1.5,
+                      fontFamily: "ui-monospace, monospace",
+                      color: svgInfo.error ? "#c98a7f" : "#6d808f" }}>
+                      {svgInfo.error || svgInfo.note}
+                    </div>
+                  )}
 
                   <PlaceEditor flat={active} yFar={yFar}
                     onChange={(place) => patchActive({ place })} />
@@ -6388,6 +6480,12 @@ export default function App() {
                   {active.content.kind === "stripes" && (
                     <StripesEditor content={active.content} rowsPerDeg={doc.h / ((eHi - eLo) || 1)}
                       onChange={patchContent} activeColor={activeColor} />
+                  )}
+
+                  {active.content.kind === "svg" && (
+                    <SvgEditor content={active.content} points={svgPointCount(active.content)}
+                      onChange={(content) => patchActive({ content })}
+                      activeColor={activeColor} />
                   )}
 
                   {active.content.kind === "shapes" && (
@@ -6476,8 +6574,13 @@ export default function App() {
                   {mode === "paint2d" && !docCode && (
                     <div style={{ fontSize: 9.5, color: "#c96f5f", marginTop: 8, lineHeight: 1.5,
                       fontFamily: "ui-monospace, monospace" }}>
-                      Too many distinct colors to save in the link — smoothing blends a new color
-                      into every cell. This backdrop will not survive a reload.
+                      {doc.flats.some((f) => f.content.kind === "svg")
+                        ? "Too much backdrop to save in the link. An imported drawing is carried"
+                          + " as its outlines, so simplify it; smoothing also costs, since it"
+                          + " blends a new color into every cell."
+                        : "Too many distinct colors to save in the link — smoothing blends a new"
+                          + " color into every cell."}
+                      {" "}This backdrop will not survive a reload.
                     </div>
                   )}
                 </>
