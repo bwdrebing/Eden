@@ -138,6 +138,18 @@ scaled inside a fixed-size `<div>` gives a zoomed crop to screenshot.
   `withTextMasks` for a backdrop text shape) and hands it across as data. A
   document in the URL carries the string and the type it is set in, never the
   mask.
+- **An imported SVG is read once, on the main thread, and never again.**
+  `backdrop/svg.js` parses a file with DOMParser and flattens its curves, arcs
+  and strokes into plain polygons in the flat's own 0..1 box — the same reason
+  `textMask.js` sets type here: the render worker has no DOM to rely on, and
+  what crosses to it has to be data. So a builder never sees SVG markup, only
+  numbers. Each path is its own region in the file's draw order, which is what
+  keeps a highlight on top of the body it was drawn inside; a gradient becomes
+  the one colour its stops average to, because a region is flat by
+  construction. Points are the thing that costs here, not colours: they are
+  simplified on the way in and packed twelve bits to a coordinate in the URL,
+  and the smallest paths go first when a drawing outgrows the region budget.
+
 - **The watermark is on the water; a text shape is across it.** `S.mark` is
   contoured on the visible-surface raster, so the words ride the wave they sit
   on and stop at the crest in front of them but never shred — that is what makes

@@ -32,8 +32,9 @@
 // ------------------------------------------------------------------ //
 import * as d3 from "d3";
 import { distTransform, blurField } from "./field";
-import { renderContent, docHasShapes } from "./document";
+import { renderContent, docHasVector } from "./document";
 import { rasterizeShapes } from "./shapes";
+import { rasterizeSvg } from "./svg";
 import { makePlanePlace } from "./place";
 
 export const MAX_REGIONS = 160;
@@ -51,7 +52,10 @@ export const COMPILE_SCALE = 4;
  *
  * Painted, ramp and repeat layers still key on colour, per layer: that is what
  * "a colour is a band" means for them, and it keeps a one-layer document
- * identical to what it compiled to before. Shape layers key per shape.
+ * identical to what it compiled to before. Shape layers key per shape, and an
+ * imported drawing keys per path — the file's own order, which is the only
+ * z-order an SVG has, and the one thing that keeps a highlight on top of the
+ * body it was drawn inside.
  */
 function flattenKeyed(doc, EW, EH, flats, fillHoles) {
   const rowScale = EH / doc.h, colScale = EW / doc.w;
@@ -76,6 +80,13 @@ function flattenKeyed(doc, EW, EH, flats, fillHoles) {
       });
       for (let p = 0; p < EW * EH; p++) {
         if (sc[p] != null) { cells[p] = sc[p]; labels[p] = sk[p]; }
+      }
+    } else if (f.content.kind === "svg") {
+      const paths = f.content.paths;
+      const { cells: vc, keys: vk } = rasterizeSvg(f.content, EW, EH, (i) =>
+        keyFor(`${li}:v:${i}`, paths[i].color, li, i));
+      for (let p = 0; p < EW * EH; p++) {
+        if (vc[p] != null) { cells[p] = vc[p]; labels[p] = vk[p]; }
       }
     } else {
       // Colour-keyed layers are authored at the document's own resolution —
@@ -215,7 +226,7 @@ function groupOf(stack, place) {
 export function compileBackdrop(doc, opts = {}) {
   // shapes render onto a finer grid than the brush paints on; everything else
   // compiles at the resolution it was authored at
-  const scale = opts.scale || (docHasShapes(doc) ? COMPILE_SCALE : 1);
+  const scale = opts.scale || (docHasVector(doc) ? COMPILE_SCALE : 1);
   const EW = doc.w * scale, EH = doc.h * scale;
 
   const sky = doc.flats.filter((f) => !f.place || f.place.kind !== "plane");

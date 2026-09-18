@@ -1,6 +1,6 @@
 # Backdrop system: critique and rearchitecture
 
-Status: phases 0–5 landed; phase 6 is still a proposal. What each phase
+Status: phases 0–5 landed (including 4b and 4c); phase 6 is still a proposal. What each phase
 delivered is noted against it in §5.
 Scope: everything that answers the question *what does the water reflect?* —
 the `preset` / `paint1d` / `paint2d` modes, the reflected-objects catalogue, and
@@ -331,6 +331,36 @@ relied on for neither, so `withTextMasks` hydrates the document on its way out
 and a shape with no mask draws nothing. The URL carries the string and the type
 it is set in — never the mask, which is thousands of cells and derivable from
 those two.
+
+### Phase 4c — imported drawings — **landed**
+
+An `svg` content kind: a file somebody drew elsewhere, arriving as what it
+already is — filled outlines. `backdrop/svg.js` reads the file, flattens its
+curves and arcs to polylines once, normalizes into the flat's 0..1 box (with y
+flipped: SVG counts down from the top of the page, a flat counts up from the
+waterline), and hands back plain numbers. It is placed in a box you drag, like a
+shape, and rendered at `COMPILE_SCALE` for the same reason.
+
+It takes the same rule Phase 4b established, for the same reason: **parsing
+happens on the studio's thread and what crosses is data.** DOMParser is a DOM
+facility and the render worker has no claim on one, so a document carries the
+drawing's polygons, never its markup.
+
+Each path is its own region, in the file's draw order — the only z-order an SVG
+has, and what keeps a highlight on top of the body it was drawn inside. Three
+things a file can say that a region model cannot hold, and what becomes of
+them: a gradient is averaged to the one colour its stops come to; anything
+near-transparent is dropped rather than drawn solid; and a stroke is expanded
+into an outline of itself, because line art is half of what people have to hand
+and a drawing that imports blank is worse than one that imports approximately.
+Type is not set — the letters are not in the file unless its author converted
+them to outlines, and the panel says so.
+
+The cost is geometry rather than colour, which is new here: points are packed
+into the URL at twelve bits each (two characters per coordinate, a twelfth of
+one cell of the grid the compiler contours on), simplified on the way in, and
+the smallest paths are dropped first when a drawing has more outline than the
+region budget or the link can hold.
 
 ### Phase 5 — depth — **landed**
 
