@@ -57,6 +57,31 @@ section in `WaterReflectionContours.jsx` (search for `const WORKSPACES`).
 The registry is the single source of truth for the tab strip *and* the find
 index: `SEARCH_INDEX` is derived from each workspace's `find` list.
 
+## Two studios
+
+The page is two studios — water and sand — picked by a small switch that
+`App.js` hands to each studio to draw on its own caption line. It lives
+there, not in a bar above both, so choosing a studio costs neither control
+column any of its budget (water tabs measure the same with and without it).
+Each studio owns its whole column: its own registry, find index and URL
+slice. The sand studio's registry is `SAND_WORKSPACES` in
+`SandscapeStudio.jsx`, and every rule in this file applies to it unchanged:
+
+| Workspace | The user's intent | What lives there |
+|---|---|---|
+| `terrain` | …the sand's shape | starting points, bedform cards (dunes, wind ripples, current ripples, rills) |
+| `light`   | …how it is lit | sun bearing and height, cast shadows, shadow fill, haze |
+| `camera`  | …the view | straight down vs across, frame shape, width / eye height, heading, horizon, lens, position |
+| `style`   | …how it's drawn | palette, bands, balance, colour by light or height, fill / lines, smoothing, antialiasing, background |
+| `output`  | …the file I get | SVG and its detail, PNG and its size, preview quality |
+
+Light is its own workspace rather than a Style section because the sun is
+the sand's main creative control — sand is one colour, and all you see of its
+shape is light — and people visit it on its own. Bedform cards collapse, one
+open at a time, which is what keeps Terrain inside the budget with several.
+A new control on either studio goes in that studio's registry; a control
+never appears in both.
+
 ## Adding a control: the procedure
 
 1. **Name the user's intent, not the implementation.** Ask "when someone
