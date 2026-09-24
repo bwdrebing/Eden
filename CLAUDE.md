@@ -7,6 +7,11 @@ it lives in one file, `hello-world/src/WaterReflectionContours.jsx`, whose
 comments carry the reasoning behind each stage — read the comment above a
 function before changing it.
 
+It is two studios behind one switch (`App.js`): the water, and a **sand
+studio** (`SandscapeStudio.jsx`, renderer in `src/sand/`) that draws dunes,
+wind ripples, current ripples and backwash rills the same way — a scalar field
+cut into flat vector regions. See "The sand studio" at the end.
+
 The control panel is organized into six task-based workspace tabs. Before
 adding, moving, or renaming **any UI control** — even "just one slider" —
 read `.claude/skills/control-surface/SKILL.md`: it says which workspace a
@@ -167,3 +172,41 @@ scaled inside a fixed-size `<div>` gives a zoomed crop to screenshot.
   (`buildSurface3D`, `buildSurface3DPanorama`) that must stay in step. A new
   option on one usually belongs on the other; `buildSolid3D` is where both are
   chosen from.
+
+## The sand studio
+
+`src/sand/field.js` is the sand's height, `h(x, y)` in metres, summed from
+bedform cards the way the water sums emitters; `render.js` lights it and cuts
+it into bands; `SandscapeStudio.jsx` is only the panel. Its workspaces are
+`SAND_WORKSPACES`, under the same control-surface rules as the water's.
+
+- **The preview is the export's own SVG string** (`renderSand`), drawn into
+  the page as markup. Export SVG only re-traces it on a wider raster; PNG
+  rasterizes the full-quality preview. There is no second drawing to drift.
+- **Every height is evaluated once**, on a grid laid out for the camera: the
+  frame's pixels for plan view, (screen column × depth step) for
+  perspective. Slope, light and shadows are read back off that grid. Anything
+  that calls `sandHeight` per pixel per sample instead will cost seconds.
+- **Depth steps are paced by visible rows** (`samplePersp`): sized so the
+  surface rising into view moves ~half a row, growing freely where the sand
+  is below the frame or hidden behind a crest, and stopping where haze is
+  total. A fixed schedule was 3× the nodes for the same picture.
+- **Shadows are a margin, not a test** (`lightNode`): how far the terrain
+  toward the sun rises above the sun's ray, eased across one footprint so the
+  edge lands between samples. The march is geometric, so it must re-sample
+  around its most promising peaks — skipping that is what drew every dune
+  shadow with a sawtooth edge. Rays that leave the camera's grid read
+  `casterCache`, never raw `sandHeight`.
+- **Bands are cut from clamped fields**: each threshold's field saturates one
+  band-gap either side, so a hard shadow edge — which crosses every threshold
+  in one pixel — puts every band's edge in the same place. Unclamped, each
+  shadow grows a sliver of every intermediate tone.
+- **Features fade by footprint, not by distance** (`keep`): a feature stays
+  while either its wavelength across the ground or its height up the frame
+  spans a few samples, so a far dune keeps its skyline while ripples at the
+  same distance go.
+- `field.js` and `render.js` bind `Math` to a module constant. Under jest,
+  global lookups inside the vm context made the field ~30× slower; leave it.
+- Look at it, as for the water: `src/sand/presets.js` holds a scene per
+  bedform, and `sand.test.js` renders each. Render them to `.svg` and open
+  them before and after any change to the field or the renderer.

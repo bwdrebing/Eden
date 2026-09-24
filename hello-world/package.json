@@ -27,7 +27,8 @@
       "node_modules/(?!(d3|d3-[^/]+|internmap|delaunator|robust-predicates)/)"
     ],
     "moduleNameMapper": {
-      "^\\./solidWorkerFactory$": "<rootDir>/src/solidWorkerFactory.jsdom.js"
+      "^\\./solidWorkerFactory$": "<rootDir>/src/solidWorkerFactory.jsdom.js",
+      "^\\./sandWorkerFactory$": "<rootDir>/src/sand/sandWorkerFactory.jsdom.js"
     }
   },
   "eslintConfig": {
