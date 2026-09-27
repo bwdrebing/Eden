@@ -616,9 +616,11 @@ function slopeAt(gx, gy, S) {
 // full reflected direction (unit) — gives both elevation and azimuth.
 // 4th component = cos of the incidence angle (view ray vs surface normal),
 // which sets the Fresnel reflectance at this point.
-function reflectAt(gx, gy, S) {
+// `relief` steepens the normal (see fresnelAt) — 1, the default, is the
+// physical wave, and is what every reflected color is read at.
+function reflectAt(gx, gy, S, relief = 1) {
   const [hx, hy] = slopeAt(gx, gy, S);
-  let nx = -hx, ny = -hy, nz = 1;
+  let nx = -hx * relief, ny = -hy * relief, nz = 1;
   const nl = Math.hypot(nx, ny, nz); nx /= nl; ny /= nl; nz /= nl;
   let vx = gx, vy = gy, vz = -S.H;
   const vl = Math.hypot(vx, vy, vz); vx /= vl; vy /= vl; vz /= vl;
@@ -633,6 +635,47 @@ function fresnelDeepW(cosI) {
   const c = cosI < 0 ? 0 : cosI > 1 ? 1 : cosI;
   const m = 1 - c;
   return 1 - (0.02 + 0.98 * m * m * m * m * m);
+}
+
+// A reflected ray that points down into the water never reaches the sky: it
+// runs into the next wave over, so what comes back along it is water — the
+// deep color — not the horizon its elevation would otherwise clamp to. That
+// is the trough-side darkening of real waves (a blocked reflection, not a
+// shadow; water has no diffuse surface for a shadow to fall on). Ramped over
+// a narrow band of reflected elevation rather than cut at zero, so the weight
+// stays a continuous field and contours into a clean edge instead of speckle.
+const BLOCKED_RAMP = 0.12;   // in sin(reflected elevation): about ±3.4° about the horizon
+
+// The deep-water weight for a reflected ray from reflectAt: Schlick at its
+// incidence, or all water where the ray is blocked, whichever is more.
+function deepWeight(R) {
+  const w = fresnelDeepW(R[3]);
+  let b = 0.5 - R[2] / BLOCKED_RAMP;
+  b = b < 0 ? 0 : b > 1 ? 1 : b;
+  return b > w ? b : w;
+}
+
+// How much steeper the drawn 3D surface is than the physical wave at a point:
+// the slope of clampLift(z·waveScale) against z, never below 1. The Fresnel
+// normal is steepened by this so a face the lift visibly tilts toward the
+// camera darkens as a face that steep would — lit at the physical slope (5°
+// on a typical scene) the whole frame bands by distance alone. The reflected
+// color keeps the physical normal: this is about how much sky a face shows,
+// not which sky. clampLift's rectangular-output anisotropy is left out on
+// purpose — it is undone by the frame's own stretch, so on screen the relief
+// is the plain waveScale.
+function reliefAt(gx, gy, S) {
+  const s = S.waveScale || 0;
+  if (s <= 1) return 1;
+  const c = Math.cosh((heightAt(gx, gy, S) * s) / (0.75 * S.H));
+  const g = s / (c * c);
+  return g > 1 ? g : 1;
+}
+
+// The deep-water weight at a ground point, on the surface the scene draws:
+// relief-steepened in the 3D-solid pass, physical everywhere else.
+function fresnelAt(gx, gy, S, lifted) {
+  return deepWeight(reflectAt(gx, gy, S, lifted ? reliefAt(gx, gy, S) : 1));
 }
 
 // quantized Lab mix toward the deep-water color: band b of K, b = 0 pure
@@ -1890,8 +1933,10 @@ function fieldSpecFor(S, opts) {
   const { use2d, doc, azSpan, cols, fresOn, fresBands } = opts;
   const mag = S.reflMag || 1;
   // occluded Fresnel: the deep-water weight at the front-most surface point,
-  // contoured into the same bands the flat path clips with
-  const fresAt = fresOn ? (gx, gy) => fresnelDeepW(reflectAt(gx, gy, S)[3]) : null;
+  // contoured into the same bands the flat path clips with. The 3D-solid pass
+  // lifts the surface, so it reads the weight off the lifted slope (reliefAt)
+  const lifted = !!(S.surface3d && S.perspective);
+  const fresAt = fresOn ? (gx, gy) => fresnelAt(gx, gy, S, lifted) : null;
   const fresThresholds = fresOn ? d3.range(1, fresBands).map((k) => k / fresBands) : null;
   if (use2d) {
     // arbitrary backdrop colors have no single scalar to contour, so the
@@ -2703,7 +2748,7 @@ function buildGeometry(S) {
       const R = reflectAt(gx, gy, S);
       const v = Math.asin(Math.max(-1, Math.min(1, R[2]))) * 180 / Math.PI;
       values[j * nx + i] = v;
-      if (wVals) wVals[j * nx + i] = fresnelDeepW(R[3]);
+      if (wVals) wVals[j * nx + i] = deepWeight(R);
       if (v < lo) lo = v; if (v > hi) hi = v;
     }
   }
@@ -2927,7 +2972,7 @@ function buildSegmentation(S, backdrop, azSpan) {
       const [phi, psi0] = rayAngles(R);
       fF[p] = phi;
       fG[p] = place.clampAz(psi0);
-      if (fW) fW[p] = fresnelDeepW(R[3]);
+      if (fW) fW[p] = deepWeight(R);
       if (needRay) {
         rGX[p] = gx; rGY[p] = gy; rRX[p] = R[0]; rRY[p] = R[1]; rRZ[p] = R[2];
       }
@@ -5276,9 +5321,9 @@ export default function App() {
     const fit = computeFit(S);
     const mag = S.reflMag || 1;
     prepField(S);
-    const deepMix = (c, cosI) => {
+    const deepMix = (c, R) => {
       if (!fresOn) return c;
-      const b = Math.min(fresBands - 1, Math.floor(fresnelDeepW(cosI) * fresBands));
+      const b = Math.min(fresBands - 1, Math.floor(deepWeight(R) * fresBands));
       return mixDeep(c, b);
     };
     let colorAt;
@@ -5292,7 +5337,7 @@ export default function App() {
         let v = magFrac((phi - S.eLo) / ((S.eHi - S.eLo) || 1), mag); v = v < 0 ? 0 : v > 1 ? 1 : v;
         let u = magFrac((psi + az) / (2 * az), mag); u = u < 0 ? 0 : u > 1 ? 1 : u;
         const c = cells[Math.min(EH - 1, Math.floor(v * EH)) * EW + Math.min(EW - 1, Math.floor(u * EW))];
-        return deepMix(c, R[3]);
+        return deepMix(c, R);
       };
     } else {
       const cols = mode === "paint1d" ? colors1d : presetColors;
@@ -5308,7 +5353,7 @@ export default function App() {
           for (const f of fr) { if (v >= f) idx++; else break; }
           c = cols[idx] || cols[0];
         } else c = cols[Math.floor(v * NB)] || cols[0];
-        return deepMix(c, R[3]);
+        return deepMix(c, R);
       };
     }
     const threeD = S.perspective && penRelief > 0;

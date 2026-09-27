@@ -163,6 +163,15 @@ scaled inside a fixed-size `<div>` gives a zoomed crop to screenshot.
   (`buildGeometry`, `buildSegmentation`) do not run at all: nothing drawn
   comes from them there, and `elevationRange` supplies the two numbers
   auto-fit reads.
+- **Fresnel is lit on the surface that is drawn, not the physical one.** The
+  deep-water weight (`fresnelAt` / `deepWeight`) steepens the normal by the
+  3D lift's own slope (`reliefAt`: the derivative of `clampLift`, floored at
+  1) in the 3D-solid pass, so a face the wave-height slider tilts toward the
+  camera darkens like a face that steep — at the physical 5° the frame only
+  bands by distance. The reflected *color* keeps the physical normal. A
+  reflected ray pointing into the water counts as blocked (it hits the next
+  wave) and weighs as all water, ramped over `BLOCKED_RAMP` rather than cut so
+  the field contours cleanly. Everything here only acts with Fresnel on.
 - The 1D/preset path and the 2D panorama path are separate builders
   (`buildSurface3D`, `buildSurface3DPanorama`) that must stay in step. A new
   option on one usually belongs on the other; `buildSolid3D` is where both are
