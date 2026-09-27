@@ -24,6 +24,8 @@ import { compileBackdrop, COMPILE_SCALE } from "./backdrop/compile";
 import { PALETTES, BANDED_PALETTES, paletteStops, paletteColorAt, paletteNames }
   from "./backdrop/palettes";
 import { createSolidBuilder } from "./solidBuilder";
+import { ICE_Z, ICE_T, ICE_IOR, ICE_DISPERSION_SPAN, ICE_MAX, prepIceCube, iceMeet, traceIce,
+  cameraRay, iceFootprint, newIceCube } from "./ice";
 import {
   VIDEO_FPS, VIDEO_MIN_SEC, VIDEO_MAX_SEC, VIDEO_DEFAULT_SEC,
   VIDEO_SCALES, VIDEO_DEFAULT_SCALE, videoSize, framePlan,
@@ -1090,8 +1092,10 @@ const CREST_OVERLAP = 1;
 // smooth a raster-space contour multipolygon into a bezier path in viewBox
 // coordinates (the raster is BW×BH, the viewBox VB_W×VB_H). `off` shifts
 // contour coordinates back from a padded raster (a one-pixel replicated border
-// lets a region's edge cross the frame instead of stopping half a pixel inside).
-function contourToScreenPath(multi, BW, BH, iters, off = 0) {
+// lets a region's edge cross the frame instead of stopping half a pixel inside);
+// with `offY` as well it places a sub-raster — a window of the frame's raster,
+// as the ice view traces one block at a time — at its own corner.
+function contourToScreenPath(multi, BW, BH, iters, off = 0, offY = off) {
   const kx = VB_W / BW, ky = VB_H / BH;
   let d = "";
   for (const poly of multi.coordinates) {
@@ -1100,7 +1104,7 @@ function contourToScreenPath(multi, BW, BH, iters, off = 0) {
       let ring = new Float64Array(n * 2);
       for (let i = 0; i < n; i++) {
         const p = ring0[i];
-        ring[2 * i] = (p[0] + off) * kx; ring[2 * i + 1] = (p[1] + off) * ky;
+        ring[2 * i] = (p[0] + off) * kx; ring[2 * i + 1] = (p[1] + offY) * ky;
       }
       ring = iters ? chaikin(ring, iters) : ring;
       const simp = simplifyRing(ring, 0.6);
@@ -2794,50 +2798,50 @@ function skyRayField(S, fit, BW) {
   return any ? { BW, BH, NP, phi, psi, dir, sky } : null;
 }
 
-// Painted backdrops: one contour per region, through its distance field —
-// the buildSegmentation construction, on view rays.
-function buildSkyRegions(S, fit, backdrop, azSpan, opts = {}) {
-  if (!S.perspective || !backdrop || backdrop.overflow) return null;
-  const R = skyRayField(S, fit, opts.BW || SKY_BW);
-  if (!R) return null;                        // horizon off the top of the frame
-  const { BW, BH, NP, phi, psi, dir, sky } = R;
-  const groups = backdrop.groups || [backdrop];
-  const iters = Math.min(S.smooth || 0, SKY_SMOOTH);
-
-  // Where each screen point lands on one flat. The plane intersection is the
-  // same function the water uses — only the ray changes, from one leaving the
-  // surface to one leaving the camera — so a board drawn above the horizon and
-  // the same board reflected below it cannot disagree.
-  const groupTaps = (g) => {
-    const plane = g.place && g.place.kind === "plane";
-    const place = plane ? null : makeSkyPlace({ eLo: S.eLo, eHi: S.eHi, azSpan,
-      mag: S.reflMag || 1, EW: g.EW, EH: g.EH });
-    const tap = new Int32Array(NP), tx = new Float32Array(NP), ty = new Float32Array(NP);
-    const on = new Uint8Array(NP);
-    const edge = plane ? new Float64Array(NP) : null;
-    for (let p = 0; p < NP; p++) {
-      if (!sky[p]) continue;
-      let u, v;
-      if (plane) {
-        const h = g.place.hit(0, 0, S.H, [dir[p * 3], dir[p * 3 + 1], dir[p * 3 + 2]]);
-        if (!h) continue;
-        u = h[0] * g.EW; v = h[1] * g.EH;
-        edge[p] = g.place.edge(h[0], h[1]) * Math.min(g.EW, g.EH);
-      } else {
-        u = place.col(place.clampAz(psi[p])); v = place.row(phi[p]);
-      }
-      let x = u - 0.5; x = x < 0 ? 0 : x > g.EW - 1 ? g.EW - 1 : x;
-      let y = v - 0.5; y = y < 0 ? 0 : y > g.EH - 1 ? g.EH - 1 : y;
-      const i0 = Math.min(g.EW - 2, Math.floor(x)), j0 = Math.min(g.EH - 2, Math.floor(y));
-      tap[p] = j0 * g.EW + i0; tx[p] = x - i0; ty[p] = y - j0; on[p] = 1;
+// Where each raster point lands on one flat of the backdrop, from the two
+// angles of the ray that point looks along (and, for a board standing at a
+// finite distance, the ray itself). The plane intersection is the same
+// function the water uses — only the ray changes, from one leaving the surface
+// to one leaving the camera — so a board drawn above the horizon and the same
+// board reflected below it cannot disagree. Shared by the sky view and the ice
+// view, which differ only in where their rays come from.
+function flatTaps(S, g, azSpan, NP, on0, phi, psi, dir) {
+  const plane = g.place && g.place.kind === "plane";
+  const place = plane ? null : makeSkyPlace({ eLo: S.eLo, eHi: S.eHi, azSpan,
+    mag: S.reflMag || 1, EW: g.EW, EH: g.EH });
+  const tap = new Int32Array(NP), tx = new Float32Array(NP), ty = new Float32Array(NP);
+  const on = new Uint8Array(NP);
+  const edge = plane ? new Float64Array(NP) : null;
+  for (let p = 0; p < NP; p++) {
+    if (!on0[p]) continue;
+    let u, v;
+    if (plane) {
+      const h = g.place.hit(0, 0, S.H, [dir[p * 3], dir[p * 3 + 1], dir[p * 3 + 2]]);
+      if (!h) continue;
+      u = h[0] * g.EW; v = h[1] * g.EH;
+      edge[p] = g.place.edge(h[0], h[1]) * Math.min(g.EW, g.EH);
+    } else {
+      u = place.col(place.clampAz(psi[p])); v = place.row(phi[p]);
     }
-    return { tap, tx, ty, on, edge };
-  };
+    let x = u - 0.5; x = x < 0 ? 0 : x > g.EW - 1 ? g.EW - 1 : x;
+    let y = v - 0.5; y = y < 0 ? 0 : y > g.EH - 1 ? g.EH - 1 : y;
+    const i0 = Math.min(g.EW - 2, Math.floor(x)), j0 = Math.min(g.EH - 2, Math.floor(y));
+    tap[p] = j0 * g.EW + i0; tx[p] = x - i0; ty[p] = y - j0; on[p] = 1;
+  }
+  return { tap, tx, ty, on, edge };
+}
 
+// Every region of a compiled backdrop, contoured through per-point taps on a
+// W x H raster that sits at (ox, oy) inside the frame's BW x BH one — one
+// contour per region, through its distance field, the buildSegmentation
+// construction. Points no ray reaches are left out entirely.
+function tapRegions(backdrop, tapsFor, W, H, BW, BH, iters, ox = 0, oy = 0, minArea = 0) {
+  const NP = W * H;
+  const groups = backdrop.groups || [backdrop];
   const F = new Float64Array(NP);
   const drawn = [];
   for (const g of groups) {
-    const { tap, tx, ty, on, edge } = groupTaps(g);
+    const { tap, tx, ty, on, edge } = tapsFor(g);
     const layers = new Array(g.count);
     g.eachField((k, D) => {
       for (let p = 0; p < NP; p++) {
@@ -2847,12 +2851,24 @@ function buildSkyRegions(S, fit, backdrop, azSpan, opts = {}) {
                 + (D[q + g.EW] * (1 - fx) + D[q + g.EW + 1] * fx) * fy;
         F[p] = edge && edge[p] < d ? edge[p] : d;
       }
-      const multi = d3.contours().size([BW, BH]).thresholds([0])(F)[0];
-      layers[k] = { d: contourToScreenPath(multi, BW, BH, iters), color: g.colorAt(k) };
+      const multi = despeckle(d3.contours().size([W, H]).thresholds([0])(F)[0], minArea);
+      layers[k] = { d: contourToScreenPath(multi, BW, BH, iters, ox, oy), color: g.colorAt(k) };
     });
     for (const l of layers) if (l && l.d) drawn.push(l);
   }
   return drawn;
+}
+
+// Painted backdrops: one contour per region, through its distance field —
+// the buildSegmentation construction, on view rays.
+function buildSkyRegions(S, fit, backdrop, azSpan, opts = {}) {
+  if (!S.perspective || !backdrop || backdrop.overflow) return null;
+  const R = skyRayField(S, fit, opts.BW || SKY_BW);
+  if (!R) return null;                        // horizon off the top of the frame
+  const { BW, BH, NP, phi, psi, dir, sky } = R;
+  const iters = Math.min(S.smooth || 0, SKY_SMOOTH);
+  return tapRegions(backdrop, (g) => flatTaps(S, g, azSpan, NP, sky, phi, psi, dir),
+    BW, BH, BW, BH, iters);
 }
 
 // Preset and 1D backdrops: colour depends on elevation alone, so — exactly as
@@ -2871,6 +2887,332 @@ function buildSkyBands(S, fit, thresholds, cols, opts = {}) {
   return d3.contours().size([BW, BH]).thresholds([SKY_FLOOR, ...thresholds])(phi)
     .map((c, k) => ({ d: contourToScreenPath(c, BW, BH, iters), color: cols[k] }))
     .filter((l) => l.d && l.color);
+}
+
+// ---- the ice view --------------------------------------------------
+// The backdrop straight on — the reflection window laid flat across the frame,
+// +/- azSpan wide and eLo..eHi tall, exactly as painted — with blocks of ice
+// hung in front of it (the optics are in ice.js). Nothing here is the water:
+// in the ice view the water builders do not run at all.
+//
+// The picture is built the way the sky view builds its own: every raster point
+// is a ray, the ray's landing on the backdrop picks a point in each region's
+// distance field, and each region is one contour of that composed field. The
+// only new thing is that inside a block the ray has been bent first. So a
+// painted edge seen through ice stays one smooth outline — displaced, stretched
+// and folded by the block, but never shredded into the raster.
+//
+// Each block is drawn as its own layer, furthest first, clipped to its own
+// outline. The outline is the zero set of the ray's closest approach to the
+// block (signed, continuous, sub-pixel — see ice.js), and the bent picture is
+// carried a few pixels PAST it (traceIce's grazing continuation), so the clip
+// cuts through a picture that is already there instead of tracing a second
+// edge of its own that could leave a seam against the first. A nearer block
+// covers a farther one by being painted over it; a ray that leaves one block
+// and meets another behind it is bent by both.
+//
+// Dispersion is the one thing drawn differently: the three colour channels are
+// traced at their own index and composited with `screen` over black, which is
+// exactly additive for colours split into (r,0,0), (0,g,0), (0,0,b) — so where
+// the three landings agree the colour is the backdrop's own, and where they
+// part the fringe is the true per-channel mix, not a painted-on rainbow.
+
+// how far past a block's outline its bent picture is carried, in raster pixels
+const ICE_MARGIN_PX = 4;
+// landing-field blur passes the ice view always runs (see buildIceView)
+const ICE_BASE_BLUR = 1;
+// the level sets the tint, the cloudy core and the shine are banded at
+const ICE_TINT_LEVELS = [0.1, 0.25, 0.42, 0.6, 0.8];
+const ICE_CORE_LEVELS = [0.12, 0.3, 0.5, 0.72];
+const ICE_SHINE_LEVELS = [0.18, 0.4, 0.65, 0.9];
+
+// The backdrop over one raster window, given where each point's ray lands on
+// the wall (fractions of the frame's half-width, v up), read as the two angles
+// the backdrop is indexed by: the frame spans the window exactly. `look` is either a compiled backdrop (painted, layered, or anything
+// with objects stamped in) or a preset/1D band list — the same two forms the
+// sky view draws.
+function iceBackdrop(S, look, W, H, BW, BH, ox, oy, U, V, on, iters, minArea = 0) {
+  const NP = W * H;
+  const phi = new Float64Array(NP), psi = new Float64Array(NP);
+  const dir = new Float64Array(NP * 3);
+  for (let p = 0; p < NP; p++) {
+    if (!on[p]) { phi[p] = BELOW_HORIZON; continue; }
+    const a = S.eLo + ((V[p] * VB_W / VB_H + 1) / 2) * (S.eHi - S.eLo), b = U[p] * look.azSpan;
+    phi[p] = a; psi[p] = b;
+    const ca = Math.cos(a * Math.PI / 180);
+    dir[p * 3] = ca * Math.sin(b * Math.PI / 180);
+    dir[p * 3 + 1] = ca * Math.cos(b * Math.PI / 180);
+    dir[p * 3 + 2] = Math.sin(a * Math.PI / 180);
+  }
+  if (look.backdrop) {
+    if (look.backdrop.overflow) return [];
+    return tapRegions(look.backdrop,
+      (g) => flatTaps(S, g, look.azSpan, NP, on, phi, psi, dir), W, H, BW, BH, iters, ox, oy,
+      minArea);
+  }
+  return d3.contours().size([W, H]).thresholds([SKY_FLOOR, ...look.thresholds])(phi)
+    .map((c, k) => ({ d: contourToScreenPath(despeckle(c, minArea), BW, BH, iters, ox, oy),
+      color: look.cols[k] }))
+    .filter((l) => l.d && l.color);
+}
+
+// Speckle cleanup: drop every island, and fill every hole, smaller than
+// `minArea` raster pixels from a contour before it is drawn. Inside a block,
+// where rays that have bounced off several rumpled faces land all over the
+// backdrop, a region breaks up into flecks a pixel or two across — faithful,
+// but it reads as noise rather than as ice. Dropping a ring can only merge a
+// fleck into whatever surrounds it (every region's field contains the ones
+// above it), so no gap can open. Counted in raster pixels, like antialiasing.
+function despeckle(multi, minArea) {
+  if (!minArea) return multi;
+  const area = (ring) => {
+    let a = 0;
+    for (let i = 0, n = ring.length, j = n - 1; i < n; j = i++)
+      a += (ring[j][0] - ring[i][0]) * (ring[j][1] + ring[i][1]);
+    return Math.abs(a / 2);
+  };
+  const coordinates = [];
+  for (const poly of multi.coordinates) {
+    if (area(poly[0]) < minArea) continue;
+    coordinates.push([poly[0], ...poly.slice(1).filter((h) => area(h) >= minArea)]);
+  }
+  return { ...multi, coordinates };
+}
+
+// Box-blur a field over the points of a mask only, so a landing is averaged
+// with its own branch's neighbours and never with a point that branch does not
+// reach. This is antialiasing in the ice view: where a landing jumps between
+// neighbouring pixels (a tear the critical-angle split does not separate —
+// the second and later internal reflections), the jump becomes a steep ramp
+// and the region edges that cross it follow a curve rather than the raster.
+function maskedBlur(f, m, W, H, passes) {
+  if (!passes) return;
+  const t = new Float64Array(f.length);
+  for (let it = 0; it < passes; it++) {
+    for (let pass = 0; pass < 2; pass++) {
+      const src = pass ? t : f, dst = pass ? f : t, step = pass ? W : 1;
+      for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
+        const p = j * W + i;
+        if (!m[p]) { dst[p] = src[p]; continue; }
+        let s = src[p], n = 1;
+        const lo = pass ? j > 0 : i > 0, hi = pass ? j < H - 1 : i < W - 1;
+        if (lo && m[p - step]) { s += src[p - step]; n++; }
+        if (hi && m[p + step]) { s += src[p + step]; n++; }
+        dst[p] = s / n;
+      }
+    }
+  }
+}
+
+// a mask grown by r pixels (a square neighbourhood, r box passes)
+function dilateMask(m, W, H, r) {
+  let a = Uint8Array.from(m), b = new Uint8Array(m.length);
+  for (let it = 0; it < r; it++) {
+    for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
+      const p = j * W + i;
+      b[p] = a[p] || (i > 0 && a[p - 1]) || (i < W - 1 && a[p + 1])
+        || (j > 0 && a[p - W]) || (j < H - 1 && a[p + W]) ? 1 : 0;
+    }
+    const t = a; a = b; b = t;
+  }
+  return a;
+}
+
+// Upper sets of a 0..1 field as translucent fills. Each set is drawn at the
+// opacity that makes the STACK of it and every set below it come to its own
+// level — so a point where the field is 0.6 is covered at 0.6, however many
+// bands it sits inside.
+function iceBands(field, W, H, BW, BH, ox, oy, levels, minArea = 0) {
+  let prev = 0;
+  const out = [];
+  for (const [k, c] of d3.contours().size([W, H]).thresholds(levels)(field).entries()) {
+    const a = 1 - (1 - levels[k]) / (1 - prev);
+    prev = levels[k];
+    const d = contourToScreenPath(despeckle(c, minArea), BW, BH, 1, ox, oy);
+    if (d && a > 0.004) out.push({ d, a: +a.toFixed(3) });
+  }
+  return out;
+}
+
+function buildIceView(S, look, ice, opts = {}) {
+  const BW = opts.BW || RASTER_LEVELS[RASTER_DEFAULT].BW;
+  const BH = Math.max(2, Math.round((BW * VB_H) / VB_W));
+  const iters = Math.min(S.smooth || 0, SKY_SMOOTH);
+  const uAt = (i) => ((i + 0.5) / BW) * 2 - 1;
+  const vAt = (j) => (1 - ((j + 0.5) / BH) * 2) * (VB_H / VB_W);
+
+  // the backdrop with nothing in front of it: the wall fills the frame, so a
+  // point's landing is the point itself
+  const NP = BW * BH;
+  const U0 = new Float64Array(NP), V0 = new Float64Array(NP), on0 = new Uint8Array(NP).fill(1);
+  for (let j = 0; j < BH; j++) for (let i = 0; i < BW; i++) {
+    U0[j * BW + i] = uAt(i); V0[j * BW + i] = vAt(j);
+  }
+  const base = iceBackdrop(S, look, BW, BH, BW, BH, 0, 0, U0, V0, on0, iters);
+
+  const blocks = (ice.cubes || []).filter((c) => c.on).map(prepIceCube);
+  // furthest first; a stable sort keeps the list's own order among equals
+  const order = blocks.map((k, i) => i).sort((a, b) => blocks[b].C[2] - blocks[a].C[2] || a - b);
+  const zWall = ICE_Z + Math.max(0, ice.dist || 0);
+  const ior = ice.ior || ICE_IOR, sp = (ice.dispersion || 0) * ICE_DISPERSION_SPAN;
+  // red bends least, blue most; the middle channel is the scene's own index
+  const iors = sp > 0 ? [ior - sp / 2, ior, ior + sp / 2] : [ior];
+  const mid = iors.length >> 1;
+  const minArea = Math.max(0, ice.despeckle || 0);
+  // One pass always: the later internal-reflection tears are in every block,
+  // and a single pass (sigma 0.8px) is the least that takes the raster off
+  // them. The scene's antialiasing adds to it, as it does everywhere else.
+  const blur = ICE_BASE_BLUR + Math.max(0, opts.polish | 0);
+  const drawn = [];
+  for (const ki of order) {
+    const k = blocks[ki];
+    const fp = iceFootprint(k);
+    if (!fp) continue;
+    const i0 = Math.max(0, Math.floor(((fp.u0 + 1) / 2) * BW));
+    const i1 = Math.min(BW - 1, Math.ceil(((fp.u1 + 1) / 2) * BW));
+    const j0 = Math.max(0, Math.floor(((1 - (fp.v1 * VB_W) / VB_H) / 2) * BH));
+    const j1 = Math.min(BH - 1, Math.ceil(((1 - (fp.v0 * VB_W) / VB_H) / 2) * BH));
+    const W = i1 - i0 + 1, H = j1 - j0 + 1;
+    if (W < 2 || H < 2) continue;
+    const N = W * H;
+    // a raster pixel, in world units at the block's depth
+    const margin = ICE_MARGIN_PX * (2 * ICE_T * k.C[2]) / BW;
+    const sil = new Float64Array(N), on = new Uint8Array(N);
+    const firsts = new Array(N);
+    const tint = new Float64Array(N), core = new Float64Array(N), shine = new Float64Array(N);
+    const looks = (r, p) => {
+      tint[p] = (ice.tintAmt || 0) * (1 - Math.exp((-1.4 * r.len) / k.size));
+      const cr = (0.85 - r.core) / 0.6;
+      core[p] = r.cloud * (cr <= 0 ? 0 : cr >= 1 ? 1 : cr * cr * (3 - 2 * cr));
+      shine[p] = Math.min(1, (ice.shine || 0) * (r.F + r.glint));
+    };
+    for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
+      const p = j * W + i;
+      const m = iceMeet(k, [0, 0, 0], cameraRay(uAt(i + i0), vAt(j + j0)));
+      if (!m) { sil[p] = k.R; continue; }
+      sil[p] = m.sil;
+      if (m.sil >= margin) continue;
+      on[p] = 1; firsts[p] = m;
+    }
+    // Per channel, the ray that leaves at its first meeting with the far side
+    // and — only around where that is not what happens — the ray that is
+    // mirrored back in instead (see crossBlock). The mirrored picture goes
+    // underneath; the leaving one over it, cut along the critical angle.
+    const chans = iors.map((n, c) => {
+      const UA = new Float64Array(N), VA = new Float64Array(N), disc = new Float64Array(N);
+      const tir = new Uint8Array(N);
+      let anyOut = false, anyIn = false;
+      for (let p = 0; p < N; p++) {
+        if (!on[p]) { disc[p] = 1; continue; }
+        const r = traceIce(blocks, ki, firsts[p], n, zWall, { split: 1 });
+        UA[p] = r.u; VA[p] = r.v; disc[p] = r.disc;
+        if (r.disc < 0) { tir[p] = 1; anyIn = true; } else anyOut = true;
+        if (c === mid) looks(r, p);
+      }
+      maskedBlur(UA, on, W, H, blur); maskedBlur(VA, on, W, H, blur);
+      const over = anyOut
+        ? iceBackdrop(S, look, W, H, BW, BH, i0, j0, UA, VA, on, iters, minArea) : null;
+      if (!anyIn) return { layers: over };
+      // the mirrored side, carried a few pixels out past its own edge
+      const near = dilateMask(tir, W, H, ICE_MARGIN_PX);
+      const UB = new Float64Array(N), VB = new Float64Array(N);
+      for (let p = 0; p < N; p++) {
+        if (!near[p] || !on[p]) { near[p] = 0; continue; }
+        const r = traceIce(blocks, ki, firsts[p], n, zWall, { split: 2 });
+        UB[p] = r.u; VB[p] = r.v;
+        if (c === mid && tir[p]) looks(r, p);
+      }
+      maskedBlur(UB, near, W, H, blur); maskedBlur(VB, near, W, H, blur);
+      const under = iceBackdrop(S, look, W, H, BW, BH, i0, j0, UB, VB, near, iters, minArea);
+      if (!anyOut) return { layers: under };
+      for (let p = 0; p < N; p++) disc[p] = on[p] ? disc[p] : 1;
+      const cut = contourToScreenPath(
+        d3.contours().size([W, H]).thresholds([0])(disc)[0], BW, BH, 0, i0, j0);
+      return { layers: under, over, overClip: cut };
+    });
+    // the washes switch between the two sides of a tear with the picture, and
+    // are banded, so a pass more than the landings keeps their edges off the grid
+    for (const f of [tint, core, shine]) maskedBlur(f, on, W, H, blur + 1);
+    // inside is where the closest approach is negative
+    for (let p = 0; p < N; p++) sil[p] = -sil[p];
+    const clip = contourToScreenPath(
+      d3.contours().size([W, H]).thresholds([0])(sil)[0], BW, BH, 0, i0, j0);
+    if (!clip) continue;
+    drawn.push({
+      clip, chans,
+      tint: iceBands(tint, W, H, BW, BH, i0, j0, ICE_TINT_LEVELS, minArea),
+      core: iceBands(core, W, H, BW, BH, i0, j0, ICE_CORE_LEVELS, minArea),
+      shine: iceBands(shine, W, H, BW, BH, i0, j0, ICE_SHINE_LEVELS, minArea),
+    });
+  }
+  const count = base.length + drawn.reduce((n, b) => n + 1 + b.tint.length + b.core.length
+    + b.shine.length + b.chans.reduce((m, ch) => m + (ch.layers ? ch.layers.length : 0)
+      + (ch.over ? ch.over.length : 0), 0), 0);
+  return { bg: look.bg, base, blocks: drawn, tintColor: ice.tintColor || "#ffffff", count, BW };
+}
+
+// What buildIceView samples, from what can cross to the render worker: a
+// backdrop document (compiled here, or handed in already compiled on the
+// thread that has it) or the preset/1D band list, which is data already.
+function iceLookFor(opts, compiled = null) {
+  if (!opts || !opts.doc) return opts;
+  const backdrop = compiled || compileBackdrop(opts.doc);
+  return { backdrop, azSpan: opts.azSpan, bg: backdrop.bg };
+}
+
+// one colour channel of a colour, for the dispersion composite
+function iceChannel(col, c) {
+  const q = d3.rgb(col);
+  return c === 0 ? `rgb(${Math.round(q.r)},0,0)` : c === 1 ? `rgb(0,${Math.round(q.g)},0)`
+    : `rgb(0,0,${Math.round(q.b)})`;
+}
+
+// The ice view as SVG markup — one writer for the preview and the file, so the
+// two cannot drift apart. `stroke` is the region-edge attribute string.
+function iceSvgMarkup(view, stroke = "") {
+  const full = `<rect width="${VB_W}" height="${VB_H}" fill=`;
+  const path = (l, fill, st = stroke) => `<path d="${l.d}" fill="${fill}" fill-rule="evenodd"${st}/>`;
+  let defs = "", body = full + `"${view.bg}"/>`;
+  view.base.forEach((l) => { body += path(l, l.color); });
+  view.blocks.forEach((b, i) => {
+    defs += `<clipPath id="ice${i}"><path d="${b.clip}"/></clipPath>`;
+    // opacity isolates the group, so the clip is antialiased once against the
+    // composite rather than per layer (see the water's own clip)
+    body += `<g clip-path="url(#ice${i})" opacity="0.999">`;
+    // one channel's picture: the mirrored side, then the leaving side over it
+    // cut along the critical angle (just the one, where there is no tear)
+    const chan = (ch, c, fillOf, st) => {
+      let out = "";
+      (ch.layers || []).forEach((l) => { out += path(l, fillOf(l.color), st); });
+      if (ch.over) {
+        defs += `<clipPath id="ice${i}t${c}"><path d="${ch.overClip}"/></clipPath>`;
+        out += `<g clip-path="url(#ice${i}t${c})" opacity="0.999">`
+          + full + `"${fillOf(view.bg)}"/>`;
+        ch.over.forEach((l) => { out += path(l, fillOf(l.color), st); });
+        out += `</g>`;
+      }
+      return out;
+    };
+    if (b.chans.length === 1) {
+      body += full + `"${view.bg}"/>` + chan(b.chans[0], 0, (x) => x, stroke);
+    } else {
+      body += `<g style="isolation:isolate">` + full + `"#000"/>`;
+      b.chans.forEach((ch, c) => {
+        const fillOf = (x) => iceChannel(x, c);
+        body += `<g style="mix-blend-mode:screen">` + full + `"${fillOf(view.bg)}"/>`
+          + chan(ch, c, fillOf, "") + `</g>`;
+      });
+      body += `</g>`;
+    }
+    const wash = (bands, color) => bands.forEach((l) => {
+      body += `<path d="${l.d}" fill="${color}" fill-opacity="${l.a}" fill-rule="evenodd"/>`;
+    });
+    wash(b.tint, view.tintColor);
+    wash(b.core, "#ffffff");
+    wash(b.shine, "#ffffff");
+    body += `</g>`;
+  });
+  return (defs ? `<defs>${defs}</defs>` : "") + body;
 }
 
 // ---- geometry build, custom 2D path ------------------------------
@@ -3106,6 +3448,7 @@ export {
   SPEED_MIN, SPEED_MAX, EMITTER_RATE_DEFAULT,
   DISPERSION_DEFAULT, omegaAt, dispersionFor, loopOmega, loopFit,
   buildMark, markSampler, markScale, MARK_FONTS,
+  buildIceView, iceSvgMarkup, iceLookFor, bandThresholds,
 };
 
 // ---- layered-paper stack export -----------------------------------
@@ -3575,6 +3918,13 @@ const WORKSPACES = [
     "watermark text on the water", "watermark type, weight & italic",
     "letter spacing", "watermark size, position & turn", "watermark ink & outline",
     "reflected objects across the water", "boat & board wakes (kelvin v)"] },
+  { id: "ice", name: "Ice", icon: "❄", find: [
+    "ice view (backdrop through ice)", "ice cubes / blocks (add, remove)",
+    "ice position, size & distance", "ice orientation (turn, tip, lean)",
+    "ice surface (worn edges, melt dimples, dimple size)", "cloudy core (frosted center)",
+    "refractive index (ior, bend)", "dispersion (rainbow fringes, prism)",
+    "backdrop distance behind the ice", "ice tint & thickness", "shine (fresnel sheen, glints)",
+    "speckle cleanup"] },
   { id: "style", name: "Style", icon: "✎", find: [
     "pen-plot mode", "pen style (parallel, concentric, hatched)", "line width",
     "ring spacing", "hatch slant & tone", "3d relief (pen)", "hide obscured lines",
@@ -4453,6 +4803,58 @@ function ObjectCard({ obj, idx, azSpan, eLo, eHi, onChange, onRemove }) {
   );
 }
 
+// One block of ice: where it hangs, how big, how it is turned, and what its
+// surface is like. Positions are in the ice view's own units — the frame is
+// 10 across at the ice — so a block's size reads against the frame directly.
+function IceCard({ cube, idx, onChange, onRemove }) {
+  const c = cube;
+  return (
+    <div style={{ border: "1px solid #26313c", borderRadius: 9, padding: 11,
+      marginBottom: 10, background: "#121922" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 9 }}>
+        <span style={{ fontSize: 10.5, letterSpacing: 1, color: "#6f8294", flex: 1,
+          fontFamily: "ui-monospace, monospace" }}>ICE {idx + 1}</span>
+        <button onClick={() => onChange({ on: !c.on })}
+          style={{ fontSize: 10.5, padding: "4px 9px", borderRadius: 6, cursor: "pointer",
+            fontFamily: "ui-monospace, monospace",
+            background: c.on ? "#27424b" : "#1a232c", color: c.on ? "#dff1f6" : "#7f93a4",
+            border: "1px solid " + (c.on ? "#3f7e8f" : "#26313c") }}>
+          {c.on ? "on" : "off"}
+        </button>
+        <button onClick={onRemove} aria-label={`remove ice ${idx + 1}`}
+          style={{ fontSize: 12, width: 26, height: 26, borderRadius: 6, cursor: "pointer",
+            background: "#1a232c", color: "#9a6a6a", border: "1px solid #3a2a2a" }}>✕</button>
+      </div>
+      <Slider label="position ← →" value={c.x} min={-5} max={5} step={0.05}
+        onChange={(v) => onChange({ x: v })} fmt={(v) => (v === 0 ? "center" : v.toFixed(2))} />
+      <Slider label="position ↓ ↑" value={c.y} min={-3.3} max={3.3} step={0.05}
+        onChange={(v) => onChange({ y: v })} fmt={(v) => (v === 0 ? "center" : v.toFixed(2))} />
+      <Slider label="distance (near ← → far)" value={c.z} min={-10} max={20} step={0.5}
+        onChange={(v) => onChange({ z: v })}
+        fmt={(v) => (v === 0 ? "at the ice plane" : (v > 0 ? "+" : "") + v.toFixed(1))} />
+      <Slider label="size" value={c.size} min={0.4} max={6} step={0.05}
+        onChange={(v) => onChange({ size: v })} fmt={(v) => v.toFixed(2) + " units"} />
+      <Slider label="turn" value={c.yaw} min={-180} max={180} step={1}
+        onChange={(v) => onChange({ yaw: v })} fmt={(v) => v + "\u00b0"} />
+      <Slider label="tip (toward you)" value={c.pitch} min={-90} max={90} step={1}
+        onChange={(v) => onChange({ pitch: v })} fmt={(v) => v + "\u00b0"} />
+      <Slider label="lean" value={c.roll} min={-180} max={180} step={1}
+        onChange={(v) => onChange({ roll: v })} fmt={(v) => v + "\u00b0"} />
+      <Slider label="worn edges (rounding)" value={c.round} min={0} max={1} step={0.02}
+        onChange={(v) => onChange({ round: v })}
+        fmt={(v) => (v === 0 ? "sharp" : v < 0.3 ? "worn" : v < 0.7 ? "melting" : "pebble")} />
+      <Slider label="melt dimples" value={c.bump} min={0} max={1.5} step={0.05}
+        onChange={(v) => onChange({ bump: v })} fmt={(v) => (v === 0 ? "polished" : v.toFixed(2))} />
+      {c.bump > 0 && (
+        <Slider label="dimple size" value={c.bumpSize} min={0.1} max={1.5} step={0.05}
+          onChange={(v) => onChange({ bumpSize: v })} fmt={(v) => v.toFixed(2) + "× block"} />
+      )}
+      <Slider label="cloudy core" value={c.cloud} min={0} max={1} step={0.05}
+        onChange={(v) => onChange({ cloud: v })} fmt={(v) => (v === 0 ? "clear" : v.toFixed(2))} />
+    </div>
+  );
+}
+
 function useWidth() {
   const [w, setW] = useState(typeof window !== "undefined" ? window.innerWidth : 1024);
   useEffect(() => {
@@ -4682,6 +5084,32 @@ export default function App() {
   const [activeColor, setActiveColor] = useState("#11324a");
   // draw the backdrop itself above the horizon, not only its reflection
   const [showBackdrop, setShowBackdrop] = useState(false);
+  // The ice view: the backdrop straight on, with blocks of ice hung in front
+  // of it that bend it (see ice.js and buildIceView). It replaces the water in
+  // the frame while it is on, so it is off for every scene until asked for.
+  const [iceOn, setIceOn] = useState(false);
+  const [iceCubes, setIceCubes] = useState(() => [newIceCube(1)]);
+  const updateIceCube = (id, patch) =>
+    setIceCubes((cs) => cs.map((c) => (c.id === id ? { ...c, ...patch } : c)));
+  // each new block lands clear of the first, a little smaller and further back,
+  // turned its own way, so a second block reads as a second block at once
+  const ICE_SLOTS = [[3.4, -0.9, 3], [-3.4, 0.9, 4], [1.7, 2, 6], [-1.7, -2, 2], [0, 0, -3]];
+  const addIceCube = () =>
+    setIceCubes((cs) => {
+      if (cs.length >= ICE_MAX) return cs;
+      const id = cs.reduce((m, c) => Math.max(m, c.id), 0) + 1;
+      const [x, y, z] = ICE_SLOTS[(cs.length - 1 + ICE_SLOTS.length) % ICE_SLOTS.length];
+      return [...cs, { ...newIceCube(id, x, y), z, size: 2.6,
+        yaw: -32 + 23 * id, pitch: 25 - 17 * id, roll: -12 + 9 * id }];
+    });
+  const removeIceCube = (id) => setIceCubes((cs) => cs.filter((c) => c.id !== id));
+  const [iceIor, setIceIor] = useState(ICE_IOR);         // refractive index
+  const [iceDisp, setIceDisp] = useState(0);             // dispersion, 0..1 of a prism's
+  const [iceDist, setIceDist] = useState(8);             // ice to backdrop, units
+  const [iceTint, setIceTint] = useState("#d6f0f7");
+  const [iceTintAmt, setIceTintAmt] = useState(0.35);    // tint at a block's thickness
+  const [iceShine, setIceShine] = useState(0.7);         // Fresnel sheen and glints
+  const [iceSpeckle, setIceSpeckle] = useState(12);      // speckle cleanup, raster px²
   // Custom paint chits — extra swatches pinned by hand or lifted from a photo
   // palette. Session-lived (not serialized), deduped against the built-in
   // SWATCHES and each other so a chit stays easy to re-select all session.
@@ -4800,6 +5228,10 @@ export default function App() {
     brushShape: [brushShape, setBrushShape], bdoc: [docCode, restoreDoc],
     env2d: [null, restoreEnv2d],                 // read-only: pre-layers links
     showBackdrop: [showBackdrop, setShowBackdrop],
+    iceOn: [iceOn, setIceOn], iceCubes: [iceCubes, setIceCubes], iceIor: [iceIor, setIceIor],
+    iceDisp: [iceDisp, setIceDisp], iceDist: [iceDist, setIceDist],
+    iceTint: [iceTint, setIceTint], iceTintAmt: [iceTintAmt, setIceTintAmt],
+    iceShine: [iceShine, setIceShine], iceSpeckle: [iceSpeckle, setIceSpeckle],
   }, {
     // A saved link that carries no `dispersion` was written before the rule
     // existed, and its author picked a frozen moment under the old timing.
@@ -5207,20 +5639,46 @@ export default function App() {
   // mode we instead z-buffer the surface into a raster and re-contour it (see
   // surf3d) — smooth regions like the flat modes, but occlusion-correct. Pen
   // mode has its own hidden-line path, so this only covers filled regions.
-  const solid3d = !penMode && surface3d && perspective;
+  // The ice view replaces the water outright, so while it is on none of the
+  // water's builders run: not the 3D pass, not the flat ones, not the pens.
+  const iceView = iceOn;
+  const solid3d = !iceView && !penMode && surface3d && perspective;
 
   // The backdrop as the camera sees it, above the horizon. Keyed on camS, so it
   // survives every animation frame and rebuilds only when the camera, the
   // window or the painting moves. Painted backdrops go through their regions;
   // preset and 1D ones band a single scalar, exactly as the water does.
   const skyLayers = useMemo(() => {
-    if (!showBackdrop || penMode) return null;
+    if (!showBackdrop || penMode || iceView) return null;
     const fit = computeFit(camS);
     if (use2d) return buildSkyRegions(camS, fit, backdrop, azSpan);
     const cols = mode === "paint1d" ? colors1d : presetColors;
     if (!cols || !cols.length) return null;
     return buildSkyBands(camS, fit, bandThresholds(camS, cols.length), cols);
-  }, [showBackdrop, penMode, use2d, backdrop, camS, azSpan, mode, colors1d, presetColors]);
+  }, [showBackdrop, penMode, iceView, use2d, backdrop, camS, azSpan, mode, colors1d,
+       presetColors]);
+
+  // The ice view. The backdrop is shown as painted — the whole window, at the
+  // reflection detail's 1x — so it needs only the window and the painting, not
+  // the camera: the view is its own, with a fixed frame. In the preset and 1D
+  // modes the backdrop is bands of elevation, exactly as the sky view has it.
+  const iceS = useMemo(() => ({
+    eLo, eHi, reflMag: 1, smooth, bandFractions, H: camS.H,
+  }), [eLo, eHi, smooth, bandFractions, camS.H]);
+  // the backdrop as data (for the worker), and compiled (for this thread,
+  // which already has it compiled)
+  const iceLookOpts = useMemo(() => {
+    if (!iceView) return null;
+    if (use2d) return { doc: backdropSource, azSpan };
+    const cols = mode === "paint1d" ? colors1d : presetColors;
+    return { cols, thresholds: bandThresholds(iceS, cols.length), bg: cols[0], azSpan };
+  }, [iceView, use2d, backdropSource, azSpan, mode, colors1d, presetColors, iceS]);
+  const iceLook = useMemo(() => (iceLookOpts ? iceLookFor(iceLookOpts, backdrop) : null),
+    [iceLookOpts, backdrop]);
+  const iceSpec = useMemo(() => ({
+    cubes: iceCubes, ior: iceIor, dispersion: iceDisp, dist: iceDist,
+    tintColor: iceTint, tintAmt: iceTintAmt, shine: iceShine, despeckle: iceSpeckle,
+  }), [iceCubes, iceIor, iceDisp, iceDist, iceTint, iceTintAmt, iceShine, iceSpeckle]);
 
   // The flat builders draw the picture only in the flat modes. In 3D solid the
   // occluded raster pass (surf3d) replaces every one of their outputs, and pen
@@ -5228,7 +5686,7 @@ export default function App() {
   // frame, for the two numbers auto-fit reads. On a detailed scene that was
   // most of the frame (the flat trace lifts every smoothed vertex through the
   // wave height), spent on geometry nothing displayed.
-  const flatNeeded = !solid3d && !penMode;
+  const flatNeeded = !solid3d && !penMode && !iceView;
   const geom = useMemo(() => (flatNeeded && !use2d ? buildGeometry(S) : null),
     [flatNeeded, use2d, S]);
   const seg = useMemo(
@@ -5272,7 +5730,7 @@ export default function App() {
   // Takes the scene rather than closing over it, so the video export can build
   // the same lines at a wave phase this render is not showing.
   const makePenLines = useCallback((S) => {
-    if (!penMode) return null;
+    if (!penMode || iceView) return null;
     const fit = computeFit(S);
     const mag = S.reflMag || 1;
     prepField(S);
@@ -5335,6 +5793,7 @@ export default function App() {
     });
   }, [penMode, penStyle, penCount, penSpacing, penRelief, penHidden, penEven, use2d, mode,
       penHatchGap, penHatchAngle, penHatchSpread, penHatchAim, penHatchTone, bgFill, rasterLevel,
+      iceView,
       envEffective, azSpan, colors1d, presetColors, fresOn, fresBands, mixDeep]);
   const penLines = useMemo(() => makePenLines(S), [makePenLines, S]);
 
@@ -5431,15 +5890,58 @@ export default function App() {
   // such raster, so it gets one of its own — flat water is a plane, so that is
   // a handful of mesh cells and it costs next to nothing.
   const makeMark = useCallback(
-    (St) => (solid3d ? null : buildMark(St, solidRaster)), [solid3d, solidRaster]);
+    (St) => (solid3d || iceView ? null : buildMark(St, solidRaster)),
+    [solid3d, iceView, solidRaster]);
   const flatMark = useMemo(() => makeMark(S), [makeMark, S]);
   const drawMark = solid3d ? (surf3d ? surf3d.mark : null) : flatMark;
   const fresIdx = useMemo(
     () => (fresOn && drawFres ? d3.range(fresBands) : [0]),
     [fresOn, drawFres, fresBands]);
+  // The ice view on the preview's own raster, with the scene's antialiasing —
+  // the same two things every other picture is built on. It does not move with
+  // the waves, so an animation frame never rebuilds it. Built in the render
+  // worker where there is one, exactly as the 3D pass is: the last picture
+  // stays up, marked "rendering", and only the newest request waits.
+  const iceRaster = useMemo(() => ({ BW: rasterLevel.BW, polish: polish.preview }),
+    [rasterLevel, polish]);
+  const iceSync = useMemo(
+    () => (iceView && builder === null ? buildIceView(iceS, iceLook, iceSpec, iceRaster) : null),
+    [iceView, builder, iceS, iceLook, iceSpec, iceRaster]);
+  const iceJobRef = useRef({ inflight: false, pending: null });
+  const [iceAsync, setIceAsync] = useState(null);
+  const [iceBusy, setIceBusy] = useState(false);
+  useEffect(() => {
+    if (!builder || !iceView) return;
+    const job = iceJobRef.current, life = jobRef.current;
+    const run = (req) => {
+      job.inflight = true;
+      setIceBusy(true);
+      builder.buildIce(req.S, req.look, req.ice, req.raster).then(
+        (out) => { if (life.alive) setIceAsync(out); },
+        (e) => {
+          console.warn("ice view failed in the render worker:", e);
+          if (life.alive && e && e.fatal) setBuilder(null);
+        },
+      ).then(() => {
+        if (!life.alive) return;
+        job.inflight = false;
+        if (job.pending) { const next = job.pending; job.pending = null; run(next); }
+        else setIceBusy(false);
+      });
+    };
+    const req = { S: iceS, look: iceLookOpts, ice: iceSpec, raster: iceRaster };
+    if (job.inflight) job.pending = req; else run(req);
+  }, [builder, iceView, iceS, iceLookOpts, iceSpec, iceRaster]);
+  const iceFrame = iceView ? (builder ? iceAsync : iceSync) : null;
+  const iceRendering = iceView && (iceBusy || !iceFrame);
+  const iceMarkup = useMemo(
+    () => (iceFrame ? iceSvgMarkup(iceFrame,
+      edges ? ` stroke="#000" stroke-opacity="0.25" stroke-width="0.6"` : "") : ""),
+    [iceFrame, edges]);
+
   // what the SVG export will hold: pen mode writes its pens, 3D solid the
   // occluded layers, the flat modes their own
-  const regionCount = penMode ? penLines.length
+  const regionCount = iceView ? (iceFrame ? iceFrame.count : 0) : penMode ? penLines.length
     : (solid3d ? drawLayers.length + 1 : use2d ? seg.count : layers.length + 1) * fresIdx.length;
 
   // auto-fit the elevation range to the actual reflected φ, so steep/near water
@@ -5476,6 +5978,8 @@ export default function App() {
   // is identical either way — the snap scales a phase term, and at t = 0 there
   // is none — so the clip still starts on exactly the picture on screen.
   const frameAt = async (t, loopPhase = 0) => {
+    // the ice view has nothing that moves with the phase
+    if (iceView) return liveFrame;
     const St = { ...S, t, loopPhase };
     if (penMode) {
       // pen mode has no filled regions at all: lines, the watermark, and paper
@@ -5513,6 +6017,13 @@ export default function App() {
   // Fresnel banding, background) is unchanged, so the file matches what
   // is on screen; only the outlines are resolved finer.
   const buildSvg = (over, frame) => {
+    if (iceView) {
+      // an export retrace brings its own, traced on a wider raster
+      const v = over && over.ice ? over.ice : iceFrame;
+      const stroke = edges ? ` stroke="#000" stroke-opacity="0.25" stroke-width="0.6"` : "";
+      return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${VB_W} ${VB_H}">`
+        + (v ? iceSvgMarkup(v, stroke) : "") + `</svg>`;
+    }
     const F = frame || liveFrame;
     const { seg, fresPaths, penLines, bgFill, gapFill } = F;
     // the drawn backdrop does not move with the waves, so every frame of a
@@ -5626,8 +6137,14 @@ export default function App() {
   // a retrace is only worth its seconds when it would actually differ from what
   // is already on screen — a wider raster, a stood-down mesh, polish passes
   // beyond the ones the preview already ran, or any combination
-  const exportRetrace = !!exportAt
-    && (exportAt.BW > rasterLevel.BW || exportAt.gN < rasterLevel.gN || polish.retrace);
+  // The ice view retraces the same way — a wider raster, the file's polish —
+  // and has no mesh to stand down.
+  const iceExportAt = iceView
+    ? { BW: exportRaster(rasterLevel, exportMult).BW, polish: polish.svg } : null;
+  const exportRetrace = iceExportAt
+    ? iceExportAt.BW > rasterLevel.BW || polish.retrace
+    : !!exportAt
+      && (exportAt.BW > rasterLevel.BW || exportAt.gN < rasterLevel.gN || polish.retrace);
   const downloadSVG = () => {
     if (exporting || pngBusy) return;
     if (!exportRetrace) { emitSvg(null); return; }
@@ -5635,7 +6152,8 @@ export default function App() {
     setTimeout(() => {
       let over = null;
       try {
-        over = buildSolid3D(S, fieldSpec, exportAt);
+        over = iceExportAt ? { ice: buildIceView(iceS, iceLook, iceSpec, iceExportAt) }
+          : buildSolid3D(S, fieldSpec, exportAt);
       } catch (e) {
         over = null;   // out of memory: the preview geometry still exports fine
       }
@@ -5652,7 +6170,7 @@ export default function App() {
   // pause as the SVG export when a retrace is involved, then one async
   // rasterize.
   const pngAt = pngSize(PNG_SCALES[Math.max(0, Math.min(PNG_SCALES.length - 1, pngQ))]);
-  const pngRetrace = solid3d && exportMult > 1;
+  const pngRetrace = (solid3d || iceView) && exportMult > 1;
   // the scene's own antialiasing comes along (it is part of the picture); the
   // export's polish step does not
   const pngGeom = pngRetrace
@@ -5675,7 +6193,9 @@ export default function App() {
       let over = null;
       if (pngGeom) {
         try {
-          over = buildSolid3D(S, fieldSpec, pngGeom);
+          over = iceView
+            ? { ice: buildIceView(iceS, iceLook, iceSpec, { BW: pngGeom.BW, polish: polish.png }) }
+            : buildSolid3D(S, fieldSpec, pngGeom);
         } catch (e) {
           over = null;  // out of memory: the preview geometry still rasterizes
         }
@@ -5793,6 +6313,13 @@ export default function App() {
     }
   };
 
+  // The ice view takes the water out of the frame, which changes what the
+  // camera, waves, objects and style tabs are for while it is on — so each of
+  // them says so where it acts, rather than silently doing nothing.
+  const iceNote = iceView && uiTab !== "ice" ? (
+    <JumpNote label="Ice view is on — the water isn't drawn" onJump={() => jumpTo("ice")} />
+  ) : null;
+
   const panel = {
     background: "#151c24", border: "1px solid #232d38", borderRadius: 12,
     padding: 16, marginBottom: 14,
@@ -5864,6 +6391,9 @@ export default function App() {
             <div style={{ position: "relative" }}>
             <svg viewBox={`0 0 ${VB_W} ${VB_H}`} style={{ width: "100%", display: "block" }}>
               <rect width={VB_W} height={VB_H} fill={bgFill} />
+              {/* the ice view is written by the same function as its file, so
+                  the two cannot drift apart */}
+              {iceView && <g dangerouslySetInnerHTML={{ __html: iceMarkup }} />}
               <g transform={rollTf || undefined}>
               {/* the backdrop itself, drawn where the camera looks straight at
                   it. First, so the water covers it: the horizon in the picture
@@ -5873,7 +6403,7 @@ export default function App() {
                   stroke={edges ? "#000" : "none"} strokeOpacity={edges ? 0.28 : 0}
                   strokeWidth={edges ? 0.6 : 0} />
               ))}
-              {penMode ? (
+              {iceView ? null : penMode ? (
                 penLines.map((l, i) => (
                   <path key={i} d={l.d} fill="none" stroke={l.color}
                     strokeWidth={penWidth} strokeLinecap="round" strokeLinejoin="round" />
@@ -5947,7 +6477,8 @@ export default function App() {
             </svg>
             <div style={{ position: "absolute", left: 12, bottom: 10, fontSize: 10.5,
               color: "#6d808f", fontFamily: "ui-monospace, monospace", letterSpacing: 0.5 }}>
-              {penMode ? `${penStyle === "rings" ? "rings" : penStyle === "hatch" ? `hatch ${penHatchAngle}\u00b0\u00b1${penHatchSpread}\u00b0` : penCount + " lines"} · ${penLines.length} pens${S.perspective && penRelief > 0 ? " · 3D" : ""}${penHidden || penStyle === "hatch" ? " · hidden-line" : ""}`
+              {iceView ? `${iceFrame ? iceFrame.count : 0} regions · ice view · ${((n) => n + (n === 1 ? " block" : " blocks"))(iceSpec.cubes.filter((c) => c.on).length)} · ${rasterLevel.name} ${rasterLevel.BW}px${iceDisp > 0 ? " · dispersion" : ""}${iceRendering ? " · rendering…" : ""}`
+                : penMode ? `${penStyle === "rings" ? "rings" : penStyle === "hatch" ? `hatch ${penHatchAngle}\u00b0\u00b1${penHatchSpread}\u00b0` : penCount + " lines"} · ${penLines.length} pens${S.perspective && penRelief > 0 ? " · 3D" : ""}${penHidden || penStyle === "hatch" ? " · hidden-line" : ""}`
                 : solid3d ? `${drawLayers.length + 1} regions · ${S.nx}×${S.ny} sample grid · 3D ${rasterLevel.name} ${rasterLevel.BW}px${antialias.passes ? ` · aa ${antialias.name}` : ""}${rendering ? " · rendering…" : ""}`
                 : `${regionCount} regions · ${S.nx}×${S.ny} sample grid${surface3d && perspective ? " · 3D" : ""}`}
             </div>
@@ -6053,7 +6584,7 @@ export default function App() {
             </div>
 
             <div role="tablist" aria-label="Control workspaces"
-              style={{ display: "grid", gridTemplateColumns: "repeat(6, 1fr)",
+              style={{ display: "grid", gridTemplateColumns: `repeat(${WORKSPACES.length}, 1fr)`,
                 gap: 4, marginBottom: 12 }}>
               {WORKSPACES.map((w) => {
                 const on = uiTab === w.id;
@@ -6074,6 +6605,7 @@ export default function App() {
             </div>
 
             {uiTab === "camera" && <>
+            {iceNote}
             <div style={panel}>
               <div style={heading}>Camera</div>
               <Slider label="Height (view angle at near edge)" value={steep} min={0} max={1} step={0.01}
@@ -6120,6 +6652,7 @@ export default function App() {
             </>}
 
             {uiTab === "waves" && <>
+            {iceNote}
             <div style={panel}>
               <div style={heading}>Open water</div>
               <Slider label="Ripple scale (λ)" value={wavelength} min={0.6} max={7} step={0.1}
@@ -6605,6 +7138,7 @@ export default function App() {
             </>}
 
             {uiTab === "objects" && <>
+            {iceNote}
             <div style={panel}>
               <div style={heading}>Watermark on the water</div>
               <Help label="what the watermark is">
@@ -6712,6 +7246,96 @@ export default function App() {
 
             </>}
 
+            {uiTab === "ice" && <>
+            <div style={panel}>
+              <div style={heading}>Ice in front of the backdrop</div>
+              <Toggle label="Ice view" value={iceOn} onChange={setIceOn} />
+              <Help label="what the ice view is">
+                The backdrop straight on — the whole window the water reflects, laid flat
+                across the frame exactly as painted — with blocks of ice hung in front of it.
+                Every point of the picture is a ray: where one meets a block it bends in at the
+                face it strikes, crosses, and bends again on the way out (or is mirrored back
+                in, past the critical angle), and lands on the backdrop somewhere other than
+                straight behind it. The regions are then cut through that bend exactly as the
+                water cuts them through its ripples, so a painted edge seen through ice is
+                still one smooth vector outline. The water isn&#39;t drawn while this is on; the
+                backdrop itself is edited under Backdrop as usual.
+              </Help>
+              {iceOn && <>
+                {iceCubes.map((c, i) => (
+                  <IceCard key={c.id} cube={c} idx={i}
+                    onChange={(patch) => updateIceCube(c.id, patch)}
+                    onRemove={() => removeIceCube(c.id)} />
+                ))}
+                {iceCubes.length < ICE_MAX && (
+                  <button onClick={addIceCube}
+                    style={{ width: "100%", padding: "9px", borderRadius: 8, cursor: "pointer",
+                      background: "#1a232c", color: "#9fb0c0", border: "1px dashed #3a4a57",
+                      fontFamily: "ui-monospace, monospace", fontSize: 12 }}>
+                    + add ice
+                  </button>
+                )}
+              </>}
+            </div>
+
+            {iceOn && <>
+            <div style={panel}>
+              <div style={heading}>Optics</div>
+              <Slider label="refractive index" value={iceIor} min={1} max={2.5} step={0.01}
+                onChange={setIceIor}
+                fmt={(v) => v.toFixed(2) + (v === 1 ? " · no bend" : Math.abs(v - 1.31) < 0.005
+                  ? " · ice" : Math.abs(v - 1.33) < 0.005 ? " · water"
+                    : Math.abs(v - 1.5) < 0.02 ? " · glass" : Math.abs(v - 2.42) < 0.02
+                      ? " · diamond" : "")} />
+              <Slider label="dispersion (rainbow fringes)" value={iceDisp} min={0} max={1} step={0.05}
+                onChange={setIceDisp}
+                fmt={(v) => (v === 0 ? "off" : `${(v * ICE_DISPERSION_SPAN).toFixed(3)} red→blue`)} />
+              <Slider label="backdrop distance" value={iceDist} min={0} max={40} step={0.5}
+                onChange={setIceDist} fmt={(v) => v.toFixed(1) + " units"} />
+              <Help label="refraction, dispersion & diffraction">
+                The index is how sharply light bends crossing into the block: 1.31 is ice, 1.5
+                glass, 2.42 diamond; at 1 nothing bends and the ice is only its sheen. Dispersion
+                is the index differing by colour — red bending least, blue most — which is what
+                splits white edges into rainbow fringes. Real ice disperses too little to see
+                (about 0.01), so this reaches a prism&#39;s worth. Each channel is traced at its
+                own index and the three are added back together, so the fringes are the true
+                mix of where each colour landed. Diffraction proper — light spreading round
+                an edge — happens at the scale of a wavelength of light, far below anything this
+                picture can draw; the fringes you see at a real ice cube&#39;s edges are
+                dispersion. Backdrop distance is how far behind the ice the picture hangs: the
+                farther it is, the further a given bend throws the view, so a block right up
+                against it barely distorts and one far in front turns it upside down.
+                {iceDisp > 0 && " Dispersion traces the picture inside each block three times,"
+                  + " so it renders about three times slower."}
+              </Help>
+            </div>
+
+            <div style={panel}>
+              <div style={heading}>Look</div>
+              <Slider label="tint (thickness)" value={iceTintAmt} min={0} max={1} step={0.05}
+                onChange={setIceTintAmt} fmt={(v) => (v === 0 ? "clear" : v.toFixed(2))} />
+              <div style={{ marginBottom: 8 }}>
+                <ColorWell label="tint" value={iceTint} onChange={setIceTint} />
+              </div>
+              <Slider label="shine (sheen & glints)" value={iceShine} min={0} max={1.5} step={0.05}
+                onChange={setIceShine} fmt={(v) => (v === 0 ? "off" : v.toFixed(2))} />
+              <Slider label="speckle cleanup" value={iceSpeckle} min={0} max={60} step={2}
+                onChange={setIceSpeckle}
+                fmt={(v) => (v === 0 ? "off" : v + " px\u00b2")} />
+              <Help label="tint, shine & speckle">
+                Tint is the colour ice picks up with depth: it builds with the distance a ray
+                travels inside, so thin edges stay clear and a thick middle clouds over. Shine
+                is the light the surface itself throws back — the Fresnel sheen that brightens
+                toward every edge, and glints where a dimple faces the light. Where a ray has
+                bounced off several rumpled faces inside a block, the picture breaks into flecks
+                a pixel or two wide; speckle cleanup folds every fleck smaller than this many
+                raster pixels into whatever surrounds it. The edges are also antialiased with the
+                rest of the scene (Style).
+              </Help>
+            </div>
+            </>}
+            </>}
+
             {uiTab === "waves" && <>
             <div style={panel}>
               <div style={heading}>Ripple emitters</div>
@@ -6741,6 +7365,7 @@ export default function App() {
             </>}
 
             {uiTab === "style" && <>
+            {iceNote}
             <div style={panel}>
               <div style={heading}>Region edges</div>
               <Slider label="Edge smoothing" value={smooth} min={0} max={4} step={1}
@@ -6890,7 +7515,7 @@ export default function App() {
             </>}
 
             {uiTab === "output" && <>
-            {solid3d && (
+            {(solid3d || iceView) && (
               <div style={{ marginBottom: 10 }}>
                 <Slider label="export detail" value={exportQ} min={0} max={EXPORT_MULTS.length - 1}
                   step={1} onChange={setExportQ}
@@ -6907,6 +7532,7 @@ export default function App() {
                   what smooths the distant crests. It runs once per export and the page holds
                   still while it does — seconds at {RASTER_LEVELS[RASTER_LEVELS.length - 1].name}.
                 </Help>
+                {solid3d && <>
                 <Slider label="export mesh" value={exportMeshQ} min={0} max={EXPORT_MESHES.length - 1}
                   step={1} onChange={setExportMeshQ}
                   fmt={(v) => {
@@ -6924,6 +7550,7 @@ export default function App() {
                   at all. Leave it as previewed for a faithful file; reach for it when a
                   distant edge still crawls at {EXPORT_MAX_BW}px.
                 </Help>
+                </>}
                 <Slider label="edge polish" value={exportPolishQ} min={0} max={EXPORT_POLISH.length - 1}
                   step={1} onChange={setExportPolishQ}
                   fmt={(v) => {
@@ -6952,7 +7579,7 @@ export default function App() {
                 color: exporting ? "#9fc4cd" : "#f1fbff",
                 padding: "12px", borderRadius: 10, cursor: exporting ? "wait" : "pointer",
                 fontSize: 13.5, fontWeight: 600, letterSpacing: 0.3 }}>
-              {exporting ? `Tracing at ${exportAt.BW}px\u2026` : "Export SVG"}
+              {exporting ? `Tracing at ${(iceExportAt || exportAt).BW}px\u2026` : "Export SVG"}
             </button>
 
             <div style={{ marginTop: 12, marginBottom: 8 }}>
@@ -7073,13 +7700,13 @@ export default function App() {
                 </>}
               </div>
             </div>
-            <button onClick={exportVideo} disabled={vidBusy || pngBusy || exporting}
+            <button onClick={exportVideo} disabled={vidBusy || pngBusy || exporting || iceView}
               title="Render the animation frame by frame and write it as an MP4"
               style={{ width: "100%", background: vidBusy ? "#1f4650" : "#2f6b78", border: "none",
                 color: vidBusy ? "#9fc4cd" : "#f1fbff",
                 padding: "12px", borderRadius: 10, cursor: vidBusy ? "wait" : "pointer",
                 fontSize: 13.5, fontWeight: 600, letterSpacing: 0.3 }}>
-              {vidBusy
+              {iceView ? "MP4 \u00b7 nothing moves in the ice view" : vidBusy
                 ? `Rendering ${vidPlan.count} frames\u2026`
                 : `Export MP4 \u00b7 ${vidPlan.seconds.toFixed(1)} s at ${VIDEO_FPS}fps`}
             </button>
@@ -7165,7 +7792,7 @@ export default function App() {
               </div>
             )}
 
-            <button onClick={exportPaperStack} disabled={penMode || vidBusy}
+            <button onClick={exportPaperStack} disabled={penMode || iceView || vidBusy}
               title={penMode ? "Turn off pen-plot mode — the paper stack needs filled color regions"
                 : "Decompose the scene into cuttable paper sheets"}
               style={{ width: "100%", marginTop: 8, background: penMode ? "#1a232c" : "#274b3f",

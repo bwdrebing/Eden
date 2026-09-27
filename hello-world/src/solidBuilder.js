@@ -1,6 +1,7 @@
 // A handle on the render worker (solidWorker.js).
 //
-// build() posts one 3D-solid request and resolves with its result. Requests
+// build() posts one 3D-solid request and resolves with its result; buildIce()
+// does the same for the ice view. Requests
 // run in the order they are sent, so a caller that only wants the newest
 // picture (the preview) keeps one request waiting and replaces it, while a
 // caller that wants every frame (the video export) awaits each in turn.
@@ -38,6 +39,21 @@ export function createSolidBuilder() {
         const { _ems, ...settings } = S;
         try {
           worker.postMessage({ id, S: settings, spec, raster });
+        } catch (e) {
+          waiting.delete(id);
+          reject(e);
+        }
+      });
+    },
+    // The ice view, on the same worker and in the same queue. Everything it
+    // needs is data: the backdrop travels as its document (or as its bands),
+    // and the far side compiles its own, exactly as for the 3D pass.
+    buildIce(S, look, ice, raster) {
+      return new Promise((resolve, reject) => {
+        const id = next++;
+        waiting.set(id, { resolve, reject });
+        try {
+          worker.postMessage({ id, kind: "ice", S, look, ice, raster });
         } catch (e) {
           waiting.delete(id);
           reject(e);

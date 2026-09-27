@@ -7,7 +7,7 @@ it lives in one file, `hello-world/src/WaterReflectionContours.jsx`, whose
 comments carry the reasoning behind each stage — read the comment above a
 function before changing it.
 
-The control panel is organized into six task-based workspace tabs. Before
+The control panel is organized into seven task-based workspace tabs. Before
 adding, moving, or renaming **any UI control** — even "just one slider" —
 read `.claude/skills/control-surface/SKILL.md`: it says which workspace a
 control belongs in, when something earns a new workspace vs. a section, and
@@ -163,6 +163,21 @@ scaled inside a fixed-size `<div>` gives a zoomed crop to screenshot.
   (`buildGeometry`, `buildSegmentation`) do not run at all: nothing drawn
   comes from them there, and `elevationRange` supplies the two numbers
   auto-fit reads.
+- **The ice view is its own picture, not a layer on the water.** With `iceOn`,
+  the frame is the backdrop straight on (the reflection window laid flat,
+  eLo..eHi by +/- azSpan) with blocks of ice in front of it, and none of the
+  water's builders run. `ice.js` is the optics — a rounded-box SDF, which is
+  convex, so a hit is a golden-section minimum plus two bisections rather than
+  a sphere-trace, and that minimum is also the signed silhouette. `buildIceView`
+  contours the backdrop through each pixel's bent landing with the same
+  `flatTaps` / `tapRegions` the sky view uses, one block at a time, clipped to
+  its own outline. Two things keep its edges off the raster, and both act on
+  the field: the first internal-reflection tear is traced from both sides and
+  cut along the Snell discriminant (`split` in `crossBlock`), and later tears
+  get a masked blur of the landings (`ICE_BASE_BLUR` plus the scene's
+  antialiasing). Dispersion draws three channels composited with `screen`;
+  the paper stack and the MP4 are off in this view (nothing moves, and paper
+  cannot hold a blend). It runs on the render worker like the 3D pass.
 - The 1D/preset path and the 2D panorama path are separate builders
   (`buildSurface3D`, `buildSurface3DPanorama`) that must stay in step. A new
   option on one usually belongs on the other; `buildSolid3D` is where both are

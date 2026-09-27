@@ -38,6 +38,7 @@ question a user arrives with: "I want to change ___".
 | `waves`    | …the water's shape | ripple λ/strength/sharpness/spread, plane extent, emitters, speed-follows-wavelength, 3D relief (wave height, crest gap) |
 | `backdrop` | …what the water reflects | the backdrop document (palettes, paint 1D/2D, layers, shapes, photo import, undo/redo), the window the water samples it through (show-backdrop, elevation range, azimuth span, reflection detail), Fresnel depth |
 | `objects`  | …the things on the water | watermark, reflected shoreline objects, wakes |
+| `ice`      | …the ice in front of the backdrop | the ice view toggle, ice blocks (position, size, depth, orientation, surface), optics (refractive index, dispersion, backdrop distance), tint / shine / speckle |
 | `style`    | …how it's drawn | fill vs pen-plot, pen styles, edge smoothing/ripple, antialiasing, region outlines, background color |
 | `output`   | …the file I get | SVG/PNG/MP4/paper exports and their quality steps, render quality, low power |
 
@@ -63,7 +64,7 @@ index: `SEARCH_INDEX` is derived from each workspace's `find` list.
    reaches for this, what are they trying to change?" — not "which renderer
    function reads it". The old "Display" panel died of implementation-first
    grouping: it held camera, surface, quality and animation controls because
-   the renderer consumed them in one place. If your answer is one of the six
+   the renderer consumed them in one place. If your answer is one of the seven
    intents above, that's the workspace. It almost always is.
 
 2. **Put it in that workspace's tab**, wrapped in the existing
@@ -113,7 +114,9 @@ the relief" apart from changing the waves.
 A new **workspace** must clear all three bars:
 
 - **It's a distinct intent**: a user would say "I want to change ___" where
-  the blank fits none of the six existing tabs, even loosely.
+  the blank fits none of the existing tabs, even loosely. (`ice` is the
+  worked example of one that cleared all three bars: a different picture
+  entirely, visited on its own, with a block list plus two sections.)
 - **It's visited independently**: someone would open it without also
   touching a neighboring tab in the same breath. (If every visit to it is
   part of a Waves session, it's a Waves section.)
