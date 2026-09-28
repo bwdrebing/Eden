@@ -10,11 +10,19 @@
 // from plain data (fieldSpecFor), because its sampling closures cannot cross
 // to a worker.
 /* eslint-disable no-restricted-globals */
-import { buildSolid3D, fieldSpecFor } from "./WaterReflectionContours";
+//
+// The ice view (buildIceView) rides the same worker for the same reason: a
+// block is a ray trace per pixel, and a slider dragged across one should not
+// wait for it. Its backdrop arrives as data too, and is compiled here.
+import { buildSolid3D, fieldSpecFor, buildIceView, iceLookFor } from "./WaterReflectionContours";
 
 self.onmessage = ({ data }) => {
   const { id, S, spec, raster } = data;
   try {
+    if (data.kind === "ice") {
+      self.postMessage({ id, out: buildIceView(S, iceLookFor(data.look), data.ice, raster) });
+      return;
+    }
     self.postMessage({ id, out: buildSolid3D(S, fieldSpecFor(S, spec), raster) });
   } catch (e) {
     self.postMessage({ id, error: (e && e.message) || String(e) });
