@@ -24,6 +24,7 @@ import { compileBackdrop, COMPILE_SCALE } from "./backdrop/compile";
 import { PALETTES, BANDED_PALETTES, paletteStops, paletteColorAt, paletteNames }
   from "./backdrop/palettes";
 import { createSolidBuilder } from "./solidBuilder";
+import { prepRock, rayMin, waterlineAt, ROCK_COLOR, MAX_ROCKS, newRock } from "./rocks";
 import {
   VIDEO_FPS, VIDEO_MIN_SEC, VIDEO_MAX_SEC, VIDEO_DEFAULT_SEC,
   VIDEO_SCALES, VIDEO_DEFAULT_SCALE, videoSize, framePlan,
@@ -136,7 +137,7 @@ function loopFit(S, T) {
   const oms = [];
   a._ems.forEach((e, i) => {
     const B = b._ems[i];
-    if (e.type === "point") oms.push(B.wt - e.wt);
+    if (e.type === "point" || e.type === "rock") oms.push(B.wt - e.wt);
     else if (e.type === "swell") oms.push(e.ph0 - B.ph0);
     else if (e.type === "rings") for (let j = 0; j < e.M; j++) oms.push(e.PH[j] - B.PH[j]);
     else if (e.type === "spectrum") for (let j = 0; j < e.N; j++) oms.push(e.PH[j] - B.PH[j]);
@@ -396,6 +397,61 @@ function newWake(id, halfW, yFar, strength) {
     angle: Math.round(WAKE_ANGLE_DEG * 10) / 10 };
 }
 
+// ---- ripples off rocks --------------------------------------------
+// Water lapping at a rock throws small rings back off it. They are the one
+// wave in the scene with an outline of its own: each ring is a fixed distance
+// out from the rock's waterline — the same signed distance field the rock is
+// drawn and reflected from (rocks.js), rounded off so that far out the rings
+// forget the rock's corners the way real ones do. So a long ledge rings in
+// long ovals and a split boulder in lobes, without a second description of its
+// shape to drift out of step with the first.
+//
+// A ring leaves the waterline at nothing, peaks a quarter wavelength out and
+// dies away over `reach` rock-widths; it runs outward at its own phase speed
+// through omegaAt, like every other train, and through loopOmega for a looped
+// clip. The height and wavelength are read like a wake's: steepness against
+// the open water at strength 1, wavelength as a share of the scene's ripple
+// scale.
+const ROCK_RIPPLE_STEEP = WAKE_STEEP;
+const ROCK_RIPPLES_DEFAULT = { on: true, amp: 0.6, size: 0.6, reach: 1.5 };
+
+// Rock ripples ride into the field as emitters, exactly as wakes do, so the
+// height, the 3D lift, the pen lines and the reflection all pick them up — and
+// the saved-scene fixture assembles S through here too.
+function withRocks(emitters, rocks, rip) {
+  if (!rocks || !rocks.length || !rip || !rip.on || !(rip.amp > 0)) return emitters;
+  const live = rocks.filter((r) => r.on).map((r) => ({
+    id: "rock" + r.id, on: true, type: "rock", rock: r,
+    amp: rip.amp, size: rip.size, reach: rip.reach }));
+  return live.length ? [...emitters, ...live] : emitters;
+}
+
+// One prepped rock's rings at a ground point, into ROCK_OUT like wakeAt: the
+// height, and with `slope` its two ground derivatives. False where there is
+// nothing to add — under the rock, or past where the rings have died away.
+const ROCK_OUT = [0, 0, 0];
+const ROCK_G = new Float64Array(2);
+function rockRippleAt(e, gx, gy, slope) {
+  const dx = gx - e.pr.bx, dy = gy - e.pr.by;
+  if (dx * dx + dy * dy > e.cut2) return false;
+  const d = waterlineAt(e.pr, gx, gy, slope ? ROCK_G : null);
+  if (d <= 0) return false;
+  const a = Math.exp(-d / e.w0), dec = Math.exp(-d / e.L);
+  const env = (1 - a) * dec;
+  const ph = e.k0 * d - e.wt;
+  const sn = Math.sin(ph);
+  // the same range filter as a swell: like it, weights the derivative without
+  // contributing one
+  const x = e.aa * gy, att = 1 / (1 + x * x);
+  ROCK_OUT[0] = e.A * env * sn * att;
+  if (slope) {
+    const denv = (a / e.w0) * dec - env / e.L;
+    const dz = e.A * att * (denv * sn + env * e.k0 * Math.cos(ph));
+    ROCK_OUT[1] = dz * ROCK_G[0]; ROCK_OUT[2] = dz * ROCK_G[1];
+  }
+  return true;
+}
+
 // Pre-bake an emitter into per-frame constants so the per-sample loop is cheap.
 function prepEmitter(em, S) {
   const baseLambda = (2 * Math.PI / S.k) * em.size; // global λ × size
@@ -462,6 +518,16 @@ function prepEmitter(em, S) {
       w: 0.45 * lam, w1: 0.9 * lam, wb: 0.45 * lam, e2: 0.04 * lam * lam,
       lamAA2: Math.pow(2.2 * cell, 2), lamDet2: Math.pow(det * lam, 2),
       aaC: S.perspective ? 0.22 / S.ny : 0 };
+  }
+  if (em.type === "rock") {
+    // rings off a rock's waterline; baseLambda already carries the ripple
+    // size as a share of the scene's wavelength
+    const pr = prepRock(em.rock);
+    const k0 = 2 * Math.PI / baseLambda;
+    const L = Math.max(0.3, em.reach == null ? 1.5 : em.reach) * pr.size;
+    return { type: "rock", pr, k0, A: ROCK_RIPPLE_STEEP * baseLambda * em.amp,
+      L, w0: 0.3 * baseLambda, wt: phase(omegaAt(k0, S)), aa: aaCoef(k0, S),
+      cut2: Math.pow(pr.bR + 8 * L, 2) };
   }
   if (em.type === "rings") {
     // a scattered field of radial ripple sources -> concentric color rings
@@ -546,6 +612,8 @@ function heightAt(gx, gy, S) {
       }
     } else if (e.type === "wake") {
       if (wakeAt(e, gx, gy, false)) z += WAKE_OUT[0];
+    } else if (e.type === "rock") {
+      if (rockRippleAt(e, gx, gy, false)) z += ROCK_OUT[0];
     } else {
       for (let i = 0; i < e.N; i++) {
         const s1 = Math.sin(e.K[i] * (e.DX[i] * gx + e.DY[i] * gy) + e.PH[i]);
@@ -599,6 +667,8 @@ function slopeAt(gx, gy, S) {
       }
     } else if (e.type === "wake") {
       if (wakeAt(e, gx, gy, true)) { hx += WAKE_OUT[1]; hy += WAKE_OUT[2]; }
+    } else if (e.type === "rock") {
+      if (rockRippleAt(e, gx, gy, true)) { hx += ROCK_OUT[1]; hy += ROCK_OUT[2]; }
     } else {
       for (let i = 0; i < e.N; i++) {
         const th = e.K[i] * (e.DX[i] * gx + e.DY[i] * gy) + e.PH[i];
@@ -1213,7 +1283,7 @@ function rasterizeSurface(S, fit, gN, BW, lift = true, gapVB = 0) {
   const gap = occluding && gapVB > 0
     ? crestGapField(SX, SY, QW, gN, stride, zb, BW, BH, (gapVB * BW) / VB_W, tmp)
     : null;
-  return { BW, BH, NP, stride, GX, GY, GZ, GI, GJ, cov, sil, crest, gap };
+  return { BW, BH, NP, stride, GX, GY, GZ, GI, GJ, cov, sil, crest, gap, zb };
 }
 
 // ---- crest seams ---------------------------------------------------
@@ -1733,6 +1803,349 @@ function markPaper(S, fit, R) {
   return out;
 }
 
+// ---- rocks: the silhouette and the reflection ---------------------
+// A rock is a solid out on the water (rocks.js), and the frame shows it twice:
+// as itself, black against whatever is behind it, and as its image in the
+// water, black against the reflected backdrop and torn up by the same ripples
+// that tear up everything else there. Both are fields on a surface raster,
+// positive inside, and both are cut by the same marching squares as a color
+// band — so a rock's edge is drawn to the water's standard, at whatever width
+// the picture is traced.
+//
+// The silhouette is ray-marched: every pixel near the rock sends its camera
+// ray, and the field is how close that ray comes to the rock, turned into
+// raster pixels at the rock's own distance. Where water stands nearer the
+// camera than the point the ray hits — a crest in front, or just the plane
+// over the part of the rock under it — the water wins. That comparison is
+// against the raster's own depth buffer, so a rock sits IN the water rather
+// than on it: its waterline is wherever the surface actually crosses it, and a
+// swell in front hides its foot the way it hides the water behind.
+//
+// The reflection sends the reflected ray instead, from the visible surface
+// point, in the direction the water's own color is read from (reflectAt). That
+// direction is sampled on the surface mesh and reconstructed across a pixel
+// with the same Catmull-Rom kernel as every other reflected field, so the
+// rock's image ripples exactly as much, and at the same scale, as the bands
+// around it. Only mesh cells whose flat-water mirror ray passes anywhere near a
+// rock are asked; the rest of the frame is left alone.
+//
+// It all lives on the raster, not in the scene's ground grid, so the flat
+// modes build one of their own for it (buildRocks), as they do for the
+// watermark.
+
+// How far past a rock's edge its fields are carried, in raster pixels — a
+// clamp for the same reasons as the watermark's, and several times the reach
+// of the strongest edge polish.
+const ROCK_REACH = 12;
+// …and how far inside it, past which a ray stops marching: the contour reads
+// values near zero, and the strongest polish blur reaches about three pixels
+const ROCK_DEEP = 4;
+// the finest step a ray takes, in raster pixels at the rock
+const ROCK_EPS = 0.15;
+// How far off the flat-water mirror direction a rippled surface can still
+// throw a reflected ray: twice the steepest slope worth planning for.
+const ROCK_TILT = 1.1;
+// the coarse step of the silhouette pass, in raster pixels (see rockFields);
+// with ROCK_DEEP it has to leave a block's corners a sure distance inside
+const ROCK_BLOCK = 4;
+
+// raster pixels per ground unit at the rock: one number per rock, taken at its
+// own place in the frame, for the reasons markScale gives
+function rockScale(S, fit, BW, pr) {
+  const kx = BW / VB_W;
+  if (!S.perspective) return (fit.scale / Math.max(1e-6, S.xMax - S.xMin)) * kx;
+  const cp = Math.cos(S.pitch), sp = Math.sin(S.pitch);
+  const Zc = pr.y * cp - (pr.height * 0.4 - S.H) * sp;
+  return (Math.sqrt(fit.scale * (fit.scaleY || fit.scale)) / Math.max(1e-3, Zc)) * kx;
+}
+
+// one grid-sampled value at one covered pixel, Catmull-Rom — rasterField for a
+// single pixel, for fields only a few pixels ever need
+function crAt(R, vals, p) {
+  const { stride, GI, GJ } = R;
+  const cl = (v) => (v < 0 ? 0 : v > stride - 1 ? stride - 1 : v);
+  const fi = GI[p], fj = GJ[p];
+  const i0 = Math.floor(fi), j0 = Math.floor(fj);
+  const tx = fi - i0, ty = fj - j0;
+  const ia = cl(i0 - 1), ib = cl(i0), ic = cl(i0 + 1), id = cl(i0 + 2);
+  const ra = cl(j0 - 1) * stride, rb = cl(j0) * stride, rc = cl(j0 + 1) * stride, rd = cl(j0 + 2) * stride;
+  return cr4(
+    cr4(vals[ra + ia], vals[ra + ib], vals[ra + ic], vals[ra + id], tx),
+    cr4(vals[rb + ia], vals[rb + ib], vals[rb + ic], vals[rb + id], tx),
+    cr4(vals[rc + ia], vals[rc + ib], vals[rc + ic], vals[rc + id], tx),
+    cr4(vals[rd + ia], vals[rd + ib], vals[rd + ic], vals[rd + id], tx),
+    ty);
+}
+
+// grow a mesh-vertex flag set by `n` vertices in each direction
+function dilateFlags(f, stride, n) {
+  let cur = f;
+  for (let it = 0; it < n; it++) {
+    const nx = new Uint8Array(cur.length);
+    for (let j = 0; j < stride; j++) for (let i = 0; i < stride; i++) {
+      const q = j * stride + i;
+      if (!cur[q]) continue;
+      for (let dj = -1; dj <= 1; dj++) for (let di = -1; di <= 1; di++) {
+        const a = i + di, b = j + dj;
+        if (a >= 0 && b >= 0 && a < stride && b < stride) nx[b * stride + a] = 1;
+      }
+    }
+    cur = nx;
+  }
+  return cur;
+}
+
+// The rock silhouette and the rock reflection as raster fields, positive
+// inside, clamped at ROCK_REACH: { body, refl } (refl null when the scene has
+// reflections off), or null with no rock in it. `polish` is the scene's
+// antialiasing (and the SVG's edge polish), on the same terms as the water's.
+function rockFields(S, fit, R, polish = 0, scratch = null) {
+  const rocks = (S.rocks || []).filter((r) => r.on).map(prepRock);
+  if (!rocks.length) return null;
+  const { BW, BH, NP, cov, zb } = R;
+  const ks = rocks.map((pr) => rockScale(S, fit, BW, pr));
+  const persp = !!S.perspective;
+  const cp = Math.cos(S.pitch), sp = Math.sin(S.pitch);
+  const syS = fit.scaleY || fit.scale;
+  const out = new Float64Array(3);
+  const gzOf = persp ? null : (p) => (cov[p] ? crAt(R, R.GZ, p) : 0);
+
+  const body = new Float32Array(NP).fill(-ROCK_REACH);
+  rocks.forEach((pr, ri) => {
+    const k = ks[ri], reach = ROCK_REACH / k, deep = ROCK_DEEP / k, eps = ROCK_EPS / k;
+    // the screen box the rock (and its reach) can land in
+    let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity, behind = false;
+    const b = pr.box;
+    for (const cx of [0, 1]) for (const cy of [2, 3]) for (const cz of [4, 5]) {
+      const q = penProject(b[cx] + (cx ? reach : -reach), b[cy] + (cy === 3 ? reach : -reach),
+        b[cz] + (cz === 5 ? reach : -reach), S, fit);
+      if (persp && q[2] <= 1e-3) behind = true;
+      const X = (q[0] / VB_W) * BW, Y = (q[1] / VB_H) * BH;
+      if (X < x0) x0 = X; if (X > x1) x1 = X; if (Y < y0) y0 = Y; if (Y > y1) y1 = Y;
+    }
+    if (behind) { x0 = 0; y0 = 0; x1 = BW - 1; y1 = BH - 1; }
+    x0 = Math.max(0, Math.floor(x0) - 1); y0 = Math.max(0, Math.floor(y0) - 1);
+    x1 = Math.min(BW - 1, Math.ceil(x1) + 1); y1 = Math.min(BH - 1, Math.ceil(y1) + 1);
+    if (x0 > x1 || y0 > y1) return;
+    const w = x1 - x0 + 1, h = y1 - y0 + 1;
+    const val = new Float32Array(w * h);
+    // depth of the rock point each ray reaches (or passes nearest), and of the
+    // water it crosses on the way: what decides which of the two is in front
+    const dR = new Float64Array(w * h), dW = new Float64Array(w * h);
+    const top = pr.box[5] + 1;
+    const cast = (x, y) => {
+      const c = (y - y0) * w + (x - x0);
+      const rx = ((x * VB_W) / BW - fit.ox) / fit.scale;
+      const ry = ((y * VB_H) / BH - fit.oy) / syS;
+      if (persp) {
+        let dx = rx, dy = cp - ry * sp, dz = -sp - ry * cp;
+        const l = Math.sqrt(dx * dx + dy * dy + dz * dz); dx /= l; dy /= l; dz /= l;
+        rayMin(pr, 0, 0, S.H, dx, dy, dz, reach, deep, eps, 1e5, out);
+        // along a unit ray, camera depth grows by 1/l per unit
+        dR[c] = (out[2] >= 0 ? out[2] : out[1]) / l;
+      } else {
+        // plan view looks straight down: nearer is higher
+        const gx = S.xMin + rx * (S.xMax - S.xMin), gy = S.yMin + (1 - ry) * (S.yMax - S.yMin);
+        rayMin(pr, gx, gy, top, 0, 0, -1, reach, deep, eps, 1e5, out);
+        dR[c] = -(top - (out[2] >= 0 ? out[2] : out[1]));
+      }
+      val[c] = -out[0] * k;
+    };
+    // Coarse first, fine only where it matters. The field is a distance in
+    // pixels, so it cannot cross zero inside a block whose corners are all
+    // further than the block's own diagonal from it: a block like that is
+    // filled by interpolation — well inside the rock or well clear of it,
+    // where only the clamp and the depth are read — and every pixel of the
+    // rest is traced. That leaves a band a few pixels wide along the outline
+    // doing the work, instead of the whole of every rock.
+    const B = ROCK_BLOCK;
+    const xs = [], ys = [];
+    for (let x = x0; x < x1; x += B) xs.push(x); xs.push(x1);
+    for (let y = y0; y < y1; y += B) ys.push(y); ys.push(y1);
+    for (const y of ys) for (const x of xs) cast(x, y);
+    const done = new Uint8Array(w * h);
+    for (const y of ys) for (const x of xs) done[(y - y0) * w + (x - x0)] = 1;
+    for (let bj = 0; bj + 1 < ys.length; bj++) for (let bi = 0; bi + 1 < xs.length; bi++) {
+      const xa = xs[bi], xb = xs[bi + 1], ya = ys[bj], yb = ys[bj + 1];
+      const c00 = (ya - y0) * w + (xa - x0), c10 = (ya - y0) * w + (xb - x0);
+      const c01 = (yb - y0) * w + (xa - x0), c11 = (yb - y0) * w + (xb - x0);
+      const v00 = val[c00], v10 = val[c10], v01 = val[c01], v11 = val[c11];
+      // no pixel is more than half a block's diagonal (2.8px) from a corner
+      const T = 3.5;
+      const out4 = v00 < -T && v10 < -T && v01 < -T && v11 < -T;
+      let in4 = v00 > T && v10 > T && v01 > T && v11 > T;
+      if (in4) {
+        // inside, the depth is what is read — and a nearer chunk standing in
+        // front of a farther one steps it, so a block across that is traced
+        const d0 = Math.min(dR[c00], dR[c10], dR[c01], dR[c11]);
+        const d1 = Math.max(dR[c00], dR[c10], dR[c01], dR[c11]);
+        if (!(d1 - d0 <= 0.02 * Math.abs(d0) + 1e-9)) in4 = false;
+      }
+      for (let y = ya; y <= yb; y++) for (let x = xa; x <= xb; x++) {
+        const c = (y - y0) * w + (x - x0);
+        if (done[c]) continue;
+        if (out4 || in4) {
+          const fx = (x - xa) / (xb - xa || 1), fy = (y - ya) / (yb - ya || 1);
+          val[c] = (v00 * (1 - fx) + v10 * fx) * (1 - fy) + (v01 * (1 - fx) + v11 * fx) * fy;
+          dR[c] = (dR[c00] * (1 - fx) + dR[c10] * fx) * (1 - fy)
+            + (dR[c01] * (1 - fx) + dR[c11] * fx) * fy;
+        } else cast(x, y);
+        done[c] = 1;
+      }
+    }
+    for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+      const p = y * BW + x, c = (y - y0) * w + (x - x0);
+      dW[c] = !cov[p] ? Infinity : persp ? zb[p] : -gzOf(p);
+      const v = val[c];
+      val[c] = v < -ROCK_REACH ? -ROCK_REACH : v > ROCK_REACH ? ROCK_REACH : v;
+    }
+    // Water in front of the rock. The depth gap is in scene units; divided by
+    // how fast it changes across the raster it becomes a distance in pixels,
+    // which is what lets the waterline land between two pixels along a smooth
+    // curve instead of on a stair of whole ones.
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const c = y * w + x;
+      if (val[c] <= -ROCK_REACH || !(dW[c] < Infinity)) continue;
+      const o = dR[c] - dW[c];                 // > 0: the water is nearer
+      const at = (xx, yy) => {
+        const cc = yy * w + xx;
+        return dW[cc] < Infinity ? dR[cc] - dW[cc] : null;
+      };
+      let gx = 0, gy = 0;
+      const l = x > 0 ? at(x - 1, y) : null, r = x < w - 1 ? at(x + 1, y) : null;
+      const u = y > 0 ? at(x, y - 1) : null, dn = y < h - 1 ? at(x, y + 1) : null;
+      if (l !== null && r !== null) gx = (r - l) / 2; else if (r !== null) gx = r - o; else if (l !== null) gx = o - l;
+      if (u !== null && dn !== null) gy = (dn - u) / 2; else if (dn !== null) gy = dn - o; else if (u !== null) gy = o - u;
+      const g = Math.hypot(gx, gy);
+      const op = g > 1e-12 ? o / g : o > 0 ? ROCK_REACH : -ROCK_REACH;
+      if (-op < val[c]) val[c] = -op < -ROCK_REACH ? -ROCK_REACH : -op;
+    }
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const p = (y + y0) * BW + (x + x0), v = val[y * w + x];
+      if (v > body[p]) body[p] = v;
+    }
+  });
+  if (polish) blurField(body, BW, BH, scratch ? scratch.tmp : new Float32Array(NP), polish);
+
+  let refl = null;
+  if (S.rockRefl) {
+    refl = new Float32Array(NP).fill(-ROCK_REACH);
+    const { stride, GX, GY, GZ } = R, nv = GX.length;
+    const coh = coherencePasses(S, stride - 1);
+    // which mesh vertices could reflect a rock at all
+    const cand = new Uint8Array(nv);
+    for (let q = 0; q < nv; q++) {
+      const ox = GX[q], oy = GY[q], oz = GZ[q];
+      let mx = ox, my = oy, mz = S.H;                // reflectAt's view ray, mirrored flat
+      const ml = Math.hypot(mx, my, mz); mx /= ml; my /= ml; mz /= ml;
+      for (let ri = 0; ri < rocks.length; ri++) {
+        const pr = rocks[ri], rad = pr.bR + ROCK_REACH / ks[ri];
+        const wx = pr.bx - ox, wy = pr.by - oy, wz = pr.bz - oz;
+        const dist = Math.hypot(wx, wy, wz);
+        if (dist <= rad) { cand[q] = 1; break; }
+        const cosA = (mx * wx + my * wy + mz * wz) / dist;
+        const ang = Math.acos(cosA < -1 ? -1 : cosA > 1 ? 1 : cosA);
+        if (ang < Math.asin(Math.min(1, rad / dist)) + ROCK_TILT) { cand[q] = 1; break; }
+      }
+    }
+    // a pixel reads a 4×4 block of vertices around its cell, so the directions
+    // are wanted a little further out than the cells that are asked
+    const pix = dilateFlags(cand, stride, 1);
+    const need = coh ? null : dilateFlags(pix, stride, 2);
+    const DX = new Float64Array(nv), DY = new Float64Array(nv), DZ = new Float64Array(nv);
+    for (let q = 0; q < nv; q++) {
+      if (need && !need[q]) continue;
+      const r = reflectAt(GX[q], GY[q], S);
+      DX[q] = r[0]; DY[q] = r[1]; DZ[q] = r[2];
+    }
+    if (coh) {
+      const cb = new Float64Array(nv);
+      meshBlur(R, DX, coh, cb); meshBlur(R, DY, coh, cb); meshBlur(R, DZ, coh, cb);
+    }
+    for (let p = 0; p < NP; p++) {
+      if (!cov[p]) continue;
+      const ci = Math.min(stride - 1, Math.max(0, Math.floor(R.GI[p])));
+      const cj = Math.min(stride - 1, Math.max(0, Math.floor(R.GJ[p])));
+      if (!pix[cj * stride + ci]) continue;
+      let dx = crAt(R, DX, p), dy = crAt(R, DY, p), dz = crAt(R, DZ, p);
+      const l = Math.hypot(dx, dy, dz);
+      if (!(l > 1e-9) || dz <= 0) continue;          // a ray back into the water
+      dx /= l; dy /= l; dz /= l;
+      const ox = crAt(R, GX, p), oy = crAt(R, GY, p), oz = crAt(R, GZ, p);
+      let best = -ROCK_REACH;
+      for (let ri = 0; ri < rocks.length; ri++) {
+        const k = ks[ri];
+        rayMin(rocks[ri], ox, oy, oz, dx, dy, dz, ROCK_REACH / k, ROCK_DEEP / k, ROCK_EPS / k, 1e5, out);
+        const v = -out[0] * ks[ri];
+        if (v > best) best = v;
+      }
+      refl[p] = best > ROCK_REACH ? ROCK_REACH : best;
+    }
+    smoothField(refl, cov, BW, BH, polish, scratch);
+  }
+  return { body, refl };
+}
+
+// The rocks as paths, from a surface raster that already exists: `under` is
+// the reflection, drawn over the water and under the watermark; `over` is the
+// rocks themselves, drawn over everything.
+function buildRocksOn(S, fit, R, iters, buf, polish, scratch) {
+  const F = rockFields(S, fit, R, polish, scratch);
+  if (!F) return null;
+  const under = [], over = [];
+  if (F.refl) {
+    const d = contourRegion(R, F.refl, 0, iters, buf);
+    if (d) under.push({ d, color: ROCK_COLOR });
+  }
+  // The silhouette is not cut against the water's outline — a rock stands up
+  // out of the water and in front of whatever is behind it — so it is traced
+  // on its own, with a one-pixel replicated border so a rock running off the
+  // frame is cut by the frame rather than half a pixel inside it.
+  const { BW, BH } = R, PW = BW + 2, PH = BH + 2;
+  const pad = new Float64Array(PW * PH);
+  for (let y = 0; y < PH; y++) {
+    const sy = y === 0 ? 0 : y === PH - 1 ? BH - 1 : y - 1;
+    for (let x = 0; x < PW; x++) {
+      const sx = x === 0 ? 0 : x === PW - 1 ? BW - 1 : x - 1;
+      pad[y * PW + x] = F.body[sy * BW + sx];
+    }
+  }
+  const multi = d3.contours().size([PW, PH]).thresholds([0])(pad)[0];
+  const d = contourToScreenPath(multi, BW, BH, iters, -1);
+  if (d) over.push({ d, color: ROCK_COLOR });
+  return under.length || over.length ? { under, over } : null;
+}
+
+// The rocks for the modes that build no surface raster of their own: the flat
+// renders and pen mode, like buildMark. Flat water projects exactly on a few
+// mesh cells, but the reflection reads the waves' slope off the mesh, so it
+// gets the scene's mesh whenever there is a reflection to draw.
+function buildRocks(S, raster = {}) {
+  if (!(S.rocks || []).some((r) => r.on)) return null;
+  const fit = computeFit(S);
+  prepField(S);
+  const lift = !!(S.surface3d && S.perspective);
+  const gN = lift || S.rockRefl ? Math.min(MARK_MAX_GN, raster.gN || 140) : MARK_FLAT_GN;
+  const BW = Math.min(MARK_MAX_BW, raster.BW || 420);
+  const polish = raster.polish || 0;
+  const R = rasterizeSurface(S, fit, gN, BW, lift, 0);
+  return buildRocksOn(S, fit, R, S.smooth || 0, new Float64Array(R.NP),
+    polish, polishScratch(R.NP, polish));
+}
+
+// Which pixels are rock for the paper export: 0 none, 1 its reflection, 2 the
+// rock. The same fields the render contours, read at the pixel.
+function rockPaper(S, fit, R, polish, scratch) {
+  const F = rockFields(S, fit, R, polish, scratch);
+  if (!F) return null;
+  const out = new Uint8Array(R.NP);
+  for (let p = 0; p < R.NP; p++) {
+    if (F.body[p] > 0) out[p] = 2;
+    else if (F.refl && R.cov[p] && F.refl[p] > 0) out[p] = 1;
+  }
+  return out;
+}
+
 // Preset / 1D path: one continuous scalar (the reflected elevation), contoured
 // at the palette's band boundaries into nested upper sets, plus the occluded
 // Fresnel bands. `scalarAt`/`fresAt` are sampled at ground points.
@@ -1757,7 +2170,8 @@ function buildSurface3D(S, fit, opts) {
     fres = fresThresholds.map((t) => contourRegion(R, ff, t, iters, buf));
   }
   return { layers, fres, gap: gapRegion(R, iters, buf),
-           mark: buildMarkOn(S, fit, R, iters, buf, polish, scratch) };
+           mark: buildMarkOn(S, fit, R, iters, buf, polish, scratch),
+           rocks: buildRocksOn(S, fit, R, iters, buf, polish, scratch) };
 }
 
 // 2D panorama path: no single scalar exists, so take the compiled backdrop's
@@ -1872,7 +2286,8 @@ function buildSurface3DPanorama(S, fit, opts) {
   }
   return { bg: backdrop.colorAt(0), layers: drawn, fres,
            gap: gapRegion(R, iters, buf),
-           mark: buildMarkOn(S, fit, R, iters, buf, polish, scratch) };
+           mark: buildMarkOn(S, fit, R, iters, buf, polish, scratch),
+           rocks: buildRocksOn(S, fit, R, iters, buf, polish, scratch) };
 }
 
 // The fields any surface-raster pass contours: one continuous scalar for
@@ -1954,8 +2369,8 @@ function buildSolid3D(S, fieldSpec, raster) {
     { uvAt, rayAt: fieldSpec.rayAt, backdrop, fresAt, fresThresholds, ...raster });
   // preset / paint1d: the wave silhouette does the occlusion. Lowest band
   // shows the background, exactly like the flat render, so no base layer.
-  const { layers, fres, gap, mark } = buildSurface3D(S, fit, { scalarAt, thresholds, fresAt, fresThresholds, ...raster });
-  return { bg: cols[0], layers: layers.map((d, k) => ({ d, color: cols[k + 1] })), fres, gap, mark };
+  const { layers, fres, gap, mark, rocks } = buildSurface3D(S, fit, { scalarAt, thresholds, fresAt, fresThresholds, ...raster });
+  return { bg: cols[0], layers: layers.map((d, k) => ({ d, color: cols[k + 1] })), fres, gap, mark, rocks };
 }
 
 // each color region is filled with nested rings that follow its edge shape
@@ -3106,6 +3521,7 @@ export {
   SPEED_MIN, SPEED_MAX, EMITTER_RATE_DEFAULT,
   DISPERSION_DEFAULT, omegaAt, dispersionFor, loopOmega, loopFit,
   buildMark, markSampler, markScale, MARK_FONTS,
+  withRocks, buildRocks, rockFields, ROCK_RIPPLES_DEFAULT,
 };
 
 // ---- layered-paper stack export -----------------------------------
@@ -3338,13 +3754,19 @@ function buildPaperImage(S, fit, opts) {
   const markP = markPaper(S, fit, R);
   const markInk = markP ? idFor(S.mark.color || "#ffffff") : -1;
   const markHalo = markP && S.mark.halo > 0 ? idFor(S.mark.haloColor || "#0b1420") : markInk;
+  // rocks are one more sheet: the rock over everything, even off the water,
+  // and its reflection under the watermark like the render draws it
+  const rockP = rockPaper(S, fit, R, polish, paperScratch);
+  const rockId = rockP ? idFor(ROCK_COLOR) : -1;
 
   const grid = new Int32Array(NP);
   const counts = [];
   for (let p = 0; p < NP; p++) {
     let id;
-    if (!cov[p]) id = bgId;                      // off the water: the mount
+    if (rockP && rockP[p] === 2) id = rockId;    // a rock stands in front of it all
+    else if (!cov[p]) id = bgId;                 // off the water: the mount
     else if (markP && markP[p]) id = markP[p] === 2 ? markInk : markHalo;
+    else if (rockP && rockP[p]) id = rockId;     // a rock's reflection
     else if (gapF && gapF[p] > 0) id = gapId;    // inside a crest gap: cut through
     else {
       let c = colorOf(p);
@@ -3574,6 +3996,9 @@ const WORKSPACES = [
   { id: "objects", name: "Objects", icon: "◉", find: [
     "watermark text on the water", "watermark type, weight & italic",
     "letter spacing", "watermark size, position & turn", "watermark ink & outline",
+    "rocks in the water (shore ledge, boulders)", "rock shape: smooth ↔ jagged",
+    "rock size, height, length & turn", "rock reflections on / off",
+    "ripples off the rocks (strength, size, reach)",
     "reflected objects across the water", "boat & board wakes (kelvin v)"] },
   { id: "style", name: "Style", icon: "✎", find: [
     "pen-plot mode", "pen style (parallel, concentric, hatched)", "line width",
@@ -4399,6 +4824,53 @@ function EnvPreview({ env }) {
   );
 }
 
+// what the smooth ↔ jagged slider is standing at, in words
+function rockShapeName(v) {
+  return v < 0.2 ? "glacial boulder" : v < 0.45 ? "weathered" : v < 0.75 ? "broken" : "jagged ledge";
+}
+
+function RockCard({ rock, idx, halfW, yNear, yFar, onChange, onRemove }) {
+  const btn = { fontSize: 12, width: 26, height: 26, borderRadius: 6, cursor: "pointer",
+    background: "#1a232c", border: "1px solid #26313c" };
+  return (
+    <div style={{ border: "1px solid #26313c", borderRadius: 9, padding: 11,
+      marginBottom: 10, background: "#121922" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 9 }}>
+        <span style={{ fontSize: 10.5, letterSpacing: 1, color: "#6f8294", flex: 1,
+          fontFamily: "ui-monospace, monospace" }}>ROCK {idx + 1}</span>
+        <button onClick={() => onChange({ on: !rock.on })}
+          style={{ fontSize: 10.5, padding: "4px 9px", borderRadius: 6, cursor: "pointer",
+            fontFamily: "ui-monospace, monospace",
+            background: rock.on ? "#27424b" : "#1a232c", color: rock.on ? "#dff1f6" : "#7f93a4",
+            border: "1px solid " + (rock.on ? "#3f7e8f" : "#26313c") }}>
+          {rock.on ? "on" : "off"}
+        </button>
+        <button onClick={() => onChange({ seed: (rock.seed || 0) + 1 })}
+          title="another rock of the same description"
+          aria-label={`reshuffle rock ${idx + 1}`}
+          style={{ ...btn, color: "#9fb0c0" }}>↻</button>
+        <button onClick={onRemove} aria-label={`remove rock ${idx + 1}`}
+          style={{ ...btn, color: "#9a6a6a", border: "1px solid #3a2a2a" }}>✕</button>
+      </div>
+      <Slider label="position ← →" value={rock.x} min={-halfW} max={halfW} step={0.25}
+        onChange={(v) => onChange({ x: v })} fmt={(v) => (v === 0 ? "center" : v.toFixed(2))} />
+      <Slider label="distance (near → far)" value={rock.y} min={yNear} max={yFar} step={0.25}
+        onChange={(v) => onChange({ y: v })} fmt={(v) => v.toFixed(2)} />
+      <Slider label="size" value={rock.size} min={0.2} max={Math.max(4, halfW / 3)} step={0.05}
+        onChange={(v) => onChange({ size: v })} fmt={(v) => v.toFixed(2) + " units"} />
+      <Slider label="height" value={rock.height} min={0.1} max={2} step={0.05}
+        onChange={(v) => onChange({ height: v })} fmt={(v) => v.toFixed(2) + "× size"} />
+      <Slider label="length" value={rock.stretch} min={1} max={4} step={0.05}
+        onChange={(v) => onChange({ stretch: v })}
+        fmt={(v) => (v < 1.05 ? "round" : v.toFixed(2) + "× as long as wide")} />
+      <Slider label="turn" value={rock.turn} min={-90} max={90} step={1}
+        onChange={(v) => onChange({ turn: v })} fmt={(v) => v + "\u00b0"} />
+      <Slider label="smooth ↔ jagged" value={rock.shape} min={0} max={1} step={0.01}
+        onChange={(v) => onChange({ shape: v })} fmt={rockShapeName} />
+    </div>
+  );
+}
+
 function ObjectCard({ obj, idx, azSpan, eLo, eHi, onChange, onRemove }) {
   const types = [["sailboat", "Sailboat"], ["dock", "Dock"], ["buoy", "Buoy"], ["post", "Post"]];
   const labels = OBJECT_SHAPES[obj.type].label;
@@ -4562,6 +5034,22 @@ export default function App() {
       [...os, { id: os.reduce((m, o) => Math.max(m, o.id), 0) + 1, on: true, type: "buoy",
         az: -12, size: 4, color: "#241a12", color2: "#d64127" }]);
   const removeObject = (id) => setObjects((os) => os.filter((o) => o.id !== id));
+
+  // rocks standing in the water: drawn black where they stand, and — each of
+  // these on its own switch — reflected black in the water and ringed by the
+  // ripples they throw back
+  const [rocks, setRocks] = useState([]);
+  const [rockRefl, setRockRefl] = useState(true);
+  const [rockRip, setRockRip] = useState(ROCK_RIPPLES_DEFAULT.on);
+  const [rockRipAmp, setRockRipAmp] = useState(ROCK_RIPPLES_DEFAULT.amp);
+  const [rockRipSize, setRockRipSize] = useState(ROCK_RIPPLES_DEFAULT.size);
+  const [rockRipReach, setRockRipReach] = useState(ROCK_RIPPLES_DEFAULT.reach);
+  const updateRock = (id, patch) =>
+    setRocks((rs) => rs.map((r) => (r.id === id ? { ...r, ...patch } : r)));
+  const addRock = () =>
+    setRocks((rs) => rs.length >= MAX_ROCKS ? rs :
+      [...rs, newRock(rs.reduce((m, r) => Math.max(m, r.id), 0) + 1, halfW, yNear, yFar)]);
+  const removeRock = (id) => setRocks((rs) => rs.filter((r) => r.id !== id));
 
   // The watermark: a line of type lying on the water. Everything here except
   // the mask is a number or a string, because all of it travels in the URL;
@@ -4778,6 +5266,9 @@ export default function App() {
     wakes: [wakes, setWakes],
     halfW: [halfW, setHalfW], yNear: [yNear, setYNear], yFar: [yFar, setYFar],
     reflMag: [reflMag, setReflMag], objects: [objects, setObjects],
+    rocks: [rocks, setRocks], rockRefl: [rockRefl, setRockRefl],
+    rockRip: [rockRip, setRockRip], rockRipAmp: [rockRipAmp, setRockRipAmp],
+    rockRipSize: [rockRipSize, setRockRipSize], rockRipReach: [rockRipReach, setRockRipReach],
     markOn: [markOn, setMarkOn], markText: [markText, setMarkText],
     markFont: [markFont, setMarkFont], markWeight: [markWeight, setMarkWeight],
     markItalic: [markItalic, setMarkItalic], markTracking: [markTracking, setMarkTracking],
@@ -5110,6 +5601,10 @@ export default function App() {
        surface3d, waveScale, bandFractions, fresOn, fresBands, reflMag,
        showBackdrop, penMode]);
 
+  // only the rocks that are on travel with the scene: a switched-off rock
+  // costs the render nothing
+  const liveRocks = useMemo(() => rocks.filter((r) => r.on), [rocks]);
+
   // The scene minus the instant: everything about the water except what phase
   // the waves are at. Split out for the same reason camS was — something wants
   // the scene without paying for it once per frame (see `reach`).
@@ -5121,8 +5616,12 @@ export default function App() {
     decay: 0.18 - spread * 0.16,
     omega: 1.0,
     dispersion,
-    emitters: withWakes(emitters, wakes),
-  }), [camS, wavelength, strength, sharp, spread, dispersion, emitters, wakes]);
+    emitters: withRocks(withWakes(emitters, wakes), liveRocks,
+      { on: rockRip, amp: rockRipAmp, size: rockRipSize, reach: rockRipReach }),
+    // the rocks themselves, for the passes that draw and reflect them
+    rocks: liveRocks, rockRefl,
+  }), [camS, wavelength, strength, sharp, spread, dispersion, emitters, wakes,
+       liveRocks, rockRefl, rockRip, rockRipAmp, rockRipSize, rockRipReach]);
 
   // The watermark's type, rasterized into a signed distance field. Built HERE
   // — on the page's own thread, where the fonts are — and carried on S as
@@ -5434,6 +5933,12 @@ export default function App() {
     (St) => (solid3d ? null : buildMark(St, solidRaster)), [solid3d, solidRaster]);
   const flatMark = useMemo(() => makeMark(S), [makeMark, S]);
   const drawMark = solid3d ? (surf3d ? surf3d.mark : null) : flatMark;
+  // the rocks the same way: off the 3D-solid pass's raster in that mode, off a
+  // raster of their own everywhere else
+  const makeRocks = useCallback(
+    (St) => (solid3d ? null : buildRocks(St, solidRaster)), [solid3d, solidRaster]);
+  const flatRocks = useMemo(() => makeRocks(S), [makeRocks, S]);
+  const drawRocks = solid3d ? (surf3d ? surf3d.rocks : null) : flatRocks;
   const fresIdx = useMemo(
     () => (fresOn && drawFres ? d3.range(fresBands) : [0]),
     [fresOn, drawFres, fresBands]);
@@ -5460,7 +5965,7 @@ export default function App() {
   // the rest do not move with the phase, so they stay closed over.
   const liveFrame = {
     seg, fresPaths, penLines,
-    drawLayers, drawFres, drawBg, drawGap, drawMark, bgFill, gapFill,
+    drawLayers, drawFres, drawBg, drawGap, drawMark, drawRocks, bgFill, gapFill,
   };
   // The 3D solid pass at any phase, through the worker when there is one —
   // the video export's frames come this way, and the page stays usable while
@@ -5479,7 +5984,8 @@ export default function App() {
     const St = { ...S, t, loopPhase };
     if (penMode) {
       // pen mode has no filled regions at all: lines, the watermark, and paper
-      return { ...liveFrame, penLines: makePenLines(St), drawMark: makeMark(St) };
+      return { ...liveFrame, penLines: makePenLines(St), drawMark: makeMark(St),
+        drawRocks: makeRocks(St) };
     }
     // the flat build only where it is what gets drawn (see flatNeeded)
     const geomT = !solid3d && !use2d ? buildGeometry(St) : null;
@@ -5497,6 +6003,8 @@ export default function App() {
     // everything else here — built at this frame's own instant, never carried
     // over from the preview
     const markT = solid3d ? solidT.mark : makeMark(St);
+    // …and so do the rocks' reflections and ripples
+    const rocksT = solid3d ? solidT.rocks : makeRocks(St);
     return {
       seg: segT, fresPaths: fresT, penLines: null,
       drawLayers: solid3d ? solidT.layers : layersT,
@@ -5504,6 +6012,7 @@ export default function App() {
       drawBg: solid3d ? solidT.bg : bgT,
       drawGap: solid3d ? solidT.gap : null,
       drawMark: markT,
+      drawRocks: rocksT,
       bgFill: bgFillT, gapFill: crestGapColor || bgFillT,
     };
   };
@@ -5525,8 +6034,13 @@ export default function App() {
     // the watermark is cut on the same raster the regions are, so an export
     // retrace brings its own — resolved as finely as everything else in the file
     const svgMark = over && over.mark !== undefined ? over.mark : F.drawMark;
-    const markStr = (svgMark || []).map(
+    const svgRocks = over && over.rocks !== undefined ? over.rocks : F.drawRocks;
+    const pathsOf = (ls) => (ls || []).map(
       (l) => `<path d="${l.d}" fill="${l.color}" fill-rule="evenodd"/>`).join("");
+    // over the water, in depth order: a rock's reflection lies in the water,
+    // the watermark lies on it, and the rock stands up out of it
+    const markStr = pathsOf(svgRocks && svgRocks.under) + pathsOf(svgMark)
+      + pathsOf(svgRocks && svgRocks.over);
     const rollOpen = rollTf ? `<g transform="${rollTf}">` : `<g>`;
     if (penMode) {
       let body = `<rect width="${VB_W}" height="${VB_H}" fill="${bgFill}"/>` + rollOpen;
@@ -5937,11 +6451,19 @@ export default function App() {
                   </g>
                 </>
               )}
-              {/* the watermark last: it lies on the water, over every region
-                  and every crest gap, and it rolls with the frame like the
-                  rest of the picture */}
+              {/* over every region and every crest gap, in depth order: a
+                  rock's reflection lies in the water, the watermark lies on
+                  it, and the rock stands up out of it. All of it rolls with
+                  the frame like the rest of the picture. */}
+              {drawRocks && drawRocks.under.map((l, i) => (
+                <path key={`rr${i}`} d={l.d} fill={l.color} fillRule="evenodd" />
+              ))}
               {drawMark && drawMark.map((l, i) => (
                 <path key={`mk${i}`} d={l.d} fill={l.color} fillRule="evenodd" />
+              ))}
+              {/* the rocks over everything: they stand up out of the water */}
+              {drawRocks && drawRocks.over.map((l, i) => (
+                <path key={`rk${i}`} d={l.d} fill={l.color} fillRule="evenodd" />
               ))}
               </g>
             </svg>
@@ -6650,6 +7172,48 @@ export default function App() {
                       + " so nothing is drawn.)" : ""}
                   </Help>
                 </div>
+              )}
+            </div>
+
+            <div style={panel}>
+              <div style={heading}>Rocks in the water</div>
+              <Help label="what rocks are">
+                Solid shapes standing out on the plane, drawn black — shore ledge, a boulder, a
+                line of stepping stones. Unlike the objects across the water below, a rock is
+                in the frame itself: the camera sees it, the waves around it hide its foot, the
+                water reflects it (torn up by the same ripples as everything else), and it rings
+                the surface with the ripples it throws back. Each of those last two has its own
+                switch. Shape runs from a round glacial boulder to a fractured, tilted ledge;
+                ↻ draws another rock of the same description.
+              </Help>
+              {rocks.length > 0 && (
+                <>
+                  <Toggle label="Reflections" value={rockRefl} onChange={setRockRefl} />
+                  <Toggle label="Ripples off the rocks" value={rockRip} onChange={setRockRip} />
+                  {rockRip && (
+                    <div style={{ marginTop: 4 }}>
+                      <Slider label="ripple strength" value={rockRipAmp} min={0} max={2} step={0.05}
+                        onChange={setRockRipAmp} fmt={(v) => (v === 0 ? "off" : v.toFixed(2))} />
+                      <Slider label="ripple size" value={rockRipSize} min={0.2} max={2} step={0.05}
+                        onChange={setRockRipSize} fmt={(v) => v.toFixed(2) + "× wavelength"} />
+                      <Slider label="ripple reach" value={rockRipReach} min={0.4} max={5} step={0.1}
+                        onChange={setRockRipReach} fmt={(v) => v.toFixed(1) + "× rock size"} />
+                    </div>
+                  )}
+                </>
+              )}
+              {rocks.map((r, i) => (
+                <RockCard key={r.id} rock={r} idx={i} halfW={halfW} yNear={yNear} yFar={yFar}
+                  onChange={(patch) => updateRock(r.id, patch)}
+                  onRemove={() => removeRock(r.id)} />
+              ))}
+              {rocks.length < MAX_ROCKS && (
+                <button onClick={addRock}
+                  style={{ width: "100%", padding: "9px", borderRadius: 8, cursor: "pointer",
+                    background: "#1a232c", color: "#9fb0c0", border: "1px dashed #3a4a57",
+                    fontFamily: "ui-monospace, monospace", fontSize: 12 }}>
+                  + add rock
+                </button>
               )}
             </div>
 

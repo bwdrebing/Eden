@@ -163,6 +163,16 @@ scaled inside a fixed-size `<div>` gives a zoomed crop to screenshot.
   (`buildGeometry`, `buildSegmentation`) do not run at all: nothing drawn
   comes from them there, and `elevationRange` supplies the two numbers
   auto-fit reads.
+- **Rocks are one signed distance field used three ways** (`rocks.js`): the
+  silhouette is ray-marched per raster pixel and loses to water that is nearer
+  in the depth buffer (so waves hide a rock's foot), the reflection marches the
+  reflected ray from the visible surface point along `reflectAt`'s direction,
+  and the ripples are an emitter (`withRocks`, like `withWakes`) ringing out
+  from the same shape's waterline. Both drawn fields ride the surface raster
+  like the watermark — `rocks` on the 3D-solid result, `buildRocks` for the
+  other modes — and in the SVG the order is reflection, watermark, rock.
+  Ray cost is pixels, so keep the coarse-block pass and the early exits in
+  `rayMin`: without them rocks cost ten times the water.
 - The 1D/preset path and the 2D panorama path are separate builders
   (`buildSurface3D`, `buildSurface3DPanorama`) that must stay in step. A new
   option on one usually belongs on the other; `buildSolid3D` is where both are

@@ -16,7 +16,9 @@
 //  if the component starts deriving S differently this needs the same edit —
 //  the fixture test will keep rendering, just not the scene you meant.
 // ------------------------------------------------------------------ //
-import { reflectAt, buildGeometry, computeFit, withWakes } from "./WaterReflectionContours";
+import {
+  reflectAt, buildGeometry, computeFit, withWakes, withRocks, ROCK_RIPPLES_DEFAULT,
+} from "./WaterReflectionContours";
 
 export const GRAZING_RIPPLES = {
     "steep": 0.81,
@@ -413,6 +415,13 @@ export const HARBOR_WAKE = {
     "brushShape": "round"
   };
 
+// the rock-ripple settings as the studio keeps them, defaulted the same way
+export function rockRipples(g) {
+  const D = ROCK_RIPPLES_DEFAULT;
+  return { on: g.rockRip !== undefined ? !!g.rockRip : D.on,
+    amp: g.rockRipAmp ?? D.amp, size: g.rockRipSize ?? D.size, reach: g.rockRipReach ?? D.reach };
+}
+
 // settings -> { S, fit, fieldSpec } ready for buildSolid3D. 1D/preset scenes
 // only: a paint2d scene needs the panorama spec (uvAt/env2d) instead.
 export function buildScene(settings) {
@@ -447,7 +456,11 @@ export function buildScene(settings) {
     surface3d: g.surface3d, waveScale: g.waveScale,
     bandFractions: runs.fracs,
     fresOn: g.fresOn, fresBands: g.fresBands, reflMag: g.reflMag,
-    emitters: withWakes(g.emitters, g.wakes),
+    emitters: withRocks(withWakes(g.emitters, g.wakes), g.rocks, rockRipples(g)),
+    // Neither fixture has rocks; a test that wants some passes `rocks` (and the
+    // rock settings, if not the defaults) alongside, as the studio would.
+    rocks: g.rocks || [],
+    rockRefl: g.rockRefl !== false,
   };
   const fit = computeFit(S);
   buildGeometry(S);                         // prepares S._ems from the emitters
