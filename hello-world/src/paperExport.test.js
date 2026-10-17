@@ -1,6 +1,6 @@
 import {
   buildPaperImage, buildPaperStack, buildPaperStackSvg, buildPaperSheetSvg, buildSurface3D,
-  computeFit, DEFAULT_EMITTERS, PAPER_MAX_COLORS, PAPER_FIT_TOL,
+  computeFit, DEFAULT_EMITTERS, PAPER_MAX_COLORS, PAPER_FIT_TOL, PAPER_FINE,
 } from "./WaterReflectionContours";
 
 /* ------------------------------------------------------------------ *
@@ -413,4 +413,49 @@ test("each sheet can be saved on its own, as one piece of paper", () => {
     // a fraction of the whole stack
     expect(svg.length).toBeLessThan(tiled.length);
   });
+});
+
+test("a gently sloping edge is cut as a line, not a flight of pixel stairs", () => {
+  // The plan is made on whole pixels, so a cut traced from it can only run
+  // along pixel edges: an edge a few degrees off level — every distant crest
+  // line — came out as long flats joined by one-pixel risers. The fine raster
+  // places the cut inside the pixel. These bands are lines on a flat plane,
+  // and a line stays a line in perspective, so every wiggle in a cut is
+  // error: measured as how far each point strays from the chord through its
+  // neighbours a few units either side, across every cut in the stack.
+  const S = baseS({ waveScale: 0, surface3d: false });
+  S._ems = [];
+  const thresholds = [20, 30, 40];
+  const shoot = (fine) => {
+    const img = buildPaperImage(S, computeFit(S), {
+      gN: 120, BW: 320, lift: false, bgColor: "#ffffff", fine,
+      scalarAt: (gx, gy) => gy + 0.35 * gx, thresholds, cols: greys(thresholds.length + 1),
+    });
+    return buildPaperStack(img, "#ffffff", { iters: 3 });
+  };
+  const wiggle = (st) => {
+    const k = 8;                                  // samples 0.5 apart: ±4 units
+    const ds = [];
+    for (const sh of st.sheets) for (const r of sampleRings(sh.d, 0.5)) {
+      for (let i = k; i + k < r.length; i++) {
+        const [ax, ay] = r[i - k], [bx, by] = r[i + k], [x, y] = r[i];
+        // the bands' own edges, not the frame they are cut off at
+        if (Math.min(ax, bx) < 20 || Math.max(ax, bx) > VB_W - 20) continue;
+        if (Math.min(ay, by) < 20 || Math.max(ay, by) > VB_H - 20) continue;
+        const l = Math.hypot(bx - ax, by - ay);
+        if (l < 6) continue;                      // a corner, not a run
+        const d = Math.abs((bx - ax) * (ay - y) - (ax - x) * (by - ay)) / l;
+        ds.push(d);
+      }
+    }
+    ds.sort((a, b) => a - b);
+    const at = (q) => ds[Math.floor(q * (ds.length - 1))];
+    return { med: at(0.5), p90: at(0.9), n: ds.length };
+  };
+  const coarse = wiggle(shoot(0)), fine = wiggle(shoot(PAPER_FINE));
+  expect(coarse.n).toBeGreaterThan(1000);
+  expect(fine.n).toBeGreaterThan(1000);
+  // typically a sixth of the wiggle, and a third at the worst tenth
+  expect(fine.med).toBeLessThan(coarse.med / 4);
+  expect(fine.p90).toBeLessThan(coarse.p90 / 2);
 });
