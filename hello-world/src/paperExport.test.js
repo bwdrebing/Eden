@@ -459,3 +459,43 @@ test("a gently sloping edge is cut as a line, not a flight of pixel stairs", () 
   expect(fine.med).toBeLessThan(coarse.med / 4);
   expect(fine.p90).toBeLessThan(coarse.p90 / 2);
 });
+
+test("a board's unpainted cells show the flat behind it, on paper as on screen", () => {
+  // A board is a flat standing at a distance, painted only where it was
+  // painted: its other cells are null, and the render draws whatever is behind
+  // there. The paper image used to take the null as a colour of its own, which
+  // posterizing then folded into one of the board's real colours — so a scene
+  // of an orange board in front of a green treeline and a blue sky came out as
+  // a stack of nothing but orange.
+  const { compileBackdrop } = require("./backdrop/compile");
+  const { backdropDoc, flat, rasterContent, DOC_W, DOC_H } = require("./backdrop/document");
+  const { envFromRows, fieldSpecFor, buildSurface3DPanorama } =
+    require("./WaterReflectionContours");
+  const solid = (color) => envFromRows(() => color, DOC_W, DOC_H);
+  // the board: painted on its left half only
+  const half = solid("#e98b3a");
+  for (let r = 0; r < DOC_H; r++) for (let c = DOC_W / 2; c < DOC_W; c++) half.cells[r * DOC_W + c] = null;
+  const doc = backdropDoc([
+    flat(rasterContent(solid("#6a96c8")), "Sky"),
+    { ...flat(rasterContent(half), "Board"),
+      place: { kind: "plane", distance: 14, width: 60, height: 14 } },
+  ], DOC_W, DOC_H);
+
+  const S = withSwell(baseS());
+  const fit = computeFit(S);
+  const spec = fieldSpecFor(S, { use2d: true, doc, azSpan: 45 });
+  expect(compileBackdrop(doc).groups.length).toBe(2);
+  const img = buildPaperImage(S, fit, { ...RASTER, lift: true, bgColor: "#ffffff", ...spec });
+
+  const share = new Map();
+  for (const id of img.grid) share.set(img.palette[id], (share.get(img.palette[id]) || 0) + 1);
+  // no paper is cut in "null"…
+  expect(img.palette.every((c) => typeof c === "string")).toBe(true);
+  // …and both the board and the sky through its empty half are in the picture,
+  expect(share.get("#e98b3a")).toBeGreaterThan(500);
+  expect(share.get("#6a96c8")).toBeGreaterThan(500);
+
+  // as they are in the render's own regions
+  const ref = buildSurface3DPanorama(S, fit, { ...spec, ...RASTER });
+  expect(ref.layers.map((l) => l.color)).toEqual(expect.arrayContaining(["#6a96c8", "#e98b3a"]));
+});

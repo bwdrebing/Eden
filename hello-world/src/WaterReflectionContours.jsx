@@ -3874,9 +3874,78 @@ function buildPaperImage(S, fit, opts) {
   const coh = coherencePasses(S, gN);
   const cbuf = coh ? new Float64Array(R.stride * R.stride) : null;
   let colorOf;
-  if (uvAt) {
-    // one sampler per flat, near to far: the first one this point actually
-    // reaches is the colour it reflects
+  if (uvAt && !backdrop.overflow) {
+    // A painted backdrop is drawn as a stack of regions, each the zero set of
+    // its own signed distance field read bilinearly off the flat's cells —
+    // furthest flat first, and within a flat in region order, each painted
+    // over the last (buildSurface3DPanorama). A pixel's colour is whatever is
+    // on top there: the last region, of the nearest flat, whose field is
+    // positive at it. Same taps, same fields, same board edge, same polish as
+    // that builder, so the sheets are cut where the render draws its edges —
+    // not on the cell grid, which would cut every painted shape as a stack
+    // of blocks the size of the brush.
+    const nv = R.GX.length;
+    const win = new Array(NP).fill(null);
+    const fld = new Float32Array(NP);
+    for (const g of backdrop.groups || [backdrop]) {
+      const su = new Float64Array(nv), sv = new Float64Array(nv);
+      const sh = new Float64Array(nv), se = new Float64Array(nv);
+      const plane = g.place && g.place.kind === "plane";
+      for (let q = 0; q < nv; q++) {
+        if (!plane) {
+          const uv = uvAt(R.GX[q], R.GY[q]); su[q] = uv[0]; sv[q] = uv[1]; sh[q] = 1;
+          continue;
+        }
+        const uv = g.place.hit(R.GX[q], R.GY[q], R.GZ[q], rayAt(R.GX[q], R.GY[q]));
+        if (uv) {
+          su[q] = uv[0] * g.EW; sv[q] = uv[1] * g.EH;
+          se[q] = g.place.edge(uv[0], uv[1]) * Math.min(g.EW, g.EH);
+          sh[q] = 1;
+        } else { se[q] = OFF_FLAT; }
+      }
+      meshBlur(R, su, coh, cbuf); meshBlur(R, sv, coh, cbuf);
+      if (plane) meshBlur(R, se, coh, cbuf);
+      const fu = rasterField(R, su), fv = rasterField(R, sv);
+      const fh = plane ? rasterField(R, sh) : null;
+      const fe = plane ? rasterField(R, se) : null;
+      const tap = new Int32Array(NP), tx = new Float32Array(NP), ty = new Float32Array(NP);
+      const on = new Uint8Array(NP);
+      for (let p = 0; p < NP; p++) {
+        if (!cov[p]) continue;
+        if (fh && fh[p] < 0.5) continue;        // this board is not there
+        let x = fu[p] - 0.5; x = x < 0 ? 0 : x > g.EW - 1 ? g.EW - 1 : x;
+        let y = fv[p] - 0.5; y = y < 0 ? 0 : y > g.EH - 1 ? g.EH - 1 : y;
+        const i0 = Math.min(g.EW - 2, Math.floor(x)), j0 = Math.min(g.EH - 2, Math.floor(y));
+        tap[p] = j0 * g.EW + i0; tx[p] = x - i0; ty[p] = y - j0; on[p] = 1;
+      }
+      // regions may be handed over in any order: keep the highest one that
+      // covers each pixel, then let this flat paint over the ones behind it
+      const top = new Int32Array(NP).fill(-1);
+      const EW = g.EW;
+      g.eachField((k, D) => {
+        for (let p = 0; p < NP; p++) {
+          if (!on[p]) { fld[p] = 0; continue; }
+          const q = tap[p], fx = tx[p], fy = ty[p];
+          fld[p] = (D[q] * (1 - fx) + D[q + 1] * fx) * (1 - fy)
+                 + (D[q + EW] * (1 - fx) + D[q + EW + 1] * fx) * fy;
+        }
+        if (polish) smoothField(fld, cov, R.BW, R.BH, polish, paperScratch);
+        for (let p = 0; p < NP; p++) {
+          if (!on[p] || k <= top[p]) continue;
+          let d = fld[p];
+          if (fe && fe[p] < d) d = fe[p];       // the board's own edge
+          if (d > 0) top[p] = k;
+        }
+      });
+      for (let p = 0; p < NP; p++) if (top[p] >= 0) win[p] = g.colorAt(top[p]);
+    }
+    const under = backdrop.colorAt(0);
+    colorOf = (p) => win[p] || under;
+  } else if (uvAt) {
+    // Too many regions for the field path (backdrop.overflow), which the
+    // render then also leaves for its per-cell fallback: one sampler per
+    // flat, near to far, and the first one this point actually reaches is
+    // the colour it reflects
     const nv = R.GX.length;
     const samplers = (backdrop.groups || [backdrop]).map((g) => {
       const su = new Float64Array(nv), sv = new Float64Array(nv), sh = new Float64Array(nv);
@@ -3900,7 +3969,12 @@ function buildPaperImage(S, fit, opts) {
         if (fh && fh[p] < 0.5) continue;
         const u = fu[p] < 0 ? 0 : fu[p] > g.EW - 1 ? g.EW - 1 : fu[p] | 0;
         const v = fv[p] < 0 ? 0 : fv[p] > g.EH - 1 ? g.EH - 1 : fv[p] | 0;
-        return g.cells[v * g.EW + u];
+        // a board's unpainted cells are null — the flat behind shows through
+        // there, exactly as the render draws it. Taken as a colour, the null
+        // became a paper of its own, and posterizing then folded it into
+        // whatever real colour it landed nearest
+        const c = g.cells[v * g.EW + u];
+        if (c != null) return c;
       }
       return backdrop.bg;
     };
