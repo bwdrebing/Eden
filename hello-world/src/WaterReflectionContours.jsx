@@ -924,6 +924,143 @@ function ringToBezier(p) {
   return d + "Z ";
 }
 
+// The same closed curve as ringToBezier, in far fewer segments. ringToBezier
+// spends one cubic per traced point, roughly two per raster pixel of outline:
+// a round hole fifty pixels across is a hundred cubics when four would draw
+// it. That is harmless on screen and is most of the bytes in a paper stack,
+// where every sheet re-cuts the outlines of all the sheets above it and the
+// file grows past what an editor like Figma will open.
+//
+// So this fits the Catmull-Rom curve rather than re-emitting it: greedily, as
+// many consecutive spans per cubic as stay within `tol` (viewBox units) of the
+// original — checked at every traced point AND at the midpoint of every span,
+// so it is the drawn curve being matched, not just the points it was drawn
+// through. Each cubic leaves and arrives along the spline's own tangent at its
+// joints, so the result is as smooth (G1) as the curve it replaces; only the
+// joints move. A span that will not merge is written as the very cubic
+// ringToBezier would have written, so this can only ever be smaller.
+function ringToFitBezier(p, tol) {
+  const n = p.length / 2;
+  if (n < 4) return ringToBezier(p);
+  // per span i (point i -> i+1): the Catmull-Rom control points, its midpoint,
+  // and the tangent at point i
+  const C1 = new Float64Array(2 * n), C2 = new Float64Array(2 * n);
+  const MX = new Float64Array(n), MY = new Float64Array(n);
+  const TX = new Float64Array(n), TY = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    const i0 = (i - 1 + n) % n, i2 = (i + 1) % n, i3 = (i + 2) % n;
+    const p1x = p[2 * i], p1y = p[2 * i + 1], p2x = p[2 * i2], p2y = p[2 * i2 + 1];
+    const c1x = p1x + (p2x - p[2 * i0]) / 6, c1y = p1y + (p2y - p[2 * i0 + 1]) / 6;
+    const c2x = p2x - (p[2 * i3] - p1x) / 6, c2y = p2y - (p[2 * i3 + 1] - p1y) / 6;
+    C1[2 * i] = c1x; C1[2 * i + 1] = c1y; C2[2 * i] = c2x; C2[2 * i + 1] = c2y;
+    MX[i] = (p1x + 3 * c1x + 3 * c2x + p2x) / 8; MY[i] = (p1y + 3 * c1y + 3 * c2y + p2y) / 8;
+    let tx = p2x - p[2 * i0], ty = p2y - p[2 * i0 + 1];
+    let tl = Math.hypot(tx, ty);
+    if (tl < 1e-12) { tx = p2x - p1x; ty = p2y - p1y; tl = Math.hypot(tx, ty) || 1; }
+    TX[i] = tx / tl; TY[i] = ty / tl;
+  }
+
+  // the samples a cubic over spans [s, s+L) has to match: 2L+1 of them
+  const maxS = 2 * n + 1;
+  const DX = new Float64Array(maxS), DY = new Float64Array(maxS), U = new Float64Array(maxS);
+  const out = [0, 0, 0, 0];                   // c1x c1y c2x c2y of the last fit
+  const load = (s, L) => {
+    let m = 0;
+    for (let k = 0; k < L; k++) {
+      const i = (s + k) % n;
+      DX[m] = p[2 * i]; DY[m] = p[2 * i + 1]; m++;
+      DX[m] = MX[i]; DY[m] = MY[i]; m++;
+    }
+    const e = (s + L) % n;
+    DX[m] = p[2 * e]; DY[m] = p[2 * e + 1]; m++;
+    U[0] = 0;
+    for (let k = 1; k < m; k++) U[k] = U[k - 1] + Math.hypot(DX[k] - DX[k - 1], DY[k] - DY[k - 1]);
+    const len = U[m - 1] || 1;
+    for (let k = 1; k < m; k++) U[k] /= len;
+    return m;
+  };
+  // worst distance from the samples to the cubic at their current parameters
+  const maxErr = (m, ax, ay, bx, by, cx, cy, dx, dy) => {
+    let worst = 0;
+    for (let k = 1; k < m - 1; k++) {
+      const t = U[k], s = 1 - t;
+      const qx = s * s * s * ax + 3 * s * s * t * bx + 3 * s * t * t * cx + t * t * t * dx;
+      const qy = s * s * s * ay + 3 * s * s * t * by + 3 * s * t * t * cy + t * t * t * dy;
+      const e = (qx - DX[k]) ** 2 + (qy - DY[k]) ** 2;
+      if (e > worst) worst = e;
+    }
+    return Math.sqrt(worst);
+  };
+  // least-squares cubic with both end tangents fixed in direction (Schneider),
+  // refined by a few Newton steps on the sample parameters
+  const fit = (s, L) => {
+    const m = load(s, L), e = (s + L) % n;
+    const ax = DX[0], ay = DY[0], dx = DX[m - 1], dy = DY[m - 1];
+    const t1x = TX[s], t1y = TY[s], t2x = -TX[e], t2y = -TY[e];
+    const chord = Math.hypot(dx - ax, dy - ay);
+    let best = Infinity;
+    for (let it = 0; it < 4; it++) {
+      let c00 = 0, c01 = 0, c11 = 0, x0 = 0, x1 = 0;
+      for (let k = 0; k < m; k++) {
+        const t = U[k], s1 = 1 - t;
+        const b0 = s1 * s1 * s1, b1 = 3 * s1 * s1 * t, b2 = 3 * s1 * t * t, b3 = t * t * t;
+        const a1x = t1x * b1, a1y = t1y * b1, a2x = t2x * b2, a2y = t2y * b2;
+        c00 += a1x * a1x + a1y * a1y; c01 += a1x * a2x + a1y * a2y; c11 += a2x * a2x + a2y * a2y;
+        const rx = DX[k] - (ax * (b0 + b1) + dx * (b2 + b3));
+        const ry = DY[k] - (ay * (b0 + b1) + dy * (b2 + b3));
+        x0 += a1x * rx + a1y * ry; x1 += a2x * rx + a2y * ry;
+      }
+      const det = c00 * c11 - c01 * c01;
+      let al = det ? (x0 * c11 - x1 * c01) / det : 0;
+      let ar = det ? (c00 * x1 - c01 * x0) / det : 0;
+      if (!(al > 1e-6 * chord) || !(ar > 1e-6 * chord)) al = ar = chord / 3;
+      const bx = ax + t1x * al, by = ay + t1y * al, cx = dx + t2x * ar, cy = dy + t2y * ar;
+      const err = maxErr(m, ax, ay, bx, by, cx, cy, dx, dy);
+      if (err < best) { best = err; out[0] = bx; out[1] = by; out[2] = cx; out[3] = cy; }
+      if (best <= tol || err > 8 * tol) break;
+      // Newton: move each sample's parameter to its nearest point on the cubic
+      for (let k = 1; k < m - 1; k++) {
+        const t = U[k], s1 = 1 - t;
+        const qx = s1 * s1 * s1 * ax + 3 * s1 * s1 * t * bx + 3 * s1 * t * t * cx + t * t * t * dx;
+        const qy = s1 * s1 * s1 * ay + 3 * s1 * s1 * t * by + 3 * s1 * t * t * cy + t * t * t * dy;
+        const q1x = 3 * (s1 * s1 * (bx - ax) + 2 * s1 * t * (cx - bx) + t * t * (dx - cx));
+        const q1y = 3 * (s1 * s1 * (by - ay) + 2 * s1 * t * (cy - by) + t * t * (dy - cy));
+        const q2x = 6 * (s1 * (cx - 2 * bx + ax) + t * (dx - 2 * cx + bx));
+        const q2y = 6 * (s1 * (cy - 2 * by + ay) + t * (dy - 2 * cy + by));
+        const ex = qx - DX[k], ey = qy - DY[k];
+        const den = q1x * q1x + q1y * q1y + ex * q2x + ey * q2y;
+        if (den) { const v = t - (ex * q1x + ey * q1y) / den; if (v > 0 && v < 1) U[k] = v; }
+      }
+    }
+    return best <= tol;
+  };
+
+  let d = "M" + fix2(p[0]) + " " + fix2(p[1]) + " ";
+  const emit = (e, b1x, b1y, b2x, b2y) => {
+    d += "C" + fix2(b1x) + " " + fix2(b1y) + " " + fix2(b2x) + " " + fix2(b2y) + " "
+       + fix2(p[2 * e]) + " " + fix2(p[2 * e + 1]) + " ";
+  };
+  let s = 0, left = n;
+  while (left > 0) {
+    // gallop out, then bisect back, for the longest run of spans one cubic holds
+    let ok = 1, bad = 0, c1 = null;
+    for (let L = 2; L <= left; L = Math.min(left, L * 2)) {
+      if (fit(s, L)) { ok = L; c1 = out.slice(); if (L === left) break; } else { bad = L; break; }
+    }
+    if (bad) {
+      while (bad - ok > 1) {
+        const mid = (ok + bad) >> 1;
+        if (fit(s, mid)) { ok = mid; c1 = out.slice(); } else bad = mid;
+      }
+    }
+    const e = (s + ok) % n;
+    if (ok === 1) emit(e, C1[2 * s], C1[2 * s + 1], C2[2 * s], C2[2 * s + 1]);
+    else emit(e, c1[0], c1[1], c1[2], c1[3]);
+    s = e; left -= ok;
+  }
+  return d + "Z ";
+}
+
 // straight segments through a flat ring, one decimal — the sharp (smoothing 0)
 // and degenerate-ring fallback the tracers share
 function ringToPolyline(p) {
@@ -1161,7 +1298,9 @@ const CREST_OVERLAP = 1;
 // coordinates (the raster is BW×BH, the viewBox VB_W×VB_H). `off` shifts
 // contour coordinates back from a padded raster (a one-pixel replicated border
 // lets a region's edge cross the frame instead of stopping half a pixel inside).
-function contourToScreenPath(multi, BW, BH, iters, off = 0) {
+// `fitTol` > 0 writes each ring through ringToFitBezier at that tolerance
+// instead of one cubic per point (the paper stack's sheets).
+function contourToScreenPath(multi, BW, BH, iters, off = 0, fitTol = 0) {
   const kx = VB_W / BW, ky = VB_H / BH;
   let d = "";
   for (const poly of multi.coordinates) {
@@ -1174,7 +1313,7 @@ function contourToScreenPath(multi, BW, BH, iters, off = 0) {
       }
       ring = iters ? chaikin(ring, iters) : ring;
       const simp = simplifyRing(ring, 0.6);
-      if (simp.length >= 6) { d += ringToBezier(simp); continue; }
+      if (simp.length >= 6) { d += fitTol ? ringToFitBezier(simp, fitTol) : ringToBezier(simp); continue; }
       d += ringToPolyline(ring);
     }
   }
@@ -1199,9 +1338,11 @@ function cr4(a, b, c, d, t) {
 // sampled on the FRAME rather than on the ground plane, with everything
 // outside the viewport absent instead of merely clipped later.
 // `gapVB` > 0 also traces the crest gaps (see crestGapField), as a width in
-// viewBox units.
-function rasterizeSurface(S, fit, gN, BW, lift = true, gapVB = 0) {
-  const BH = Math.max(2, Math.round(BW * VB_H / VB_W));
+// viewBox units. `BHo` pins the height instead of deriving it from BW — a
+// supersampled copy of a raster has to be exactly K times its height, not
+// whatever rounding the wider width happens to give.
+function rasterizeSurface(S, fit, gN, BW, lift = true, gapVB = 0, BHo = 0) {
+  const BH = BHo || Math.max(2, Math.round(BW * VB_H / VB_W));
   const stride = gN + 1, NV = stride * stride, NP = BW * BH;
   const GX = new Float64Array(NV), GY = new Float64Array(NV), GZ = new Float64Array(NV);
   const SX = new Float64Array(NV), SY = new Float64Array(NV), QW = new Float64Array(NV);
@@ -3580,6 +3721,29 @@ const PAPER_MIN_FEATURE = 2.6e-4;
 // planning millions of pixels for cut lines nobody can cut that finely.
 const PAPER_MAX_BW = 560;
 
+// How far a sheet's cut line may stray from the traced curve, in viewBox units,
+// so it can be written in a fraction of the segments (see ringToFitBezier). A
+// raster pixel at the cap above is 1.36 units, so this is a twenty-fifth of
+// one. Looked at on the saved grazing scene, 24x into the far field: at 0.12
+// the fit visibly rounds the corners of the traced steps and lays a slow
+// wobble along their flat runs; here it takes a side-by-side to tell them
+// apart, for about half again as many segments — still a sixth of the old.
+const PAPER_FIT_TOL = 0.05;
+
+// How finely a sheet's cut line is placed, as a supersampling factor on the
+// raster the stack is planned on. The plan has to be made on whole pixels —
+// every pixel one paper, regions grown pixel by pixel — and a cut line traced
+// from that grid can only run along pixel edges: a gently sloping crest in the
+// far field comes out as a flight of one-pixel stairs, faithfully reproduced
+// however well the curve is fitted afterwards. So the plan stays on the grid
+// and only the CUT LINE is traced from a picture K times finer, as the share
+// of each planning pixel that lies on the paper side (see buildPaperStack).
+// Odd, so a pixel's subsamples sit symmetrically about its own sample point.
+// Measured on a band edge a few degrees off level: 3 takes the cut line's
+// median wobble to a sixth of the whole-pixel trace's; 5 buys a little more
+// for twice the export time.
+const PAPER_FINE = 3;
+
 // How many colors of paper the stack may call for. Screen colors are free and
 // paper colors are not: a smooth gradient — which is what a preset palette
 // becomes the moment a reflected object forces the panorama path, and what any
@@ -3682,8 +3846,10 @@ function buildPaperImage(S, fit, opts) {
           uvAt, rayAt, backdrop,           // painted panorama: reflected u,v
           gap = 0, gapColor,               // crest gaps, as in the SVG
           polish = 0,                      // the scene's antialiasing, as in the SVG
+          fine = 0,                        // also sample a K× copy (PAPER_FINE)
+          BH = 0,
           fresAt, fresBands, deepMix } = opts;
-  const R = rasterizeSurface(S, fit, gN, BW, lift, gap);
+  const R = rasterizeSurface(S, fit, gN, BW, lift, gap, BH);
   const { NP, cov } = R;
   // Antialiasing, on the fields a pixel's color is read from rather than on the
   // colors themselves — the same place and the same operator the contour path
@@ -3708,9 +3874,78 @@ function buildPaperImage(S, fit, opts) {
   const coh = coherencePasses(S, gN);
   const cbuf = coh ? new Float64Array(R.stride * R.stride) : null;
   let colorOf;
-  if (uvAt) {
-    // one sampler per flat, near to far: the first one this point actually
-    // reaches is the colour it reflects
+  if (uvAt && !backdrop.overflow) {
+    // A painted backdrop is drawn as a stack of regions, each the zero set of
+    // its own signed distance field read bilinearly off the flat's cells —
+    // furthest flat first, and within a flat in region order, each painted
+    // over the last (buildSurface3DPanorama). A pixel's colour is whatever is
+    // on top there: the last region, of the nearest flat, whose field is
+    // positive at it. Same taps, same fields, same board edge, same polish as
+    // that builder, so the sheets are cut where the render draws its edges —
+    // not on the cell grid, which would cut every painted shape as a stack
+    // of blocks the size of the brush.
+    const nv = R.GX.length;
+    const win = new Array(NP).fill(null);
+    const fld = new Float32Array(NP);
+    for (const g of backdrop.groups || [backdrop]) {
+      const su = new Float64Array(nv), sv = new Float64Array(nv);
+      const sh = new Float64Array(nv), se = new Float64Array(nv);
+      const plane = g.place && g.place.kind === "plane";
+      for (let q = 0; q < nv; q++) {
+        if (!plane) {
+          const uv = uvAt(R.GX[q], R.GY[q]); su[q] = uv[0]; sv[q] = uv[1]; sh[q] = 1;
+          continue;
+        }
+        const uv = g.place.hit(R.GX[q], R.GY[q], R.GZ[q], rayAt(R.GX[q], R.GY[q]));
+        if (uv) {
+          su[q] = uv[0] * g.EW; sv[q] = uv[1] * g.EH;
+          se[q] = g.place.edge(uv[0], uv[1]) * Math.min(g.EW, g.EH);
+          sh[q] = 1;
+        } else { se[q] = OFF_FLAT; }
+      }
+      meshBlur(R, su, coh, cbuf); meshBlur(R, sv, coh, cbuf);
+      if (plane) meshBlur(R, se, coh, cbuf);
+      const fu = rasterField(R, su), fv = rasterField(R, sv);
+      const fh = plane ? rasterField(R, sh) : null;
+      const fe = plane ? rasterField(R, se) : null;
+      const tap = new Int32Array(NP), tx = new Float32Array(NP), ty = new Float32Array(NP);
+      const on = new Uint8Array(NP);
+      for (let p = 0; p < NP; p++) {
+        if (!cov[p]) continue;
+        if (fh && fh[p] < 0.5) continue;        // this board is not there
+        let x = fu[p] - 0.5; x = x < 0 ? 0 : x > g.EW - 1 ? g.EW - 1 : x;
+        let y = fv[p] - 0.5; y = y < 0 ? 0 : y > g.EH - 1 ? g.EH - 1 : y;
+        const i0 = Math.min(g.EW - 2, Math.floor(x)), j0 = Math.min(g.EH - 2, Math.floor(y));
+        tap[p] = j0 * g.EW + i0; tx[p] = x - i0; ty[p] = y - j0; on[p] = 1;
+      }
+      // regions may be handed over in any order: keep the highest one that
+      // covers each pixel, then let this flat paint over the ones behind it
+      const top = new Int32Array(NP).fill(-1);
+      const EW = g.EW;
+      g.eachField((k, D) => {
+        for (let p = 0; p < NP; p++) {
+          if (!on[p]) { fld[p] = 0; continue; }
+          const q = tap[p], fx = tx[p], fy = ty[p];
+          fld[p] = (D[q] * (1 - fx) + D[q + 1] * fx) * (1 - fy)
+                 + (D[q + EW] * (1 - fx) + D[q + EW + 1] * fx) * fy;
+        }
+        if (polish) smoothField(fld, cov, R.BW, R.BH, polish, paperScratch);
+        for (let p = 0; p < NP; p++) {
+          if (!on[p] || k <= top[p]) continue;
+          let d = fld[p];
+          if (fe && fe[p] < d) d = fe[p];       // the board's own edge
+          if (d > 0) top[p] = k;
+        }
+      });
+      for (let p = 0; p < NP; p++) if (top[p] >= 0) win[p] = g.colorAt(top[p]);
+    }
+    const under = backdrop.colorAt(0);
+    colorOf = (p) => win[p] || under;
+  } else if (uvAt) {
+    // Too many regions for the field path (backdrop.overflow), which the
+    // render then also leaves for its per-cell fallback: one sampler per
+    // flat, near to far, and the first one this point actually reaches is
+    // the colour it reflects
     const nv = R.GX.length;
     const samplers = (backdrop.groups || [backdrop]).map((g) => {
       const su = new Float64Array(nv), sv = new Float64Array(nv), sh = new Float64Array(nv);
@@ -3734,7 +3969,12 @@ function buildPaperImage(S, fit, opts) {
         if (fh && fh[p] < 0.5) continue;
         const u = fu[p] < 0 ? 0 : fu[p] > g.EW - 1 ? g.EW - 1 : fu[p] | 0;
         const v = fv[p] < 0 ? 0 : fv[p] > g.EH - 1 ? g.EH - 1 : fv[p] | 0;
-        return g.cells[v * g.EW + u];
+        // a board's unpainted cells are null — the flat behind shows through
+        // there, exactly as the render draws it. Taken as a colour, the null
+        // became a paper of its own, and posterizing then folded it into
+        // whatever real colour it landed nearest
+        const c = g.cells[v * g.EW + u];
+        if (c != null) return c;
       }
       return backdrop.bg;
     };
@@ -3784,7 +4024,22 @@ function buildPaperImage(S, fit, opts) {
   // posterize to a buyable number of papers (see PAPER_MAX_COLORS)
   const q = maxColors ? reducePaperPalette(palette, counts, maxColors, bgId) : null;
   if (q) for (let p = 0; p < NP; p++) grid[p] = q.map(grid[p]);
-  return { W: R.BW, H: R.BH, grid, palette };
+  const image = { W: R.BW, H: R.BH, grid, palette };
+  if (fine > 1) {
+    // The same picture K times finer, for placing cut lines (PAPER_FINE). It is
+    // read through THIS image's posterizing, so a fine pixel names one of the
+    // papers the plan knows; a shade only the fine raster happens to catch
+    // names none, and simply goes with the planning pixel it falls in. The
+    // polish is in raster pixels, and a pass's reach goes with the square
+    // root of the count, so K² times the passes is the same blur on the page.
+    const hi = buildPaperImage(S, fit, { ...opts, fine: 0, maxColors: 0,
+      BW: R.BW * fine, BH: R.BH * fine, polish: polish * fine * fine });
+    const post = new Map();
+    for (let i = 0; i < palette.length; i++) post.set(palette[i], palette[q ? q.map(i) : i]);
+    image.fine = { K: fine, W: hi.W, H: hi.H, grid: hi.grid,
+      palette: hi.palette.map((c) => post.get(c) || c) };
+  }
+  return image;
 }
 
 // full pipeline: color image (+ palette id->hex) -> ordered sheets with paths.
@@ -3827,6 +4082,42 @@ function buildPaperStack(image, bgColor, opts = {}) {
 
   const { sheets, method } = planCollapse(regions, adj, frameId);
 
+  // Fine raster (see PAPER_FINE): which planned region each fine pixel belongs
+  // to. A fine pixel the color of its own planning pixel's region is that
+  // region; one the color of a NEIGHBOURING pixel's region is that one — this
+  // is how an edge gets to sit part way through a planning pixel — and one the
+  // color of neither (a sliver the denoise merged away, a shade the plan never
+  // saw) goes with its planning pixel, exactly as the plan decided.
+  const fine = image.fine;
+  let K = 0, fineRegion = null;
+  if (fine) {
+    K = fine.K;
+    const FW = fine.W, FH = fine.H, h = K >> 1;
+    const fineVal = fine.palette.map((c) => { const v = hexId.get(c); return v === undefined ? -1 : v; });
+    fineRegion = new Int32Array(FW * FH);
+    for (let fy = 0; fy < FH; fy++) {
+      const y = Math.min(H - 1, ((fy + h) / K) | 0);
+      for (let fx = 0; fx < FW; fx++) {
+        const x = Math.min(W - 1, ((fx + h) / K) | 0), p = y * W + x;
+        const v = fineVal[fine.grid[fy * FW + fx]];
+        let r = label[p];
+        if (v >= 0 && regions[r].value !== v) {
+          // nearest neighbouring planning pixel whose region is this color
+          let bd = Infinity;
+          for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+            const nx = x + dx, ny = y + dy;
+            if ((!dx && !dy) || nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+            const q = label[ny * W + nx];
+            if (regions[q].value !== v) continue;
+            const d = (fx - nx * K) ** 2 + (fy - ny * K) ** 2;
+            if (d < bd) { bd = d; r = q; }
+          }
+        }
+        fineRegion[fy * FW + fx] = r;
+      }
+    }
+  }
+
   // per sheet, contour the HOLE = everything not yet absorbed (the inverse of
   // the cumulative union). The cut line is then the boundary between this
   // sheet's paper and the sheets below; it only touches the water's outline
@@ -3849,31 +4140,60 @@ function buildPaperStack(image, bgColor, opts = {}) {
   // physical guard: the sheet is one piece only because every paper component
   // reaches the frame border (= the mount margin). True for the planner's mask
   // by construction; the blur must not pinch a thin bridge and break it.
-  const paperHoldsTogether = () => {
+  // the pieces of paper that do NOT reach the border, each a list of pixels;
+  // `first` stops at the first one, for a yes/no answer
+  const paperIslands = (first) => {
     const seen = new Uint8Array(N);
-    const st = [];
+    const st = [], islands = [];
     for (let s = 0; s < N; s++) {
       if (F[s] >= 0 || seen[s]) continue;
       let touchesBorder = false;
+      const comp = [];
       seen[s] = 1; st.push(s);
       while (st.length) {
         const p = st.pop(), x = p % W, y = (p / W) | 0;
+        comp.push(p);
         if (x === 0 || x === W - 1 || y === 0 || y === H - 1) touchesBorder = true;
         if (x > 0 && F[p - 1] < 0 && !seen[p - 1]) { seen[p - 1] = 1; st.push(p - 1); }
         if (x < W - 1 && F[p + 1] < 0 && !seen[p + 1]) { seen[p + 1] = 1; st.push(p + 1); }
         if (y > 0 && F[p - W] < 0 && !seen[p - W]) { seen[p - W] = 1; st.push(p - W); }
         if (y < H - 1 && F[p + W] < 0 && !seen[p + W]) { seen[p + W] = 1; st.push(p + W); }
       }
-      if (!touchesBorder) return false;
+      if (!touchesBorder) { islands.push(comp); if (first) break; }
     }
-    return true;
+    return islands;
+  };
+  const paperHoldsTogether = () => paperIslands(true).length === 0;
+  // Coverage draws the cut where the picture's edge really is, which is not
+  // always where the plan's whole pixels put it — and now and then, in a busy
+  // frame, that cuts through a bridge of paper one pixel wide or leaves a
+  // scrap of paper standing in a hole. Either is a sheet that falls apart.
+  // Mend those spots and only those, from the plan's own answer: a scrap the
+  // plan made hole goes back to hole, and pixels the plan made paper are put
+  // back next to a piece that has come loose, a ring at a time, until it
+  // reaches the rest again. Everywhere else the coverage cut stands.
+  const mendPaper = () => {
+    for (let it = 0; it < 16; it++) {
+      const islands = paperIslands(false);
+      if (!islands.length) return true;
+      for (const comp of islands) for (const p of comp) {
+        if (!cum[p]) { F[p] = 0.25; continue; }
+        const x = p % W;
+        for (const q of [x > 0 ? p - 1 : -1, x < W - 1 ? p + 1 : -1, p - W, p + W]) {
+          if (q >= 0 && q < N && cum[q] && F[q] >= 0) F[q] = -0.25;
+        }
+      }
+    }
+    return paperHoldsTogether();
   };
   let cumCount = 0;
   const out = [];
+  const absorbed = new Uint8Array(regions.length);
   for (let si = 0; si < sheets.length; si++) {
     const sh = sheets[si];
     for (const id of sh.members) {
       const r = regions[id];
+      absorbed[id] = 1;
       for (const p of r.cells) if (!cum[p]) { cum[p] = 1; cumCount++; }
     }
     // nothing of this sheet survives the cut — zoomed in past the shore, the
@@ -3890,12 +4210,77 @@ function buildPaperStack(image, bgColor, opts = {}) {
         F[p] = Din[p] - Dout[p];                // >0 hole, <0 paper
         if (F[p] > thick) thick = F[p];
       }
-      // skip the blur on hairline holes (it would erase them), and undo it if
-      // it disconnected the paper — sub-pixel interpolation still smooths
+      // Next to the cut, trade the whole-pixel distance for one read off the
+      // fine raster. A pixel the cut passes through has some share c of its
+      // K×K subsamples on the paper side, and a straight edge crossing it sits
+      // 0.5 - c pixels from its centre; its whole neighbours are that, one
+      // pixel further on. It has to be a DISTANCE: marching squares places the
+      // crossing by straight interpolation between pixel centres, which only
+      // puts it on the edge if the field is linear across it — the coverage
+      // itself is not, and leaves a ripple at the pixel pitch. Everything here
+      // is in pixels, hole positive, so the whole-pixel field (which crosses
+      // midway between centres a whole pixel apart) is rescaled to match.
+      if (fine) {
+        for (let p = 0; p < N; p++) F[p] = F[p] > 0 ? F[p] - 0.5 : F[p] + 0.5;
+        const FW = fine.W, h = K >> 1, kk = K * K;
+        const c = new Float32Array(N).fill(-1);    // paper share, near the cut only
+        for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+          const p = y * W + x;
+          if (F[p] > 1 || F[p] < -1) continue;
+          let paper = 0;
+          for (let j = 0; j < K; j++) {
+            const row = y * K - h + j;
+            const fy = row < 0 ? 0 : row >= fine.H ? fine.H - 1 : row;
+            for (let i = 0; i < K; i++) {
+              const col = x * K - h + i;
+              const fx = col < 0 ? 0 : col >= FW ? FW - 1 : col;
+              paper += absorbed[fineRegion[fy * FW + fx]];
+            }
+          }
+          c[p] = paper / kk;
+        }
+        for (let p = 0; p < N; p++) if (c[p] > 0 && c[p] < 1) F[p] = 0.5 - c[p];
+        for (let p = 0; p < N; p++) {
+          if (c[p] !== 0 && c[p] !== 1) continue;
+          const x = p % W, hole = c[p] === 0;
+          let best = hole ? Infinity : -Infinity;
+          for (const q of [x > 0 ? p - 1 : -1, x < W - 1 ? p + 1 : -1, p - W, p + W]) {
+            if (q < 0 || q >= N || c[q] < 0) continue;
+            const v = c[q] > 0 && c[q] < 1 ? (hole ? F[q] + 1 : F[q] - 1)
+              : c[q] !== c[p] ? (hole ? 0.5 : -0.5) : best;
+            best = hole ? Math.min(best, v) : Math.max(best, v);
+          }
+          if (best !== Infinity && best !== -Infinity) {
+            // never across the cut: a whole pixel stays on its own side
+            F[p] = hole ? Math.max(best, 0.05) : Math.min(best, -0.05);
+          }
+        }
+      }
+      // Blur to round off what is left of the grid — whole-pixel stairs, or
+      // the coverage's ninths — skipped on hairline holes (it would erase
+      // them), and undone if it disconnected the paper. With the fine raster
+      // the blur is also held off any pixel it would carry clearly across the
+      // cut: that only happens on a hole or a bridge a couple of pixels wide,
+      // which coverage has already placed and the blur would simply erase.
       if (thick >= 2) {
+        const pre = fine ? F.slice() : null;
         blurField(F, W, H, tmp, 1);
-        if (!paperHoldsTogether()) {
+        if (pre) {
+          for (let p = 0; p < N; p++) {
+            if ((pre[p] > 0.1 && F[p] <= 0) || (pre[p] < -0.1 && F[p] >= 0)) F[p] = pre[p];
+          }
+        }
+        if (!pre && !paperHoldsTogether()) {
           for (let p = 0; p < N; p++) F[p] = Din[p] - Dout[p];
+        }
+      }
+      // and if the mending cannot hold the sheet together, the whole-pixel
+      // cut is the one the plan guarantees: back to that, blur and all
+      if (fine && !mendPaper()) {
+        for (let p = 0; p < N; p++) F[p] = Din[p] - Dout[p];
+        if (thick >= 2) {
+          blurField(F, W, H, tmp, 1);
+          if (!paperHoldsTogether()) for (let p = 0; p < N; p++) F[p] = Din[p] - Dout[p];
         }
       }
       for (let j = 0; j < py; j++) {
@@ -3906,7 +4291,7 @@ function buildPaperStack(image, bgColor, opts = {}) {
         }
       }
       const cont = d3.contours().size([px, py]).thresholds([0])(FP)[0];
-      if (cont) d = contourToScreenPath(cont, W, H, iters, -1);
+      if (cont) d = contourToScreenPath(cont, W, H, iters, -1, opts.fitTol ?? PAPER_FIT_TOL);
     }
     out.push({ color: sh.color, d, frame: !!sh.frame, solid });
   }
@@ -3942,10 +4327,11 @@ function buildPaperStackSvg(stack, rollTf) {
     // full-sheet paper — this is the whole physical sheet, mount margin and all,
     // in one color; the water<->background edge is NOT drawn here
     body += `<rect x="${cx}" y="${cy}" width="${tileW}" height="${tileH}" fill="${sh.color}"/>`;
-    // holes: paper removed to reveal the sheets below (hatched + dashed cut line)
-    if (sh.d) body += `<path transform="${tf}" d="${sh.d}" fill="url(#cuthatch)" fill-rule="evenodd"/>`
-      + `<path transform="${tf}" d="${sh.d}" fill="none" fill-rule="evenodd" stroke="#0b0f14"`
-      + ` stroke-width="1" stroke-dasharray="4 2"/>`;
+    // holes: paper removed to reveal the sheets below (hatched + dashed cut
+    // line). One element paints both — the outline is most of the file, and
+    // writing it twice is what doubled it
+    if (sh.d) body += `<path transform="${tf}" d="${sh.d}" fill="url(#cuthatch)" fill-rule="evenodd"`
+      + ` stroke="#0b0f14" stroke-width="1" stroke-dasharray="4 2"/>`;
     body += `</g>`;
     body += `<rect x="${cx}" y="${cy}" width="${tileW}" height="${tileH}" fill="none"`
       + ` stroke="#000" stroke-opacity="0.35" stroke-width="1"/>`;
@@ -3960,9 +4346,31 @@ function buildPaperStackSvg(stack, rollTf) {
     + `<rect width="${W}" height="${H}" fill="#0b0f14"/>${defs}${body}</svg>`;
 }
 
+// One sheet on its own, at the frame's own size: the paper as a single shape,
+// its color with the holes taken out of it, which is the thing a cutter or an
+// editor wants. The tiled file carries every sheet at once, and a busy scene
+// makes that more than an editor like Figma will open; a sheet is a fraction
+// of it. The paper is drawn as a rectangle well past the frame, so the roll
+// transform can turn it without uncovering a corner, then clipped to the frame
+// — the holes overshoot the frame edge by a raster pixel, and the clip is what
+// makes that the sheet's own edge.
+function buildPaperSheetSvg(stack, i, rollTf) {
+  const sh = stack.sheets[i], N = stack.sheets.length;
+  const role = sh.frame ? "background mount" : sh.solid ? "solid backing" : "sheet";
+  const tf = rollTf ? ` transform="${rollTf}"` : "";
+  const paper = `M${-VB_W} ${-VB_H}H${2 * VB_W}V${2 * VB_H}H${-VB_W}Z `;
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${VB_W} ${VB_H}"`
+    + ` width="${VB_W}" height="${VB_H}">`
+    + `<title>Paper sheet ${i + 1} of ${N} (top → bottom) · ${role} · ${sh.color}</title>`
+    + `<defs><clipPath id="sheet-frame"><rect width="${VB_W}" height="${VB_H}"/></clipPath></defs>`
+    + `<g clip-path="url(#sheet-frame)"><path${tf} d="${paper}${sh.d}" fill="${sh.color}"`
+    + ` fill-rule="evenodd"/></g></svg>`;
+}
+
 // exported for tests: the two halves of the layered-paper export
 export {
-  buildPaperImage, buildPaperStack, buildPaperStackSvg, PAPER_MAX_BW, PAPER_MAX_COLORS,
+  buildPaperImage, buildPaperStack, buildPaperStackSvg, buildPaperSheetSvg,
+  PAPER_MAX_BW, PAPER_MAX_COLORS, PAPER_FIT_TOL, PAPER_FINE,
 };
 
 // ---- UI bits -------------------------------------------------------
@@ -4008,7 +4416,7 @@ const WORKSPACES = [
   { id: "output", name: "Output", icon: "⇲", find: [
     "export svg", "export detail / mesh / edge polish", "export png & size",
     "export mp4 (video length, video size)", "perfect loop", "loop length (phase)",
-    "layered paper stack", "sample grid", "3d surface detail (raster)",
+    "layered paper stack", "paper sheets one at a time (smaller files)", "sample grid", "3d surface detail (raster)",
     "low power mode"] },
 ];
 
@@ -6291,15 +6699,22 @@ export default function App() {
       lift: surface3d && perspective,      // the render's own 3D-solid rule
       polish: polish.paper,                // and its antialiasing
       gap: solid3d ? crestGap : 0, gapColor: crestGapColor,
-      bgColor: bgFill, fresBands, deepMix: mixDeep,
+      bgColor: bgFill, fresBands, deepMix: mixDeep, fine: PAPER_FINE,
       ...fieldSpec,
     });
     const stack = buildPaperStack(image, bgFill, { iters: S.smooth || 0 });
     const svg = buildPaperStackSvg(stack, rollTf);
     saveSvg(svg, "reflection-paper-stack.svg");
     setSvgName("reflection-paper-stack.svg");
-    setStackInfo({ nSheets: stack.nSheets, method: stack.method });
+    setStackInfo({ nSheets: stack.nSheets, method: stack.method, stack, rollTf });
     setSvgOut(svg);
+  };
+  const saveSheet = (i) => {
+    const { stack, rollTf: tf } = stackInfo;
+    const n = String(stack.nSheets).length;
+    const num = (k) => String(k).padStart(n, "0");
+    saveSvg(buildPaperSheetSvg(stack, i, tf),
+      `reflection-paper-sheet-${num(i + 1)}-of-${num(stack.nSheets)}.svg`);
   };
   const copySvg = () => {
     if (svgOut && navigator.clipboard) {
@@ -7768,6 +8183,21 @@ export default function App() {
                         : " — greedy order (scene too complex for exact search)"}
                       · top → bottom. Hatched = holes to cut.
                       Cut each sheet from paper of its labeled color, then assemble bottom → top.
+                    </div>
+                    <div style={{ fontSize: 10.5, color: "#8a9bab", marginBottom: 6 }}>
+                      One sheet per file, for editors that will not open the whole stack:
+                    </div>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10 }}>
+                      {stackInfo.stack.sheets.map((sh, i) => (
+                        <button key={i} onClick={() => saveSheet(i)}
+                          title={`Download sheet ${i + 1} (${sh.color}) on its own`}
+                          style={{ ...miniBtn, flex: "none", padding: "5px 8px",
+                            display: "flex", alignItems: "center", gap: 5 }}>
+                          <span style={{ width: 10, height: 10, borderRadius: 2, background: sh.color,
+                            border: "1px solid #3a4652" }} />
+                          {i + 1} ↓
+                        </button>
+                      ))}
                     </div>
                   </>
                 )}

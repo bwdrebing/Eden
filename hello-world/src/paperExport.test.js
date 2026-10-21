@@ -1,6 +1,6 @@
 import {
-  buildPaperImage, buildPaperStack, buildPaperStackSvg, buildSurface3D, computeFit,
-  DEFAULT_EMITTERS, PAPER_MAX_COLORS,
+  buildPaperImage, buildPaperStack, buildPaperStackSvg, buildPaperSheetSvg, buildSurface3D,
+  computeFit, DEFAULT_EMITTERS, PAPER_MAX_COLORS, PAPER_FIT_TOL, PAPER_FINE,
 } from "./WaterReflectionContours";
 
 /* ------------------------------------------------------------------ *
@@ -291,4 +291,211 @@ test("a crest gap is cut through the sheets, the hole the SVG paints", () => {
   const tinted = buildPaperImage(S, fit, { ...opts, gap: 4, gapColor: "#ff2d78" });
   expect(tinted.palette).toContain("#ff2d78");
   expect(count(tinted, "#ff2d78")).toBeGreaterThan(0);
+});
+
+// the cubics of a path, sampled every `step` viewBox units, one array per ring
+const sampleRings = (d, step) => {
+  const tok = d.match(/[MCLZ]|-?\d+(?:\.\d+)?/g) || [];
+  const rings = [];
+  let r = null, x = 0, y = 0;
+  for (let i = 0; i < tok.length;) {
+    const c = tok[i++];
+    if (c === "M") { x = +tok[i++]; y = +tok[i++]; r = [[x, y]]; rings.push(r); }
+    else if (c === "L") { x = +tok[i++]; y = +tok[i++]; r.push([x, y]); }
+    else if (c === "C") {
+      const [ax, ay, bx, by, ex, ey] = tok.slice(i, i + 6).map(Number); i += 6;
+      const len = Math.hypot(ax - x, ay - y) + Math.hypot(bx - ax, by - ay) + Math.hypot(ex - bx, ey - by);
+      const n = Math.max(2, Math.ceil(len / step));
+      for (let k = 1; k <= n; k++) {
+        const t = k / n, u = 1 - t;
+        r.push([u * u * u * x + 3 * u * u * t * ax + 3 * u * t * t * bx + t * t * t * ex,
+                u * u * u * y + 3 * u * u * t * ay + 3 * u * t * t * by + t * t * t * ey]);
+      }
+      x = ex; y = ey;
+    }
+  }
+  return rings;
+};
+const cubics = (d) => (d.match(/C/g) || []).length;
+
+test("a sheet's cut line is fitted in far fewer cubics, without moving it", () => {
+  // The trace writes a cubic per traced point, about two per raster pixel of
+  // outline, and every sheet re-cuts the outlines of the sheets above it — on
+  // a busy scene that is a file an editor will not open. The fitted cut line
+  // has to be the same line: checked here against the unfitted one, densely,
+  // both ways round.
+  const S = withSwell(baseS());
+  const img = () => buildPaperImage(S, computeFit(S), {
+    ...RASTER, lift: true, bgColor: "#ffffff",
+    scalarAt: (gx, gy) => gx + 3 * Math.sin(gy * 0.4), thresholds: [-10, -3, 4, 11], cols: greys(5),
+  });
+  const raw = buildPaperStack(img(), "#ffffff", { iters: 3, fitTol: 0 });
+  const fit = buildPaperStack(img(), "#ffffff", { iters: 3 });
+  expect(fit.sheets.map((s) => s.color)).toEqual(raw.sheets.map((s) => s.color));
+
+  const total = (st) => st.sheets.reduce((n, s) => n + cubics(s.d), 0);
+  expect(total(raw)).toBeGreaterThan(2000);
+  expect(total(fit)).toBeLessThan(total(raw) / 3);
+
+  // distance from every sample of one line to the polyline of the other
+  const segDist = (x, y, p, q) => {
+    const dx = q[0] - p[0], dy = q[1] - p[1], l = dx * dx + dy * dy;
+    let t = l ? ((x - p[0]) * dx + (y - p[1]) * dy) / l : 0;
+    t = t < 0 ? 0 : t > 1 ? 1 : t;
+    return Math.hypot(p[0] + t * dx - x, p[1] + t * dy - y);
+  };
+  const worstGap = (fromD, toD) => {
+    const to = sampleRings(toD, 0.1), cell = new Map(), key = (x, y) => `${Math.floor(x)},${Math.floor(y)}`;
+    for (const r of to) for (let i = 0; i + 1 < r.length; i++) {
+      const k = key(r[i][0], r[i][1]);
+      const a = cell.get(k); if (a) a.push([r[i], r[i + 1]]); else cell.set(k, [[r[i], r[i + 1]]]);
+    }
+    let worst = 0;
+    for (const r of sampleRings(fromD, 0.25)) for (const [x, y] of r) {
+      let best = Infinity;
+      for (let j = -1; j <= 1; j++) for (let i = -1; i <= 1; i++) {
+        for (const [p, q] of cell.get(key(x + i, y + j)) || []) best = Math.min(best, segDist(x, y, p, q));
+      }
+      worst = Math.max(worst, best);
+    }
+    return worst;
+  };
+  for (let i = 0; i < raw.sheets.length; i++) {
+    if (!raw.sheets[i].d) continue;
+    // the fit checks the curve at two samples a span; between them it can lean
+    // out a little further, and both are rounded to hundredths
+    expect(worstGap(raw.sheets[i].d, fit.sheets[i].d)).toBeLessThan(PAPER_FIT_TOL * 1.5);
+    expect(worstGap(fit.sheets[i].d, raw.sheets[i].d)).toBeLessThan(PAPER_FIT_TOL * 1.5);
+  }
+});
+
+test("a round hole is cut in a fraction of the cubics", () => {
+  // the case that makes the point: a disk traced at a raster's resolution is
+  // a cubic per traced point, a thousand of them. Fitted, it is not the four a
+  // true circle needs — the trace carries the raster's sub-pixel wobble, and
+  // at this tolerance the fit keeps it rather than smooth it away — but it is
+  // a tenth of the count
+  const W = 220, H = 145, grid = new Int32Array(W * H);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    grid[y * W + x] = Math.hypot(x - 110, y - 72) < 40 ? 1 : 0;
+  }
+  const image = () => ({ W, H, grid: grid.slice(), palette: ["#ffffff", "#27406b"] });
+  const raw = buildPaperStack(image(), "#ffffff", { iters: 3, fitTol: 0 });
+  const fit = buildPaperStack(image(), "#ffffff", { iters: 3 });
+  const hole = (st) => st.sheets.find((s) => s.d).d;
+  expect(cubics(hole(raw))).toBeGreaterThan(1000);
+  expect(cubics(hole(fit))).toBeLessThan(cubics(hole(raw)) / 8);
+});
+
+test("each sheet can be saved on its own, as one piece of paper", () => {
+  const thresholds = [12, 20, 28];
+  const S = withSwell(baseS());
+  const img = buildPaperImage(S, computeFit(S), {
+    ...RASTER, lift: true, bgColor: "#ffffff",
+    scalarAt: (gx, gy) => gy, thresholds, cols: greys(thresholds.length + 1),
+  });
+  const stack = buildPaperStack(img, "#ffffff", { iters: 3 });
+  const roll = "rotate(6 380 250)";
+  // the tiled file paints each outline once, fill and cut line together
+  const tiled = buildPaperStackSvg(stack, roll);
+  expect((tiled.match(/<path/g) || []).length).toBe(stack.sheets.filter((s) => s.d).length);
+
+  stack.sheets.forEach((sh, i) => {
+    const svg = buildPaperSheetSvg(stack, i, roll);
+    expect(svg).not.toContain("NaN");
+    expect(svg).toContain(`viewBox="0 0 ${VB_W} ${VB_H}"`);
+    // one shape: the paper, in its color, with the sheet's holes in it
+    expect((svg.match(/<path/g) || []).length).toBe(1);
+    expect(svg).toContain(`fill="${sh.color}"`);
+    expect(svg).toContain(sh.d);
+    expect(svg).toContain(`transform="${roll}"`);
+    expect(svg).toContain(`sheet ${i + 1} of ${stack.nSheets}`);
+    // a fraction of the whole stack
+    expect(svg.length).toBeLessThan(tiled.length);
+  });
+});
+
+test("a gently sloping edge is cut as a line, not a flight of pixel stairs", () => {
+  // The plan is made on whole pixels, so a cut traced from it can only run
+  // along pixel edges: an edge a few degrees off level — every distant crest
+  // line — came out as long flats joined by one-pixel risers. The fine raster
+  // places the cut inside the pixel. These bands are lines on a flat plane,
+  // and a line stays a line in perspective, so every wiggle in a cut is
+  // error: measured as how far each point strays from the chord through its
+  // neighbours a few units either side, across every cut in the stack.
+  const S = baseS({ waveScale: 0, surface3d: false });
+  S._ems = [];
+  const thresholds = [20, 30, 40];
+  const shoot = (fine) => {
+    const img = buildPaperImage(S, computeFit(S), {
+      gN: 120, BW: 320, lift: false, bgColor: "#ffffff", fine,
+      scalarAt: (gx, gy) => gy + 0.35 * gx, thresholds, cols: greys(thresholds.length + 1),
+    });
+    return buildPaperStack(img, "#ffffff", { iters: 3 });
+  };
+  const wiggle = (st) => {
+    const k = 8;                                  // samples 0.5 apart: ±4 units
+    const ds = [];
+    for (const sh of st.sheets) for (const r of sampleRings(sh.d, 0.5)) {
+      for (let i = k; i + k < r.length; i++) {
+        const [ax, ay] = r[i - k], [bx, by] = r[i + k], [x, y] = r[i];
+        // the bands' own edges, not the frame they are cut off at
+        if (Math.min(ax, bx) < 20 || Math.max(ax, bx) > VB_W - 20) continue;
+        if (Math.min(ay, by) < 20 || Math.max(ay, by) > VB_H - 20) continue;
+        const l = Math.hypot(bx - ax, by - ay);
+        if (l < 6) continue;                      // a corner, not a run
+        const d = Math.abs((bx - ax) * (ay - y) - (ax - x) * (by - ay)) / l;
+        ds.push(d);
+      }
+    }
+    ds.sort((a, b) => a - b);
+    const at = (q) => ds[Math.floor(q * (ds.length - 1))];
+    return { med: at(0.5), p90: at(0.9), n: ds.length };
+  };
+  const coarse = wiggle(shoot(0)), fine = wiggle(shoot(PAPER_FINE));
+  expect(coarse.n).toBeGreaterThan(1000);
+  expect(fine.n).toBeGreaterThan(1000);
+  // typically a sixth of the wiggle, and a third at the worst tenth
+  expect(fine.med).toBeLessThan(coarse.med / 4);
+  expect(fine.p90).toBeLessThan(coarse.p90 / 2);
+});
+
+test("a board's unpainted cells show the flat behind it, on paper as on screen", () => {
+  // A board is a flat standing at a distance, painted only where it was
+  // painted: its other cells are null, and the render draws whatever is behind
+  // there. The paper image used to take the null as a colour of its own, which
+  // posterizing then folded into one of the board's real colours — so a scene
+  // of an orange board in front of a green treeline and a blue sky came out as
+  // a stack of nothing but orange.
+  const { compileBackdrop } = require("./backdrop/compile");
+  const { backdropDoc, flat, rasterContent, DOC_W, DOC_H } = require("./backdrop/document");
+  const { envFromRows, fieldSpecFor, buildSurface3DPanorama } =
+    require("./WaterReflectionContours");
+  const solid = (color) => envFromRows(() => color, DOC_W, DOC_H);
+  // the board: painted on its left half only
+  const half = solid("#e98b3a");
+  for (let r = 0; r < DOC_H; r++) for (let c = DOC_W / 2; c < DOC_W; c++) half.cells[r * DOC_W + c] = null;
+  const doc = backdropDoc([
+    flat(rasterContent(solid("#6a96c8")), "Sky"),
+    { ...flat(rasterContent(half), "Board"),
+      place: { kind: "plane", distance: 14, width: 60, height: 14 } },
+  ], DOC_W, DOC_H);
+
+  const S = withSwell(baseS());
+  const fit = computeFit(S);
+  const spec = fieldSpecFor(S, { use2d: true, doc, azSpan: 45 });
+  expect(compileBackdrop(doc).groups.length).toBe(2);
+  const img = buildPaperImage(S, fit, { ...RASTER, lift: true, bgColor: "#ffffff", ...spec });
+
+  const share = new Map();
+  for (const id of img.grid) share.set(img.palette[id], (share.get(img.palette[id]) || 0) + 1);
+  // no paper is cut in "null"…
+  expect(img.palette.every((c) => typeof c === "string")).toBe(true);
+  // …and both the board and the sky through its empty half are in the picture,
+  expect(share.get("#e98b3a")).toBeGreaterThan(500);
+  expect(share.get("#6a96c8")).toBeGreaterThan(500);
+
+  // as they are in the render's own regions
+  const ref = buildSurface3DPanorama(S, fit, { ...spec, ...RASTER });
+  expect(ref.layers.map((l) => l.color)).toEqual(expect.arrayContaining(["#6a96c8", "#e98b3a"]));
 });
