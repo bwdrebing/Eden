@@ -806,6 +806,21 @@ function rollTransform(rollDeg) {
   return `rotate(${rollDeg} ${cx} ${cy}) translate(${(cx * (1 - s)).toFixed(2)} ${(cy * (1 - s)).toFixed(2)}) scale(${s.toFixed(4)})`;
 }
 
+// The same roll as a matrix [a, b, c, d, e, f] (x' = a x + c y + e,
+// y' = b x + d y + f), for geometry that has to carry it in its own
+// coordinates rather than under a transform — the paper sheets, whose cut
+// lines are clipped to the frame AFTER the roll. rotate(c)·translate(c(1-s))·
+// scale(s) reduces to c + s·Rot(p - c).
+function rollMatrix(rollDeg) {
+  if (!rollDeg) return null;
+  const r = (rollDeg * Math.PI) / 180;
+  const ca = Math.abs(Math.cos(r)), sa = Math.abs(Math.sin(r));
+  const s = Math.max((VB_W * ca + VB_H * sa) / VB_W, (VB_W * sa + VB_H * ca) / VB_H);
+  const cos = s * Math.cos(r), sin = s * Math.sin(r);
+  const cx = VB_W / 2, cy = VB_H / 2;
+  return [cos, sin, -sin, cos, cx - cos * cx + sin * cy, cy - sin * cx - cos * cy];
+}
+
 // Chaikin corner-cutting on a closed ring — rounds the marching-squares
 // staircase. Done in grid space, before projection.
 // ---- ring helpers ---------------------------------------------------
@@ -1300,7 +1315,7 @@ const CREST_OVERLAP = 1;
 // lets a region's edge cross the frame instead of stopping half a pixel inside).
 // `fitTol` > 0 writes each ring through ringToFitBezier at that tolerance
 // instead of one cubic per point (the paper stack's sheets).
-function contourToScreenPath(multi, BW, BH, iters, off = 0, fitTol = 0) {
+function contourToScreenPath(multi, BW, BH, iters, off = 0, fitTol = 0, xf = null) {
   const kx = VB_W / BW, ky = VB_H / BH;
   let d = "";
   for (const poly of multi.coordinates) {
@@ -1309,7 +1324,11 @@ function contourToScreenPath(multi, BW, BH, iters, off = 0, fitTol = 0) {
       let ring = new Float64Array(n * 2);
       for (let i = 0; i < n; i++) {
         const p = ring0[i];
-        ring[2 * i] = (p[0] + off) * kx; ring[2 * i + 1] = (p[1] + off) * ky;
+        const x = (p[0] + off) * kx, y = (p[1] + off) * ky;
+        if (xf) {                // a matrix from rollMatrix
+          ring[2 * i] = xf[0] * x + xf[2] * y + xf[4];
+          ring[2 * i + 1] = xf[1] * x + xf[3] * y + xf[5];
+        } else { ring[2 * i] = x; ring[2 * i + 1] = y; }
       }
       ring = iters ? chaikin(ring, iters) : ring;
       const simp = simplifyRing(ring, 0.6);
@@ -2993,14 +3012,17 @@ function exportRaster(level, mult, meshF = 1) {
 
 // How many polish passes each output runs, from the scene's antialiasing and
 // the SVG's own edge-polish step. In one place because these have to agree:
-// the preview is the picture, the PNG, the video frames and the paper stack are
-// that same picture in another medium, and only the SVG adds anything — so an
+// the preview is the picture, the PNG and the video frames are that same
+// picture in another medium, and only the vector outputs add anything — so an
 // output that quietly picked a different number would be a file that does not
-// match what was on screen. `retrace` says whether the SVG's total is more than
-// the preview already ran, which is the only reason to pay for one.
+// match what was on screen. The paper stack is a vector output: its cut lines
+// are outlines a blade follows, crawling exactly where an SVG edge crawls, so
+// it takes the SVG's polish (and, in buildPaperImage, the SVG's mesh step and
+// its detail through paperFine). `retrace` says whether the SVG's total is
+// more than the preview already ran, which is the only reason to pay for one.
 function polishPlan(aaPasses, exportPasses) {
   const svg = aaPasses + exportPasses;
-  return { preview: aaPasses, png: aaPasses, paper: aaPasses, svg,
+  return { preview: aaPasses, png: aaPasses, paper: svg, svg,
            retrace: svg > aaPasses };
 }
 
@@ -3742,7 +3764,20 @@ const PAPER_FIT_TOL = 0.05;
 // Measured on a band edge a few degrees off level: 3 takes the cut line's
 // median wobble to a sixth of the whole-pixel trace's; 5 buys a little more
 // for twice the export time.
+//
+// It is also where the SVG's "export detail" reaches the stack. The planning
+// raster stays capped (PAPER_MAX_BW): a wider plan would only find more
+// specks to merge away. What the step buys is what it buys the SVG — the same
+// outlines placed more finely — and here that is K, one odd step per
+// multiple: as previewed cuts on the plan's whole pixels, the default 2× is
+// this K, and 3× is five subsamples a side. A step whose fine raster would
+// pass the SVG's own width cap comes down to the one below it.
 const PAPER_FINE = 3;
+function paperFine(mult, planBW) {
+  let K = 2 * Math.max(1, Math.round(mult)) - 1;
+  while (K > 1 && planBW * K > EXPORT_MAX_BW) K -= 2;
+  return K > 1 ? K : 0;
+}
 
 // How many colors of paper the stack may call for. Screen colors are free and
 // paper colors are not: a smooth gradient — which is what a preset palette
@@ -4132,6 +4167,34 @@ function buildPaperStack(image, bgColor, opts = {}) {
   // field of the mask instead: the crossing interpolates to sub-pixel
   // positions and the cut edge comes out as smooth as the normal export.
   const px = W + 2, py = H + 2;
+  // The frame, as a field on the padded contour grid: signed distance (in
+  // raster pixels, positive inside) from where each sample lands on screen to
+  // the edge of the frame. The hole field is min()'d with it before
+  // contouring, which is hole ∩ frame — the cut line stops exactly at the
+  // frame edge instead of running past it to be clipped off later. A cutter
+  // takes no clip paths (Cricut's software drops them and cuts the whole
+  // overshoot), so the clip has to be in the geometry. The roll goes in the
+  // same way: the cut lines are written in screen coordinates, already
+  // turned, so the frame they are clipped to is the one in the file.
+  // d3.contours puts sample i at i + 0.5, and the -1 offset below takes the
+  // padding back off, so a sample sits at the centre of its raster pixel.
+  const xf = rollMatrix(opts.roll || 0);
+  const kx = VB_W / W, ky = VB_H / H;
+  const kpx = (xf ? Math.hypot(xf[0], xf[1]) : 1) * (kx + ky) / 2;
+  const frameD = new Float64Array(px * py);
+  for (let j = 0; j < py; j++) {
+    for (let i = 0; i < px; i++) {
+      let x = (i - 0.5) * kx, y = (j - 0.5) * ky;
+      if (xf) {
+        const X = xf[0] * x + xf[2] * y + xf[4];
+        y = xf[1] * x + xf[3] * y + xf[5]; x = X;
+      }
+      const ox = x < 0 ? -x : x > VB_W ? x - VB_W : 0;
+      const oy = y < 0 ? -y : y > VB_H ? y - VB_H : 0;
+      const dd = ox || oy ? -Math.hypot(ox, oy) : Math.min(x, VB_W - x, y, VB_H - y);
+      frameD[j * px + i] = dd / kpx;
+    }
+  }
   const cum = new Uint8Array(N);
   const inv = new Uint8Array(N);
   const F = new Float64Array(N);
@@ -4287,54 +4350,69 @@ function buildPaperStack(image, bgColor, opts = {}) {
         const jj = Math.min(H - 1, Math.max(0, j - 1));
         for (let i = 0; i < px; i++) {
           const ii = Math.min(W - 1, Math.max(0, i - 1));
-          FP[j * px + i] = F[jj * W + ii];
+          const f = F[jj * W + ii], fd = frameD[j * px + i];
+          FP[j * px + i] = f < fd ? f : fd;
         }
       }
       const cont = d3.contours().size([px, py]).thresholds([0])(FP)[0];
-      if (cont) d = contourToScreenPath(cont, W, H, iters, -1, opts.fitTol ?? PAPER_FIT_TOL);
+      if (cont) d = contourToScreenPath(cont, W, H, iters, -1, opts.fitTol ?? PAPER_FIT_TOL, xf);
     }
     out.push({ color: sh.color, d, frame: !!sh.frame, solid });
   }
   return { sheets: out, nSheets: out.length, method };
 }
 
-// tile the sheets into one printable SVG: each is the full viewport in its
-// paper color with the holes shown as a hatched "cut" fill and a dashed cut
-// line. Listed top -> bottom (assemble the stack bottom -> top).
-function buildPaperStackSvg(stack, rollTf) {
+// The physical sheet around the picture. Every sheet is cut the same outer
+// size — the design plus a solid border of `marginIn` inches on every side —
+// so a stack registers by squaring up its edges, and every piece of paper
+// inside the design hangs off that border instead of off a frame edge a hole
+// may run along. `widthIn` is the design's own width on paper: the frame
+// raster has no size of its own, and an inch of border means nothing until
+// the picture has one. The files say it in inches, which is what a cutter's
+// software (and a printer) reads as the size to make it.
+const PAPER_WIDTH_IN = 8;      // fits a 12×12 cutting mat with the border on
+const PAPER_MARGIN_IN = 1;
+function paperFrame({ widthIn = PAPER_WIDTH_IN, marginIn = PAPER_MARGIN_IN } = {}) {
+  const w = Math.max(0.5, widthIn), mIn = Math.max(0, marginIn);
+  const m = (mIn * VB_W) / w;                  // the border, in viewBox units
+  const n = (v) => +v.toFixed(3);
+  return { m: n(m), W: n(VB_W + 2 * m), H: n(VB_H + 2 * m),
+    wIn: n(w + 2 * mIn), hIn: n((w * VB_H) / VB_W + 2 * mIn) };
+}
+
+// tile the sheets into one printable SVG: each is the whole sheet, border
+// included, in its paper color with the holes shown as a hatched "cut" fill
+// and a dashed cut line. Listed top -> bottom (assemble the stack bottom -> top).
+function buildPaperStackSvg(stack, frame = {}) {
   const sheets = stack.sheets, N = sheets.length;
+  const fr = paperFrame(frame);
   const cols = Math.min(4, Math.max(1, N));
   const rows = Math.ceil(N / cols);
-  const tileW = 240, tileH = Math.round(tileW * VB_H / VB_W);
+  const tileW = 240, tileH = Math.round(tileW * fr.H / fr.W);
   const labelH = 26, gap = 18, pad = 20, top = 46;
   const W = pad * 2 + cols * tileW + (cols - 1) * gap;
   const H = top + pad + rows * (tileH + labelH) + (rows - 1) * gap;
-  const sx = tileW / VB_W;
+  const sx = tileW / fr.W;
   const ord = stack.method === "optimal" ? "provably fewest" : "greedy order";
   let body = `<text x="${pad}" y="26" font-family="ui-monospace,monospace" font-size="15" fill="#e6eef5">`
-    + `Layered paper stack · ${N} sheets (${ord}) · top → bottom (assemble bottom → top)</text>`;
+    + `Layered paper stack · ${N} sheets (${ord}) · ${fr.wIn}″ × ${fr.hIn}″`
+    + ` · top → bottom (assemble bottom → top)</text>`;
   sheets.forEach((sh, i) => {
     const cx = pad + (i % cols) * (tileW + gap);
     const cy = top + Math.floor(i / cols) * (tileH + labelH + gap);
-    const tf = `translate(${cx} ${cy}) scale(${sx.toFixed(4)})` + (rollTf ? " " + rollTf : "");
-    // clip the tile to its viewport — the roll transform rotates the picture
-    // past the frame edge, and neighbouring tiles are right there. The holes
-    // need no further clip: they are contoured on the frame raster, so they
-    // already stop at the visible wave silhouette (crests above the water
-    // plane included) and never reach past the sheet.
-    body += `<clipPath id="ptile${i}"><rect x="${cx}" y="${cy}" width="${tileW}" height="${tileH}"/></clipPath>`;
-    body += `<g clip-path="url(#ptile${i})">`;
-    // full-sheet paper — this is the whole physical sheet, mount margin and all,
-    // in one color; the water<->background edge is NOT drawn here
-    body += `<rect x="${cx}" y="${cy}" width="${tileW}" height="${tileH}" fill="${sh.color}"/>`;
+    const tf = `translate(${(cx + fr.m * sx).toFixed(2)} ${(cy + fr.m * sx).toFixed(2)})`
+      + ` scale(${sx.toFixed(4)})`;
+    // full-sheet paper — this is the whole physical sheet, border and all, in
+    // one color; the water<->background edge is NOT drawn here. The holes
+    // need no clip: they are cut off at the frame edge in their own geometry
+    // (see buildPaperStack), roll included, so they never reach the border.
+    body += `<rect x="${cx}" y="${cy}" width="${tileW}" height="${tileH}" fill="${sh.color}"`
+      + ` stroke="#000" stroke-opacity="0.35" stroke-width="1"/>`;
     // holes: paper removed to reveal the sheets below (hatched + dashed cut
     // line). One element paints both — the outline is most of the file, and
     // writing it twice is what doubled it
     if (sh.d) body += `<path transform="${tf}" d="${sh.d}" fill="url(#cuthatch)" fill-rule="evenodd"`
       + ` stroke="#0b0f14" stroke-width="1" stroke-dasharray="4 2"/>`;
-    body += `</g>`;
-    body += `<rect x="${cx}" y="${cy}" width="${tileW}" height="${tileH}" fill="none"`
-      + ` stroke="#000" stroke-opacity="0.35" stroke-width="1"/>`;
     const role = sh.frame ? "BACKGROUND · mount" : (sh.solid ? "BACKING · solid" : `sheet ${i}`);
     body += `<text x="${cx}" y="${cy + tileH + 17}" font-family="ui-monospace,monospace"`
       + ` font-size="11" fill="#c9d4da">${i + 1}. ${role} · ${sh.color}</text>`;
@@ -4346,31 +4424,31 @@ function buildPaperStackSvg(stack, rollTf) {
     + `<rect width="${W}" height="${H}" fill="#0b0f14"/>${defs}${body}</svg>`;
 }
 
-// One sheet on its own, at the frame's own size: the paper as a single shape,
-// its color with the holes taken out of it, which is the thing a cutter or an
-// editor wants. The tiled file carries every sheet at once, and a busy scene
-// makes that more than an editor like Figma will open; a sheet is a fraction
-// of it. The paper is drawn as a rectangle well past the frame, so the roll
-// transform can turn it without uncovering a corner, then clipped to the frame
-// — the holes overshoot the frame edge by a raster pixel, and the clip is what
-// makes that the sheet's own edge.
-function buildPaperSheetSvg(stack, i, rollTf) {
+// One sheet on its own, at its physical size: the paper as a single shape —
+// the outer edge of the border and the sheet's holes, one path — which is the
+// thing a cutter or an editor wants. Nothing else is in the file: no clip
+// path, no transform, no group, because a cutter's importer (Cricut Design
+// Space, for one) honors none of them reliably and cuts whatever geometry is
+// underneath. The outer rectangle winds against the holes, so the paper fills
+// with its holes open under either fill rule.
+// The tiled file carries every sheet at once, and a busy scene makes that
+// more than an editor like Figma will open; a sheet is a fraction of it.
+function buildPaperSheetSvg(stack, i, frame = {}) {
   const sh = stack.sheets[i], N = stack.sheets.length;
+  const fr = paperFrame(frame);
   const role = sh.frame ? "background mount" : sh.solid ? "solid backing" : "sheet";
-  const tf = rollTf ? ` transform="${rollTf}"` : "";
-  const paper = `M${-VB_W} ${-VB_H}H${2 * VB_W}V${2 * VB_H}H${-VB_W}Z `;
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${VB_W} ${VB_H}"`
-    + ` width="${VB_W}" height="${VB_H}">`
+  const paper = `M${-fr.m} ${-fr.m}H${VB_W + fr.m}V${VB_H + fr.m}H${-fr.m}Z`;
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${-fr.m} ${-fr.m} ${fr.W} ${fr.H}"`
+    + ` width="${fr.wIn}in" height="${fr.hIn}in">`
     + `<title>Paper sheet ${i + 1} of ${N} (top → bottom) · ${role} · ${sh.color}</title>`
-    + `<defs><clipPath id="sheet-frame"><rect width="${VB_W}" height="${VB_H}"/></clipPath></defs>`
-    + `<g clip-path="url(#sheet-frame)"><path${tf} d="${paper}${sh.d}" fill="${sh.color}"`
-    + ` fill-rule="evenodd"/></g></svg>`;
+    + `<path d="${paper}${sh.d ? " " + sh.d : ""}" fill="${sh.color}" fill-rule="evenodd"/></svg>`;
 }
 
 // exported for tests: the two halves of the layered-paper export
 export {
   buildPaperImage, buildPaperStack, buildPaperStackSvg, buildPaperSheetSvg,
-  PAPER_MAX_BW, PAPER_MAX_COLORS, PAPER_FIT_TOL, PAPER_FINE,
+  PAPER_MAX_BW, PAPER_MAX_COLORS, PAPER_FIT_TOL, PAPER_FINE, paperFine, paperFrame,
+  PAPER_WIDTH_IN, PAPER_MARGIN_IN, rollMatrix, rollTransform,
 };
 
 // ---- UI bits -------------------------------------------------------
@@ -4416,7 +4494,8 @@ const WORKSPACES = [
   { id: "output", name: "Output", icon: "⇲", find: [
     "export svg", "export detail / mesh / edge polish", "export png & size",
     "export mp4 (video length, video size)", "perfect loop", "loop length (phase)",
-    "layered paper stack", "paper sheets one at a time (smaller files)", "sample grid", "3d surface detail (raster)",
+    "layered paper stack", "paper sheets one at a time (smaller files)",
+    "paper design width (inches)", "registration border / frame (inches)", "sample grid", "3d surface detail (raster)",
     "low power mode"] },
 ];
 
@@ -5379,6 +5458,8 @@ export default function App() {
   const [exportQ, setExportQ] = useState(EXPORT_DEFAULT);  // export raster, x preview
   const [exportMeshQ, setExportMeshQ] = useState(EXPORT_MESH_DEFAULT); // export mesh step
   const [exportPolishQ, setExportPolishQ] = useState(EXPORT_POLISH_DEFAULT); // export edge polish
+  const [paperWidthIn, setPaperWidthIn] = useState(PAPER_WIDTH_IN);    // design width on paper
+  const [paperMarginIn, setPaperMarginIn] = useState(PAPER_MARGIN_IN); // registration border
   const [exporting, setExporting] = useState(false);       // the big retrace is synchronous
   const [pngQ, setPngQ] = useState(PNG_DEFAULT);           // PNG size, x the SVG frame
   const [pngBusy, setPngBusy] = useState(false);           // retrace + rasterize, same pause
@@ -5668,6 +5749,7 @@ export default function App() {
     exportQ: [exportQ, setExportQ],
     exportMeshQ: [exportMeshQ, setExportMeshQ],
     exportPolishQ: [exportPolishQ, setExportPolishQ], pngQ: [pngQ, setPngQ],
+    paperWidthIn: [paperWidthIn, setPaperWidthIn], paperMarginIn: [paperMarginIn, setPaperMarginIn],
     vidSec: [vidSec, setVidSec], vidQ: [vidQ, setVidQ],
     vidLoop: [vidLoop, setVidLoop], vidLoopPhase: [vidLoopPhase, setVidLoopPhase],
     uiTab: [uiTab, setUiTab], emitters: [emitters, setEmitters],
@@ -6690,30 +6772,45 @@ export default function App() {
   // Layered paper: cut the same picture the SVG export draws. Both resolve the
   // scene on the visible-surface raster, so the sheets ride the 3D relief, stop
   // where a nearer crest hides the water behind it, and cover exactly what is
-  // in frame — no plan, and no path, for water the camera cannot see.
+  // in frame — no plan, and no path, for water the camera cannot see. Where
+  // the SVG retraces (3D solid, the only mode its export steps show in), the
+  // stack takes the same three steps: the mesh as the SVG's, the polish as
+  // the SVG's, and the detail as how finely the cut is placed (paperFine).
+  const paperFrameOpts = { widthIn: paperWidthIn, marginIn: paperMarginIn };
   const exportPaperStack = () => {
     const fit = computeFit(S);
     prepField(S);
+    const planBW = Math.min(rasterLevel.BW, PAPER_MAX_BW);
     const image = buildPaperImage(S, fit, {
-      gN: rasterLevel.gN, BW: Math.min(rasterLevel.BW, PAPER_MAX_BW),
+      gN: exportAt ? exportAt.gN : rasterLevel.gN, BW: planBW,
       lift: surface3d && perspective,      // the render's own 3D-solid rule
-      polish: polish.paper,                // and its antialiasing
+      polish: exportAt ? polish.paper : polish.preview,
       gap: solid3d ? crestGap : 0, gapColor: crestGapColor,
-      bgColor: bgFill, fresBands, deepMix: mixDeep, fine: PAPER_FINE,
+      bgColor: bgFill, fresBands, deepMix: mixDeep,
+      fine: exportAt ? paperFine(exportMult, planBW) : PAPER_FINE,
       ...fieldSpec,
     });
-    const stack = buildPaperStack(image, bgFill, { iters: S.smooth || 0 });
-    const svg = buildPaperStackSvg(stack, rollTf);
+    const stack = buildPaperStack(image, bgFill, { iters: S.smooth || 0, roll: rollDeg });
+    const svg = buildPaperStackSvg(stack, paperFrameOpts);
     saveSvg(svg, "reflection-paper-stack.svg");
     setSvgName("reflection-paper-stack.svg");
-    setStackInfo({ nSheets: stack.nSheets, method: stack.method, stack, rollTf });
+    setStackInfo({ nSheets: stack.nSheets, method: stack.method, stack });
     setSvgOut(svg);
   };
+  // the sheet size and border only change how the sheets are written, not
+  // what is cut, so moving them redraws the overview without a new plan
+  const stackForOverview = stackInfo && stackInfo.stack;
+  useEffect(() => {
+    if (stackForOverview) {
+      setSvgOut(buildPaperStackSvg(stackForOverview,
+        { widthIn: paperWidthIn, marginIn: paperMarginIn }));
+    }
+  }, [stackForOverview, paperWidthIn, paperMarginIn]);
   const saveSheet = (i) => {
-    const { stack, rollTf: tf } = stackInfo;
+    const { stack } = stackInfo;
     const n = String(stack.nSheets).length;
     const num = (k) => String(k).padStart(n, "0");
-    saveSvg(buildPaperSheetSvg(stack, i, tf),
+    saveSvg(buildPaperSheetSvg(stack, i, paperFrameOpts),
       `reflection-paper-sheet-${num(i + 1)}-of-${num(stack.nSheets)}.svg`);
   };
   const copySvg = () => {
@@ -8160,6 +8257,9 @@ export default function App() {
                 rebuilds the scene when stacked in order. Cut from the picture on screen —
                 the 3D surface, what the crests hide, and the current framing included —
                 posterized to at most {PAPER_MAX_COLORS} colors, since paper is not a gradient.
+                {solid3d && " The export detail, mesh and edge polish steps above apply to it"
+                  + " as they do to the SVG: detail sets how finely each cut line is placed,"
+                  + " mesh and polish change the picture it is cut from."}
               </Help>
             </div>
 
@@ -8184,8 +8284,28 @@ export default function App() {
                       · top → bottom. Hatched = holes to cut.
                       Cut each sheet from paper of its labeled color, then assemble bottom → top.
                     </div>
+                    <Slider label="design width" value={paperWidthIn} min={2} max={24} step={0.5}
+                      onChange={setPaperWidthIn} fmt={(v) => `${v}″`} />
+                    <Slider label="border" value={paperMarginIn} min={0} max={3}
+                      step={0.25} onChange={setPaperMarginIn}
+                      fmt={(v) => {
+                        const fr = paperFrame(paperFrameOpts);
+                        return (v ? `${v}″` : "none")
+                          + ` · sheet ${+fr.wIn.toFixed(2)}×${+fr.hIn.toFixed(2)}″`;
+                      }} />
+                    <div style={{ marginTop: -6, marginBottom: 10 }}>
+                      <Help label="sheet size and border">
+                        Every sheet is cut the same outer size — the design plus a solid border
+                        all the way round — so the stack lines up by squaring the edges, and
+                        no piece of paper hangs off a hole that runs to the edge of the picture.
+                        The sheet files carry their size in inches, so a cutter imports them
+                        at the size shown here. Each one is a single path, the border's outer
+                        edge with the holes in it: no clip paths or transforms, which cutting
+                        software such as Cricut Design Space does not honor.
+                      </Help>
+                    </div>
                     <div style={{ fontSize: 10.5, color: "#8a9bab", marginBottom: 6 }}>
-                      One sheet per file, for editors that will not open the whole stack:
+                      One sheet per file, ready to cut:
                     </div>
                     <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10 }}>
                       {stackInfo.stack.sheets.map((sh, i) => (

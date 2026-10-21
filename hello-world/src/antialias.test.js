@@ -28,14 +28,16 @@ test("the steps go off, then up, and a scene starts with none", () => {
   expect(antialiasAt(99)).toBe(ANTIALIAS[ANTIALIAS.length - 1]);
 });
 
-test("every output polishes by what the preview did, and only the SVG adds", () => {
+test("every output polishes by what the preview did, and only the vector files add", () => {
   const light = ANTIALIAS[1].passes, ex = EXPORT_POLISH[1].passes;
   const p = polishPlan(light, ex);
-  // the PNG, the video and the paper stack are the picture on screen
-  expect([p.png, p.paper]).toEqual([p.preview, p.preview]);
+  // the PNG and the video are the picture on screen
+  expect(p.png).toBe(p.preview);
   expect(p.preview).toBe(light);
-  // the file is that, plus the step it asks for on the way out
+  // the file is that, plus the step it asks for on the way out — and the
+  // paper stack's cut lines are outlines too, so they take the same step
   expect(p.svg).toBe(light + ex);
+  expect(p.paper).toBe(p.svg);
   expect(p.retrace).toBe(true);
   // with nothing extra to add, there is nothing to retrace for
   expect(polishPlan(light, 0)).toMatchObject({ svg: light, retrace: false });

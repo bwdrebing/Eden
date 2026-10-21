@@ -1,6 +1,8 @@
 import {
   buildPaperImage, buildPaperStack, buildPaperStackSvg, buildPaperSheetSvg, buildSurface3D,
   computeFit, DEFAULT_EMITTERS, PAPER_MAX_COLORS, PAPER_FIT_TOL, PAPER_FINE,
+  paperFine, paperFrame, rollMatrix, rollTransform, EXPORT_MULTS, EXPORT_DEFAULT,
+  EXPORT_MAX_BW, PAPER_MAX_BW,
 } from "./WaterReflectionContours";
 
 /* ------------------------------------------------------------------ *
@@ -241,13 +243,13 @@ test("a gradient is posterized to a buyable number of papers", () => {
   expect(sheets(shoot(PAPER_MAX_COLORS))).toBeLessThan(sheets(shoot(0)));
 });
 
-test("the tiled sheet SVG is one clipped tile per sheet, and nothing else", () => {
+test("the tiled sheet SVG is one tile per sheet, and nothing else", () => {
   // The tiles used to clip each hole to the flat water trapezoid as well, to
   // contain a 5% overshoot the grid pipeline needed. On a 3D surface that clip
   // shears off every crest standing above the water plane — and the holes now
   // come out of the frame raster, already bounded by the visible silhouette,
-  // so the only clip left is the one that keeps a rolled picture inside its
-  // own tile.
+  // and are cut off at the frame edge in their own geometry, roll included, so
+  // no tile needs a clip at all.
   const thresholds = [12, 20, 28];
   const cols = greys(thresholds.length + 1);
   const S = withSwell(baseS());
@@ -255,10 +257,10 @@ test("the tiled sheet SVG is one clipped tile per sheet, and nothing else", () =
     ...RASTER, lift: true, bgColor: "#ffffff",
     scalarAt: (gx, gy) => gy, thresholds, cols,
   });
-  const stack = buildPaperStack(img, "#ffffff", { iters: 3 });
-  const svg = buildPaperStackSvg(stack, "rotate(6 380 250)");
+  const stack = buildPaperStack(img, "#ffffff", { iters: 3, roll: 6 });
+  const svg = buildPaperStackSvg(stack);
 
-  expect((svg.match(/<clipPath/g) || []).length).toBe(stack.nSheets);
+  expect(svg).not.toContain("clip");
   expect(svg).not.toContain("NaN");
   expect(svg.startsWith("<svg")).toBe(true);
   expect(svg.endsWith("</svg>")).toBe(true);
@@ -394,21 +396,27 @@ test("each sheet can be saved on its own, as one piece of paper", () => {
     ...RASTER, lift: true, bgColor: "#ffffff",
     scalarAt: (gx, gy) => gy, thresholds, cols: greys(thresholds.length + 1),
   });
-  const stack = buildPaperStack(img, "#ffffff", { iters: 3 });
-  const roll = "rotate(6 380 250)";
+  const stack = buildPaperStack(img, "#ffffff", { iters: 3, roll: 6 });
   // the tiled file paints each outline once, fill and cut line together
-  const tiled = buildPaperStackSvg(stack, roll);
+  const tiled = buildPaperStackSvg(stack);
   expect((tiled.match(/<path/g) || []).length).toBe(stack.sheets.filter((s) => s.d).length);
 
+  const frame = { widthIn: 10, marginIn: 1 };
+  const fr = paperFrame(frame);
   stack.sheets.forEach((sh, i) => {
-    const svg = buildPaperSheetSvg(stack, i, roll);
+    const svg = buildPaperSheetSvg(stack, i, frame);
     expect(svg).not.toContain("NaN");
-    expect(svg).toContain(`viewBox="0 0 ${VB_W} ${VB_H}"`);
-    // one shape: the paper, in its color, with the sheet's holes in it
+    // the design plus an inch all round, in inches, so a cutter sizes it
+    expect(fr.wIn).toBe(12);
+    expect(fr.hIn).toBeCloseTo(10 * VB_H / VB_W + 2, 2);
+    expect(svg).toContain(`width="${fr.wIn}in" height="${fr.hIn}in"`);
+    expect(svg).toContain(`viewBox="${-fr.m} ${-fr.m} ${fr.W} ${fr.H}"`);
+    // one shape: the paper, in its color, with the sheet's holes in it — and
+    // nothing a cutter's importer would drop: no clip, no transform, no group
     expect((svg.match(/<path/g) || []).length).toBe(1);
     expect(svg).toContain(`fill="${sh.color}"`);
     expect(svg).toContain(sh.d);
-    expect(svg).toContain(`transform="${roll}"`);
+    expect(svg).not.toMatch(/clip|transform|<g/);
     expect(svg).toContain(`sheet ${i + 1} of ${stack.nSheets}`);
     // a fraction of the whole stack
     expect(svg.length).toBeLessThan(tiled.length);
@@ -498,4 +506,64 @@ test("a board's unpainted cells show the flat behind it, on paper as on screen",
   // as they are in the render's own regions
   const ref = buildSurface3DPanorama(S, fit, { ...spec, ...RASTER });
   expect(ref.layers.map((l) => l.color)).toEqual(expect.arrayContaining(["#6a96c8", "#e98b3a"]));
+});
+
+test("the roll as a matrix is the roll as a transform", () => {
+  expect(rollMatrix(0)).toBe(null);
+  // rotate(a c) translate(t) scale(s), applied by hand, against the matrix
+  const tf = rollTransform(17);
+  const [, a, cx, cy] = tf.match(/rotate\(([-\d.]+) ([-\d.]+) ([-\d.]+)\)/).map(Number);
+  const [, tx, ty] = tf.match(/translate\(([-\d.]+) ([-\d.]+)\)/).map(Number);
+  const [, s] = tf.match(/scale\(([-\d.]+)\)/).map(Number);
+  const m = rollMatrix(17), r = (a * Math.PI) / 180;
+  for (const [x, y] of [[0, 0], [VB_W, 0], [123, 456], [VB_W, VB_H]]) {
+    const ux = x * s + tx - cx, uy = y * s + ty - cy;
+    const ex = cx + Math.cos(r) * ux - Math.sin(r) * uy;
+    const ey = cy + Math.sin(r) * ux + Math.cos(r) * uy;
+    expect(m[0] * x + m[2] * y + m[4]).toBeCloseTo(ex, 1);
+    expect(m[1] * x + m[3] * y + m[5]).toBeCloseTo(ey, 1);
+  }
+});
+
+test("every cut stops at the frame edge, rolled or not, with no clip to do it", () => {
+  // A cutter does not honor a clip path: it cuts the geometry underneath. The
+  // holes used to run a pixel past the frame (and, rolled, well past it) and
+  // rely on the clip to trim them — on a cutting mat, a slit into the border.
+  // Bands that run off every side of the frame, so every sheet's holes meet it.
+  const S = withSwell(baseS());
+  const thresholds = [12, 20, 28];
+  const img = buildPaperImage(S, computeFit(S), {
+    ...RASTER, lift: true, bgColor: "#ffffff",
+    scalarAt: (gx, gy) => gy + 0.3 * gx, thresholds, cols: greys(thresholds.length + 1),
+  });
+  for (const roll of [0, 9, -23]) {
+    const stack = buildPaperStack({ ...img, grid: img.grid.slice() }, "#ffffff",
+      { iters: 3, roll });
+    let n = 0, onEdge = 0;
+    for (const sh of stack.sheets) for (const r of sampleRings(sh.d, 0.5)) {
+      for (const [x, y] of r) {
+        n++;
+        expect(x).toBeGreaterThan(-0.2);
+        expect(y).toBeGreaterThan(-0.2);
+        expect(x).toBeLessThan(VB_W + 0.2);
+        expect(y).toBeLessThan(VB_H + 0.2);
+        if (x < 0.5 || y < 0.5 || x > VB_W - 0.5 || y > VB_H - 0.5) onEdge++;
+      }
+    }
+    expect(n).toBeGreaterThan(1000);
+    // and they really do run along it, rather than stopping short
+    expect(onEdge).toBeGreaterThan(100);
+  }
+});
+
+test("export detail places the cut more finely, within the SVG's own cap", () => {
+  // the default step is the supersampling the stack always had
+  expect(paperFine(EXPORT_MULTS[EXPORT_DEFAULT], 440)).toBe(PAPER_FINE);
+  // as previewed is the plan's own whole pixels
+  expect(paperFine(1, 440)).toBe(0);
+  expect(paperFine(3, 440)).toBe(5);
+  // and a step that would trace past the SVG's width comes down a step
+  const K = paperFine(3, PAPER_MAX_BW);
+  expect(PAPER_MAX_BW * K).toBeLessThanOrEqual(EXPORT_MAX_BW);
+  expect(K % 2).toBe(1);
 });

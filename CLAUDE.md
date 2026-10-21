@@ -73,6 +73,15 @@ scaled inside a fixed-size `<div>` gives a zoomed crop to screenshot.
   an export step and does come through — it is part of the picture that was on
   screen. `polishPlan` is the one place that says which outputs blur by how
   much; add an output there rather than picking a number at its call site.
+- **The paper stack is a cut file, so it is a vector output.** It takes the
+  SVG's export mesh and edge polish (`polishPlan`'s `paper` is the SVG's
+  total), and export detail reaches it as how finely each cut is placed
+  (`paperFine`), not as a wider plan. A sheet file must be plain geometry —
+  one path, the border's outer edge plus the holes, sized in inches: cutting
+  software (Cricut Design Space) ignores clip paths and transforms and cuts
+  whatever is underneath. So the frame clip and the roll live in the cut
+  lines themselves (`buildPaperStack`'s frame field and `rollMatrix`), never
+  in the SVG around them.
 - **A wave's speed is not a free parameter.** With "Speed follows wavelength"
   on (`S.dispersion`, the default for a new scene), every train takes its
   frequency from its own wavenumber through `omegaAt` — deep-water dispersion,
