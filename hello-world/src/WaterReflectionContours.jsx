@@ -141,6 +141,8 @@ function loopFit(S, T) {
     else if (e.type === "swell") oms.push(e.ph0 - B.ph0);
     else if (e.type === "rings") for (let j = 0; j < e.M; j++) oms.push(e.PH[j] - B.PH[j]);
     else if (e.type === "spectrum") for (let j = 0; j < e.N; j++) oms.push(e.PH[j] - B.PH[j]);
+    // rain's one clock is the drop cycle: how many lifetimes have passed
+    else if (e.type === "rain") oms.push(2 * Math.PI * (B.u - e.u));
     // a wake carries no phase term at all: it is already the same every frame
   });
   const live = oms.map(Math.abs).filter((o) => o > 1e-12);
@@ -214,7 +216,9 @@ function mergeChits(existing, colors) {
 // Real water is a superposition of straight-crested waves over many
 // wavelengths. We work with the surface *slope* (which sets the normal,
 // which sets the reflected angle), computed analytically per emitter.
-//   point    = concentric ripple from a spot (a raindrop / a fish)
+//   point    = concentric ripple from a spot (a fish, a steady drip)
+//   rain     = drops landing all over the plane, each one ring that is
+//              born, spreads and dies (see "rain" below)
 //   swell    = one long straight-crested wave train
 //   spectrum = a wind field: many straight waves around a heading,
 //              weighted toward long wavelengths, + a roughness control
@@ -452,6 +456,166 @@ function rockRippleAt(e, gx, gy, slope) {
   return true;
 }
 
+// ---- rain -----------------------------------------------------------
+// Every other emitter is a steady train: a sum of sinusoids in t. A raindrop
+// is not. It lands, throws one short packet of rings, and the packet spreads
+// and dies; then the next drop lands somewhere else. So rain is a fixed number
+// of *slots* — `detail` drops on the water at any instant — and each slot runs
+// through lifetimes back to back. Lifetime n of slot i lands at a place (and
+// with a size) hashed from (emitter, i, n), so the pattern is a pure function
+// of the clock: the preview, a scrubbed frame, the worker and a video frame
+// all see the same drops, and nothing is carried from one frame to the next.
+//
+// One drop, at age f in [0, 1) of its life:
+//
+//     R = f · reach·λ          the packet's radius
+//     w = w0 + 0.35·R          its width: a packet disperses as it goes
+//     z = A(f) · (1 − s²/4)⁴ · cos(k(r − R)),   s = (r − R)/w, |s| < 2
+//
+// The packet runs out at the drop's own phase speed omegaAt(k)/k — the one
+// rule every train in the scene obeys. Rain ripples sit near the capillary-
+// gravity minimum, where group and phase speed meet, which is why the crests
+// ride with the packet rather than through it. A(f) opens from nothing, falls
+// as 1/√R (one ring's energy spread round a growing circumference) and closes
+// to nothing at f = 1, so a slot's old drop is gone the instant its new one
+// lands: no frame ever pops. The packet's profile is a Gaussian's shape
+// (exp(−s²) to within a few percent) cut to compact support, so a ring has a
+// real outer edge to cull at with no step left in the field there. r is
+// rounded off over a quarter wavelength at the
+// center so a fresh drop is a dimple, not a cone.
+//
+// Height is steepness against the open water at strength 1, like a wake's —
+// rain on glass is the picture people want, and that is a scene with no
+// strength to scale by.
+//
+// Drops land on the water the camera can see, not on the whole plane: a
+// scene zoomed 20x onto a sliver of a 90-unit plane would otherwise put nearly
+// every drop off-screen, and "drops on the water" would mean nothing you could
+// count. Within that footprint they land uniformly on the *ground*, so the far
+// water, seen foreshortened, is where they crowd — as real rain does. The
+// footprint is read off the fit, so moving the camera re-scatters the rain;
+// nothing else does.
+//
+// A loop (see loopOmega) snaps the drop cycle to a whole number N of
+// lifetimes in the clip and takes lifetime indices mod N, so the drops that
+// land in the last second are the drops that landed in the first.
+const RAIN_STEEP = WAKE_STEEP;
+const RAIN_REACH_DEFAULT = 5;   // how far a ring runs before it is gone, in λ
+const RAIN_EPS = 0.25;          // center rounding, in λ
+// a 2-D hash onto rand1, so that (slot, lifetime) pairs do not collide the way
+// a single linear seed would
+function rainHash(seed, i, n, c) {
+  return rand1(seed * 7.31 + i * 92.821 + n * 689.17 + c * 0.377);
+}
+
+// The ground the frame shows, as a bounding box clipped to the plane, plus a
+// test for whether one ground point is in frame (with a margin, so rings ride
+// in from just past the edges). Plan view sees the whole plane.
+const RAIN_MARGIN = 0.06;
+function rainFootprint(S) {
+  const all = { x0: S.xMin, x1: S.xMax, y0: S.yMin, y1: S.yMax, inView: () => true };
+  if (!S.perspective || !(S.H > 0)) return all;
+  const fit = computeFit(S);
+  const cp = Math.cos(S.pitch), sp = Math.sin(S.pitch);
+  const mx = VB_W * RAIN_MARGIN, my = VB_H * RAIN_MARGIN;
+  let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+  for (let a = 0; a <= 8; a++) for (let b = 0; b <= 8; b++) {
+    const rx = (-mx + ((VB_W + 2 * mx) * a) / 8 - fit.ox) / fit.scale;
+    const ry = (-my + ((VB_H + 2 * my) * b) / 8 - fit.oy) / fit.scaleY;
+    const den = ry * cp + sp;
+    if (!(den > 1e-9)) continue;                     // at or above the horizon
+    let gy = (S.H * (cp - ry * sp)) / den;
+    if (!(gy > 0)) continue;
+    gy = Math.min(S.yMax, Math.max(S.yMin, gy));
+    const gx = Math.min(S.xMax, Math.max(S.xMin, rx * (gy * cp + S.H * sp)));
+    x0 = Math.min(x0, gx); x1 = Math.max(x1, gx);
+    y0 = Math.min(y0, gy); y1 = Math.max(y1, gy);
+  }
+  if (!(x1 > x0 && y1 > y0)) return all;
+  const inView = (gx, gy) => {
+    const [rx, ry] = rawProject(gx, gy, S);
+    const sx = fit.ox + fit.scale * rx, sy = fit.oy + fit.scaleY * ry;
+    return sx > -mx && sx < VB_W + mx && sy > -my && sy < VB_H + my;
+  };
+  return { x0, x1, y0, y1, inView };
+}
+
+function prepRain(em, S, baseLambda, rate) {
+  const M = Math.max(1, Math.min(80, em.detail | 0));
+  const k0 = (2 * Math.PI) / baseLambda;
+  const reach = Math.max(1, em.reach == null ? RAIN_REACH_DEFAULT : em.reach);
+  const Rmax = reach * baseLambda;
+  const c = Math.max(1e-6, omegaAt(k0, S) / k0);     // the packet's speed
+  const Om = (2 * Math.PI * c) / Rmax;               // lifetimes, as a frequency
+  // the drop clock, in lifetimes. Off a loop it is the arithmetic every train
+  // uses; on one, the snapped frequency against the scene's own clock
+  const T = S.loopPhase;
+  const omL = T ? loopOmega(Om * rate, S) : 0;
+  const u = T ? (omL * S.t) / (2 * Math.PI) : (Om * S.t * rate) / (2 * Math.PI);
+  const N = T && omL ? Math.max(1, Math.round((omL * T) / (2 * Math.PI))) : 0;
+  const rough = Math.max(0, Math.min(1, em.roughness || 0));
+  const seed = typeof em.id === "number" ? em.id : 0;
+  const X = [], Y = [], R = [], W = [], K = [], AMP = [], RIN2 = [], ROUT2 = [], E2 = [];
+  const w0 = 0.6 * baseLambda;
+  const fp = rainFootprint(S);
+  for (let i = 0; i < M; i++) {
+    const ui = u + rand1(seed * 13 + i * 5 + 2);
+    let n = Math.floor(ui);
+    const f = ui - n;
+    if (N) n = ((n % N) + N) % N;
+    const lam = baseLambda * (1 + (rainHash(seed, i, n, 3) - 0.5) * 1.2 * rough);
+    const k = (2 * Math.PI) / Math.max(0.1, lam);
+    // uniform over the footprint's box, rejecting what falls out of frame;
+    // a few tries is plenty, and the last stands if none land
+    let x = 0, y = 0;
+    for (let tr = 0; tr < 8; tr++) {
+      x = fp.x0 + (fp.x1 - fp.x0) * rainHash(seed, i, n, 10 + 2 * tr);
+      y = fp.y0 + (fp.y1 - fp.y0) * rainHash(seed, i, n, 11 + 2 * tr);
+      if (fp.inView(x, y)) break;
+    }
+    const Ri = f * Rmax;
+    const w = w0 + 0.35 * Ri;
+    // the range filter, read at the drop's own place: a ring is one object
+    // and fades as one, rather than shredding across its own far side
+    const xa = aaCoef(k, S) * y;
+    const life = (1 - Math.exp(-f / 0.05)) * (1 - f) * (1 - f);
+    const A = RAIN_STEEP * lam * em.amp * life * Math.sqrt(w0 / (w0 + Ri)) / (1 + xa * xa);
+    if (!(A > 1e-9)) continue;
+    const rout = Ri + 2 * w, rin = Math.max(0, Ri - 2 * w);
+    X.push(x); Y.push(y); R.push(Ri); W.push(w); K.push(k); AMP.push(A);
+    ROUT2.push(rout * rout); RIN2.push(rin * rin);
+    E2.push(Math.pow(RAIN_EPS * lam, 2));
+  }
+  return { type: "rain", M: X.length, X, Y, R, W, K, AMP, RIN2, ROUT2, E2, u };
+}
+
+// One prepped rain emitter at a ground point: height into RAIN_OUT[0] and,
+// with `slope`, its two ground derivatives — one function for both, like
+// wakeAt, so heightAt and slopeAt cannot drift apart.
+const RAIN_OUT = [0, 0, 0];
+function rainAt(e, gx, gy, slope) {
+  let z = 0, hx = 0, hy = 0;
+  for (let i = 0; i < e.M; i++) {
+    const dx = gx - e.X[i], dy = gy - e.Y[i];
+    const d2 = dx * dx + dy * dy;
+    const q2 = d2 + e.E2[i];                     // r², rounded at the center
+    if (q2 > e.ROUT2[i] || q2 < e.RIN2[i]) continue;
+    const r = Math.sqrt(q2);
+    const s = (r - e.R[i]) / e.W[i];
+    const b = 1 - 0.25 * s * s, b3 = b * b * b;
+    const g = b3 * b;
+    const ph = e.K[i] * (r - e.R[i]);
+    const cs = Math.cos(ph);
+    z += e.AMP[i] * g * cs;
+    if (slope) {
+      // dz/dr, then down the radius; r is rounded, so dr/dx = dx / r is smooth
+      const dzr = e.AMP[i] * ((-2 * s * b3 / e.W[i]) * cs - g * e.K[i] * Math.sin(ph));
+      hx += (dzr * dx) / r; hy += (dzr * dy) / r;
+    }
+  }
+  RAIN_OUT[0] = z; RAIN_OUT[1] = hx; RAIN_OUT[2] = hy;
+}
+
 // Pre-bake an emitter into per-frame constants so the per-sample loop is cheap.
 function prepEmitter(em, S) {
   const baseLambda = (2 * Math.PI / S.k) * em.size; // global λ × size
@@ -529,6 +693,7 @@ function prepEmitter(em, S) {
       L, w0: 0.3 * baseLambda, wt: phase(omegaAt(k0, S)), aa: aaCoef(k0, S),
       cut2: Math.pow(pr.bR + 8 * L, 2) };
   }
+  if (em.type === "rain") return prepRain(em, S, baseLambda, rate);
   if (em.type === "rings") {
     // a scattered field of radial ripple sources -> concentric color rings
     const M = Math.max(1, Math.min(20, em.detail | 0));
@@ -614,6 +779,8 @@ function heightAt(gx, gy, S) {
       if (wakeAt(e, gx, gy, false)) z += WAKE_OUT[0];
     } else if (e.type === "rock") {
       if (rockRippleAt(e, gx, gy, false)) z += ROCK_OUT[0];
+    } else if (e.type === "rain") {
+      rainAt(e, gx, gy, false); z += RAIN_OUT[0];
     } else {
       for (let i = 0; i < e.N; i++) {
         const s1 = Math.sin(e.K[i] * (e.DX[i] * gx + e.DY[i] * gy) + e.PH[i]);
@@ -669,6 +836,8 @@ function slopeAt(gx, gy, S) {
       if (wakeAt(e, gx, gy, true)) { hx += WAKE_OUT[1]; hy += WAKE_OUT[2]; }
     } else if (e.type === "rock") {
       if (rockRippleAt(e, gx, gy, true)) { hx += ROCK_OUT[1]; hy += ROCK_OUT[2]; }
+    } else if (e.type === "rain") {
+      rainAt(e, gx, gy, true); hx += RAIN_OUT[1]; hy += RAIN_OUT[2];
     } else {
       for (let i = 0; i < e.N; i++) {
         const th = e.K[i] * (e.DX[i] * gx + e.DY[i] * gy) + e.PH[i];
@@ -4389,7 +4558,8 @@ const WORKSPACES = [
     "grazing perspective", "rectangular output (fill frame)"] },
   { id: "waves", name: "Waves", icon: "≈", find: [
     "ripple scale (wavelength)", "ripple strength", "crest sharpness", "spread / reach",
-    "emitters (swell, spectrum, rings, point)", "roughness (chop)", "wind heading",
+    "emitters (swell, spectrum, rings, point, rain)",
+    "rain (raindrop ripples, drizzle / downpour)", "roughness (chop)", "wind heading",
     "emitter rate (trim on the clock's share)",
     "speed follows wavelength (dispersion)",
     "3d wave surface", "wave height (3d)", "crest gap & color",
@@ -5080,7 +5250,7 @@ const miniBtnBase = {
 };
 
 function EmitterCard({ em, idx, halfW, yFar, dispersion, onChange, onRemove }) {
-  const types = [["point", "Point"], ["rings", "Rings"], ["swell", "Swell"], ["spectrum", "Spectrum"]];
+  const types = [["point", "Point"], ["rings", "Rings"], ["rain", "Rain"], ["swell", "Swell"], ["spectrum", "Spectrum"]];
   // What the wavelength slider just bought this train, in the terms the Speed
   // panel states the rule in. For a spectrum this is its dominant component;
   // the shorter rungs of its ladder run faster still.
@@ -5140,7 +5310,20 @@ function EmitterCard({ em, idx, halfW, yFar, dispersion, onChange, onRemove }) {
           fmt={(v) => (v < 0.2 ? "uniform" : v < 0.6 ? "varied" : "random")} />
       </>}
 
-      <Slider label={em.type === "spectrum" ? "dominant wavelength" : "wavelength"} value={em.size}
+      {em.type === "rain" && <>
+        <Slider label="drops on the water" value={Math.max(4, Math.min(60, em.detail | 0))}
+          min={4} max={60} step={1} onChange={(v) => onChange({ detail: v })}
+          fmt={(v) => (v < 12 ? v + " · drizzle" : v < 30 ? v + " · shower" : v + " · downpour")} />
+        <Slider label="drop size variation" value={em.roughness} min={0} max={1} step={0.02}
+          onChange={(v) => onChange({ roughness: v })}
+          fmt={(v) => (v < 0.2 ? "uniform" : v < 0.6 ? "varied" : "random")} />
+        <Slider label="ring reach" value={em.reach == null ? RAIN_REACH_DEFAULT : em.reach}
+          min={2} max={12} step={0.5} onChange={(v) => onChange({ reach: v })}
+          fmt={(v) => v + " λ"} />
+      </>}
+
+      <Slider label={em.type === "spectrum" ? "dominant wavelength"
+        : em.type === "rain" ? "ring wavelength" : "wavelength"} value={em.size}
         min={0.3} max={5} step={0.1} onChange={(v) => onChange({ size: v })} fmt={(v) => v.toFixed(1) + "×"} />
       {dispersion && (
         <div style={{ fontSize: 9.5, color: "#6d808f", lineHeight: 1.5, marginTop: -6,
@@ -7698,7 +7881,9 @@ export default function App() {
                 Swell = one long straight-crested wave train. Spectrum = a wind field of many
                 straight waves (raise roughness for chop). Rings = a scattered field of radial
                 ripples — the source of the concentric color rings you see on a real lake.
-                Point = a single spreading ripple. Each carries a rate — its gearing off
+                Point = a single spreading ripple. Rain = drops landing all over the water,
+                each throwing one ring that spreads out and dies before the next lands; its
+                strength is absolute, so it reads on glassy water too. Each carries a rate — its gearing off
                 the scene clock — so a long swell can roll under fast chop, or one train
                 can be frozen while the rest of the water moves.
               </Help>
