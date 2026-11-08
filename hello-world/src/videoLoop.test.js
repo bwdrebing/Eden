@@ -40,6 +40,8 @@ const everyType = (t, loopPhase, extra = {}) => ({
       amp: 1.2, spread: 0, roughness: 0, detail: 8 },
     { id: 5, on: true, type: "wake", x: -3, y: 20, dir: 30, scale: 5,
       amp: 0.6, len: 8, detail: 0.3, angle: 19.5 },
+    { id: 6, on: true, type: "rain", x: 0, y: 12, dir: 0, size: 0.8,
+      amp: 1, spread: 0, roughness: 0.4, detail: 30, reach: 5 },
   ],
   ...extra,
 });
@@ -175,6 +177,12 @@ test("prepped constants other than the phase are untouched by the loop", () => {
     if (e.type === "swell") {
       expect(f.k0).toBe(e.k0);
       expect([f.Dx, f.Dy, f.A, f.q, f.aa]).toEqual([e.Dx, e.Dy, e.A, e.q, e.aa]);
+    }
+    if (e.type === "rain") {
+      // at t = 3 a drop may differ — that is the tempo moving — but the scene
+      // still holds the drops it holds, at the size it holds them
+      expect(f.M).toBeGreaterThan(0);
+      expect(f.u).not.toBe(e.u);
     }
     // a wake has no phase term at all, so a loop is nothing to it
     if (e.type === "wake") expect(f).toEqual(e);

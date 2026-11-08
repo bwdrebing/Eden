@@ -173,6 +173,14 @@ scaled inside a fixed-size `<div>` gives a zoomed crop to screenshot.
   other modes — and in the SVG the order is reflection, watermark, rock.
   Ray cost is pixels, so keep the coarse-block pass and the early exits in
   `rayMin`: without them rocks cost ten times the water.
+- **Rain is the one emitter that is not a sum of sinusoids in `t`.** Each of
+  its `detail` slots runs through drop lifetimes back to back, and lifetime
+  *n* lands at a place hashed from (emitter id, slot, *n*). That keeps the
+  field a pure function of the clock (worker, scrub and video all agree), and
+  under a loop *n* is taken mod the snapped lifetime count, which is how
+  `prepRain` closes the clip without `loopOmega` touching a phase term. Drops
+  land on the ground the *frame* shows (`rainFootprint`), so moving the
+  camera re-scatters them, and nothing else does.
 - The 1D/preset path and the 2D panorama path are separate builders
   (`buildSurface3D`, `buildSurface3DPanorama`) that must stay in step. A new
   option on one usually belongs on the other; `buildSolid3D` is where both are
